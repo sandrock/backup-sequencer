@@ -1,0 +1,33 @@
+{
+  "window": { "open": "23:00", "close": "06:00" },
+  "staging": null,
+  "resources": { "diskA": 1, "diskB": 1, "net-out": 1, "cpu": 2 },
+  "notify": {
+    "enabled": false,
+    "from": "backups@example.com",
+    "to": ["ops@example.com"],
+    "server": "smtp.example.com:587",
+    "authUser": "smtp-user",
+    "passwordFile": "secrets/smtp.pass"
+  },
+  "services": {
+    "example-app": {
+      "enabled": true,
+      "mandatory": true,
+      "class": "triggered",
+      "script": "recipes/docker-compose-cold.ps1",
+      "env": {
+        "DCC_COMPOSE_DIR": "/srv/example-app",
+        "DCC_DATA_DIR": "/srv/example-app/data",
+        "DCC_COMPOSE_CMD": "docker compose",
+        "DCC_ARCHIVE_NAME": "example-app_files.tar"
+      },
+      "steps": [
+        { "name": "stop", "resources": [] },
+        { "name": "dump", "resources": ["diskA"], "timeoutSec": 1800 },
+        { "name": "start", "resources": [], "alwaysRun": true },
+        { "name": "cleanup", "resources": ["diskA"], "alwaysRun": true }
+      ]
+    }
+  }
+}
