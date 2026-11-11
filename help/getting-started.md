@@ -27,6 +27,27 @@ All three are overridable with `BACKUP_SEQUENCER_CONFIG_DIR` and
 package); keep config and secrets out of the code tree.
 
 
+Where backups land
+----------------------------------------------------------------
+
+Each service's dump is produced under a *staging* directory:
+
+```
+<staging-root>/<service>/wip/<archive>
+```
+
+The staging root is resolved as:
+
+1. `staging` in `config.json`, if set; otherwise
+2. `<state dir>/staging` — i.e. `/var/lib/backup-sequencer/staging` (Linux) or
+   `%ProgramData%\backup-sequencer\var\staging` (Windows).
+
+Set `staging` explicitly to a path with room for a service's largest dump —
+especially if the state dir is on a small system disk. Put it on the volume that
+has the space. A shipping step, if present, reads from here; otherwise the recipe's
+`cleanup` frees it after the run.
+
+
 Configure
 ----------------------------------------------------------------
 
