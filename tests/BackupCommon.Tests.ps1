@@ -61,6 +61,31 @@ Describe 'time window' {
     }
 }
 
+Describe 'staging size measurement' {
+    It 'returns 0 for a non-existent path' {
+        Get-PathSizeBytes -Path (Join-Path $Work 'nope') | Should -Be 0
+    }
+    It 'returns 0 for an empty directory without throwing (regression, under Stop)' {
+        $ErrorActionPreference = 'Stop'
+        $d = Join-Path $Work 'empty-dir'
+        New-Item -ItemType Directory -Force -Path $d | Out-Null
+        { Get-PathSizeBytes -Path $d } | Should -Not -Throw
+        Get-PathSizeBytes -Path $d | Should -Be 0
+    }
+    It 'returns 0 for a directory containing only subdirectories' {
+        $d = Join-Path $Work 'subdirs-only'
+        New-Item -ItemType Directory -Force -Path (Join-Path $d 'wip') | Out-Null
+        Get-PathSizeBytes -Path $d | Should -Be 0
+    }
+    It 'sums file sizes recursively' {
+        $d = Join-Path $Work 'with-files'
+        New-Item -ItemType Directory -Force -Path (Join-Path $d 'sub') | Out-Null
+        Set-Content -LiteralPath (Join-Path $d 'a.bin') -Value ('x' * 100) -NoNewline
+        Set-Content -LiteralPath (Join-Path $d 'sub/b.bin') -Value ('y' * 50) -NoNewline
+        Get-PathSizeBytes -Path $d | Should -Be 150
+    }
+}
+
 Describe 'planning' {
     It 'puts mandatory first and preserves config order' {
         $cfg = @'
@@ -125,5 +150,23 @@ Describe 'run orchestration' {
         $events = Get-BackupEvents -EventsPath $ev
         ($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'svc2' } | Select-Object -First 1).status | Should -Be 'fail'
         @($events | Where-Object { $_.type -eq 'step.start' -and $_.step -eq 'start' }).Count | Should -BeGreaterThan 0
+    }
+
+    It 'completes (emits run.end) even when a step empties staging (regression, under Stop)' {
+        $ErrorActionPreference = 'Stop'
+        $ev = Join-Path $Work 'run-wipe.jsonl'
+        $cfg = @'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "svc3": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "steps": [ { "name": "dump", "resources": [] },
+               { "name": "wipe", "resources": [] } ] } } }
+'@ | ConvertFrom-Json
+        $paths = @{ BaseDir = $TestsDir; EventsPath = $ev; LockPath = (Join-Path $Work 'run-wipe.lock'); StagingRoot = (Join-Path $Work 'stg-wipe') }
+        $runId = Invoke-BackupRun -Config $cfg -Paths $paths -Force
+        $runId | Should -Not -BeNullOrEmpty
+        $events = Get-BackupEvents -EventsPath $ev
+        @($events | Where-Object { $_.type -eq 'run.end' }).Count | Should -Be 1
+        # dump size survives the wipe (max-across-steps), so it is recorded, not lost to 0
+        ($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'svc3' } | Select-Object -First 1).bytes | Should -BeGreaterThan 0
     }
 }

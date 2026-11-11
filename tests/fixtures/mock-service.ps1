@@ -16,5 +16,12 @@ switch ($Step) {
     'boom' { throw 'simulated failure' }
     'start' { }     # recovery no-op
     'cleanup' { }   # no-op (keeps data so the test can assert recorded size)
+    'wipe' {
+        # empties staging, to reproduce the post-cleanup empty-dir measurement
+        if (Test-Path -LiteralPath $StagingDir) {
+            Get-ChildItem -LiteralPath $StagingDir -Force -ErrorAction SilentlyContinue |
+                Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
     default { }
 }

@@ -174,12 +174,15 @@ function Get-PathSizeBytes {
     if (-not (Test-Path -LiteralPath $Path)) {
         return [long]0
     }
-    $sum = (Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue |
-            Measure-Object -Property Length -Sum).Sum
-    if ($null -eq $sum) {
-        return [long]0
+    # Sum lengths directly. Avoid `(... | Measure-Object -Sum).Sum`: with zero
+    # files the subexpression is $null, and $null.Sum throws under StrictMode
+    # (the empty-staging crash after a cleanup step).
+    $files = @(Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue)
+    $total = [long]0
+    foreach ($f in $files) {
+        $total += [long]$f.Length
     }
-    return [long]$sum
+    return $total
 }
 
 # --- step execution ---------------------------------------------------------
