@@ -3,6 +3,11 @@ Architecture and internals
 
 Developer-facing design of the sequencer. For usage see `../help/`.
 
+The staging and archiving handoff has its own target design in `archiving.md`
+(producer/consumer split, the `wip → stage → ready` lifecycle). The as-built
+engine described below still uses a single `wip/` dir; `archiving.md` is where it
+is going.
+
 
 Components
 ----------------------------------------------------------------
