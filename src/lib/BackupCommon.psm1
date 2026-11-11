@@ -261,6 +261,69 @@ function Get-BackupPlan {
     return @($mandatory + $rest)
 }
 
+# --- staging phases (wip -> stage -> ready, trash) --------------------------
+
+function Get-StagingPaths {
+    param([Parameter(Mandatory)][string]$StagingRoot)
+    return @{
+        Wip   = Join-Path $StagingRoot 'wip'
+        Stage = Join-Path $StagingRoot 'stage'
+        Ready = Join-Path $StagingRoot 'ready'
+        Trash = Join-Path $StagingRoot 'trash'
+    }
+}
+
+function Move-ToTrash {
+    # Atomic rename of a dir into trash/ (instant); the reaper frees it later.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$TrashRoot)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    if (-not (Test-Path -LiteralPath $TrashRoot)) {
+        New-Item -ItemType Directory -Force -Path $TrashRoot | Out-Null
+    }
+    $name = (Split-Path -Leaf $Path) + '-' + ([guid]::NewGuid().ToString('n').Substring(0, 12))
+    [System.IO.Directory]::Move($Path, (Join-Path $TrashRoot $name))
+}
+
+function Move-Phase {
+    # Atomic rename of a backup dir from one phase to the next (same filesystem).
+    param([Parameter(Mandatory)][string]$Src, [Parameter(Mandatory)][string]$Dst)
+    $parent = Split-Path -Parent $Dst
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
+    [System.IO.Directory]::Move($Src, $Dst)
+}
+
+function Clear-Trash {
+    # Reaper: free everything already moved to trash/. Off the publish hot path.
+    param([Parameter(Mandatory)][string]$TrashRoot)
+    if (-not (Test-Path -LiteralPath $TrashRoot)) { return }
+    foreach ($item in (Get-ChildItem -LiteralPath $TrashRoot -Force -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Set-ServiceEnv {
+    # Apply an object's .env vars; return the prior values for restoration.
+    param($Obj)
+    $saved = @{}
+    if ((Test-HasProp $Obj 'env') -and ($null -ne $Obj.env)) {
+        # iterate the property objects (safe on an empty env {} under StrictMode)
+        foreach ($prop in @($Obj.env.PSObject.Properties)) {
+            $saved[$prop.Name] = [System.Environment]::GetEnvironmentVariable($prop.Name)
+            [System.Environment]::SetEnvironmentVariable($prop.Name, [string]$prop.Value)
+        }
+    }
+    return $saved
+}
+
+function Restore-ServiceEnv {
+    param([hashtable]$Saved)
+    foreach ($k in $Saved.Keys) {
+        [System.Environment]::SetEnvironmentVariable($k, $Saved[$k])
+    }
+}
+
 # --- run orchestration ------------------------------------------------------
 
 function Invoke-BackupRun {
@@ -275,6 +338,12 @@ function Invoke-BackupRun {
     }
     try {
         $runId = New-RunId
+        $stg = Get-StagingPaths -StagingRoot $Paths.StagingRoot
+        foreach ($d in @($stg.Wip, $stg.Stage, $stg.Ready, $stg.Trash)) {
+            if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+        }
+        Clear-Trash -TrashRoot $stg.Trash   # reap leftovers at run start, off the publish path
+
         Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'run.start' `
             -Props @{ runId = $runId; window = "$($Config.window.open)-$($Config.window.close)" }
 
@@ -292,7 +361,9 @@ function Invoke-BackupRun {
             }
             $svcName = $p.Service
             $svc = $Config.services.$svcName
-            $stagingDir = Join-Path $Paths.StagingRoot $svcName
+            $wipDir = Join-Path $stg.Wip $svcName
+            $stageDir = Join-Path $stg.Stage $svcName
+            $readyDir = Join-Path $stg.Ready $svcName
             $scriptPath = Join-Path $Paths.BaseDir $svc.script
 
             # pre-flight free-space check against the last recorded size (1.5x headroom)
@@ -306,48 +377,90 @@ function Invoke-BackupRun {
                 }
             }
 
-            # per-service env lets the same script target different hosts/setups
-            $savedEnv = @{}
-            if (Test-HasProp $svc 'env') {
-                foreach ($k in $svc.env.PSObject.Properties.Name) {
-                    $savedEnv[$k] = [System.Environment]::GetEnvironmentVariable($k)
-                    [System.Environment]::SetEnvironmentVariable($k, [string]$svc.env.$k)
-                }
-            }
+            # fresh wip dir (clear any leftover from a prior crash)
+            Move-ToTrash -Path $wipDir -TrashRoot $stg.Trash
+            New-Item -ItemType Directory -Force -Path $wipDir | Out-Null
 
+            # --- produce the artifact set into wip/<service> ---
+            $savedEnv = Set-ServiceEnv $svc
             $failed = $false
-            $maxBytes = [long]0
             try {
                 foreach ($stepDef in $svc.steps) {
                     $stepName = $stepDef.name
                     $always = (Test-HasProp $stepDef 'alwaysRun') -and $stepDef.alwaysRun
                     if ($failed -and -not $always) {
-                        continue   # skip normal steps after a failure, but still run recovery/cleanup
+                        continue   # skip normal steps after a failure, but still run recovery (e.g. start)
                     }
                     $retries = 0
                     if (Test-HasProp $stepDef 'retries') { $retries = [int]$stepDef.retries }
                     $action = [scriptblock]::Create(
-                        "& `"$scriptPath`" -Step `"$stepName`" -StagingDir `"$stagingDir`" -Service `"$svcName`"")
+                        "& `"$scriptPath`" -Step `"$stepName`" -StagingDir `"$wipDir`" -Service `"$svcName`"")
                     $r = Invoke-BackupStep -EventsPath $Paths.EventsPath -RunId $runId `
                         -Service $svcName -Step $stepName -Action $action -Retries $retries
-                    # measure after each step and keep the max (cleanup may free the dump)
-                    $sz = Get-PathSizeBytes -Path $stagingDir
-                    if ($sz -gt $maxBytes) { $maxBytes = $sz }
-                    if ($r -ne 'ok' -and -not $always) {
-                        $failed = $true
-                    }
+                    if ($r -ne 'ok' -and -not $always) { $failed = $true }
                 }
             }
             finally {
-                foreach ($k in $savedEnv.Keys) {
-                    [System.Environment]::SetEnvironmentVariable($k, $savedEnv[$k])
+                Restore-ServiceEnv $savedEnv
+            }
+
+            if ($failed) {
+                Move-ToTrash -Path $wipDir -TrashRoot $stg.Trash   # discard the partial dump
+                $failCount++
+                Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
+                    -Props @{ runId = $runId; svc = $svcName; status = 'fail'; bytes = 0 }
+                continue
+            }
+
+            $bytes = Get-PathSizeBytes -Path $wipDir
+
+            # --- promote wip -> stage ---
+            Move-ToTrash -Path $stageDir -TrashRoot $stg.Trash   # clear any leftover
+            Move-Phase -Src $wipDir -Dst $stageDir
+
+            # --- optional synchronous archive step, on stage/<service> ---
+            $syncFailed = $false
+            if (Test-HasProp $svc 'syncArchive') {
+                $sa = $svc.syncArchive
+                $saScript = Join-Path $Paths.BaseDir $sa.script
+                $savedSaEnv = Set-ServiceEnv $sa
+                try {
+                    $saAction = [scriptblock]::Create(
+                        "& `"$saScript`" -Step `"archive`" -StagingDir `"$stageDir`" -Service `"$svcName`"")
+                    $rsa = Invoke-BackupStep -EventsPath $Paths.EventsPath -RunId $runId `
+                        -Service $svcName -Step 'sync-archive' -Action $saAction
+                    $syncFailed = ($rsa -ne 'ok')
+                }
+                finally {
+                    Restore-ServiceEnv $savedSaEnv
+                }
+                if ($syncFailed) {
+                    Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.syncfail' `
+                        -Props @{ runId = $runId; svc = $svcName }
                 }
             }
 
-            $svcStatus = if ($failed) { 'fail' } else { 'ok' }
-            if ($failed) { $failCount++ } else { $okCount++ }
+            # --- publish stage -> ready (or discard if sync-only and sync ok) ---
+            $publishToReady = $true
+            if (Test-HasProp $svc 'publishToReady') { $publishToReady = [bool]$svc.publishToReady }
+            if ($syncFailed) { $publishToReady = $true }   # never lose a backup on sync failure
+
+            if ($publishToReady) {
+                if (Test-Path -LiteralPath $readyDir) {
+                    # previous backup never taken by the archiver: replace + notify
+                    Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.replaced' `
+                        -Props @{ runId = $runId; svc = $svcName; reason = 'previous-unarchived' }
+                    Move-ToTrash -Path $readyDir -TrashRoot $stg.Trash
+                }
+                Move-Phase -Src $stageDir -Dst $readyDir
+            }
+            else {
+                Move-ToTrash -Path $stageDir -TrashRoot $stg.Trash   # archived synchronously; drop local copy
+            }
+
+            $okCount++
             Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
-                -Props @{ runId = $runId; svc = $svcName; status = $svcStatus; bytes = $maxBytes }
+                -Props @{ runId = $runId; svc = $svcName; status = 'ok'; bytes = $bytes }
         }
 
         Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'run.end' `
@@ -397,7 +510,7 @@ function Send-BackupReport {
     }
     $passFile = Join-Path $BaseDir $Notify.passwordFile
     if (-not (Test-Path -LiteralPath $passFile)) {
-        Write-Warning "SparkPost password file not found: $passFile; skipping email."
+        Write-Warning "SMTP password file not found: $passFile; skipping email."
         return $false
     }
     $pass = (Get-Content -LiteralPath $passFile -Raw).Trim()
@@ -420,4 +533,5 @@ Export-ModuleMember -Function `
     New-RunId, Get-NowIso, Add-BackupEvent, Get-BackupEvents, Test-HasProp, `
     Get-ServiceProjection, Get-EstimatedServiceSeconds, Enter-SequencerLock, Exit-SequencerLock, `
     Test-WithinWindow, Get-FreeSpaceBytes, Get-PathSizeBytes, Invoke-BackupStep, `
+    Get-StagingPaths, Move-ToTrash, Move-Phase, Clear-Trash, `
     Get-BackupPlan, Invoke-BackupRun, Format-RunReport, Send-BackupReport

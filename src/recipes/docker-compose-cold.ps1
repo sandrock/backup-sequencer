@@ -7,12 +7,13 @@
 .DESCRIPTION
   Reusable across any docker-compose service. Parameters via environment
   (set by the service's config entry):
-    DCC_COMPOSE_DIR    directory containing docker-compose.yml   (required)
-    DCC_DATA_DIR       the data directory to archive             (required)
+    DCC_COMPOSE_DIR    directory containing docker-compose.yml   (required by stop/start)
+    DCC_DATA_DIR       the data directory to archive             (required by dump)
     DCC_COMPOSE_CMD    compose command        (default: 'docker compose')
     DCC_ARCHIVE_NAME   output tar file name    (default: '<service>_files.tar')
-  Produces an uncompressed tar (friendly to downstream dedup). Invoked once per
-  step by the sequencer.
+  Produces an uncompressed tar into the dir the sequencer passes as -StagingDir
+  (the service's wip/ dir). The sequencer owns everything after: promotion to
+  stage/ and ready/, archiving, and deletion. This recipe does NOT clean up.
 #>
 
 [CmdletBinding()]
@@ -28,19 +29,23 @@ $ErrorActionPreference = 'Stop'
 
 if ($Help -or -not $Step) {
     @'
-docker-compose-cold recipe — steps: stop | dump | start | cleanup
+docker-compose-cold recipe — steps: stop | dump | start
 Environment: DCC_COMPOSE_DIR, DCC_DATA_DIR, DCC_COMPOSE_CMD, DCC_ARCHIVE_NAME
 '@ | Write-Host
     return
 }
 
-$composeDir = if ($env:DCC_COMPOSE_DIR) { $env:DCC_COMPOSE_DIR } else { throw 'DCC_COMPOSE_DIR not set' }
-$dataDir    = if ($env:DCC_DATA_DIR) { $env:DCC_DATA_DIR } else { throw 'DCC_DATA_DIR not set' }
-$composeCmd = if ($env:DCC_COMPOSE_CMD) { $env:DCC_COMPOSE_CMD } else { 'docker compose' }
-$archive    = if ($env:DCC_ARCHIVE_NAME) { $env:DCC_ARCHIVE_NAME } else { "${Service}_files.tar" }
+function Get-RequiredEnv {
+    param([Parameter(Mandatory)][string]$Name)
+    $v = [System.Environment]::GetEnvironmentVariable($Name)
+    if (-not $v) { throw "$Name not set" }
+    return $v
+}
 
 function Invoke-Compose {
     param([string[]]$ComposeArgs)
+    $composeDir = Get-RequiredEnv 'DCC_COMPOSE_DIR'
+    $composeCmd = if ($env:DCC_COMPOSE_CMD) { $env:DCC_COMPOSE_CMD } else { 'docker compose' }
     # DCC_COMPOSE_CMD may be multi-word (e.g. 'sudo docker-compose'); split it.
     $parts = $composeCmd.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
     $exe = $parts[0]
@@ -61,9 +66,10 @@ switch ($Step) {
         Invoke-Compose @('down')
     }
     'dump' {
-        $wip = Join-Path $StagingDir 'wip'
-        New-Item -ItemType Directory -Force -Path $wip | Out-Null
-        $out = Join-Path $wip $archive
+        $dataDir = Get-RequiredEnv 'DCC_DATA_DIR'
+        $archive = if ($env:DCC_ARCHIVE_NAME) { $env:DCC_ARCHIVE_NAME } else { "${Service}_files.tar" }
+        New-Item -ItemType Directory -Force -Path $StagingDir | Out-Null
+        $out = Join-Path $StagingDir $archive
         $parent = Split-Path -Parent $dataDir
         $leaf = Split-Path -Leaf $dataDir
         # uncompressed tar (compression, if any, happens downstream)
@@ -72,15 +78,6 @@ switch ($Step) {
     }
     'start' {
         Invoke-Compose @('up', '-d')
-    }
-    'cleanup' {
-        # No downstream consumer is assumed here; free the staging dump (its size
-        # has already been recorded by the sequencer). A shipping step, if present,
-        # should run before this.
-        $wip = Join-Path $StagingDir 'wip'
-        if (Test-Path -LiteralPath $wip) {
-            Remove-Item -LiteralPath $wip -Recurse -Force -ErrorAction SilentlyContinue
-        }
     }
     default {
         throw "unknown step: $Step"

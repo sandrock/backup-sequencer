@@ -20,13 +20,12 @@
         "DCC_COMPOSE_DIR": "/srv/example-app",
         "DCC_DATA_DIR": "/srv/example-app/data",
         "DCC_COMPOSE_CMD": "docker compose",
-        "DCC_ARCHIVE_NAME": "example-app_files.tar"
+        "DCC_ARCHIVE_NAME": "example-app_data.tar"
       },
       "steps": [
         { "name": "stop", "resources": [] },
         { "name": "dump", "resources": ["diskA"], "timeoutSec": 1800 },
-        { "name": "start", "resources": [], "alwaysRun": true },
-        { "name": "cleanup", "resources": ["diskA"], "alwaysRun": true }
+        { "name": "start", "resources": [], "alwaysRun": true }
       ]
     }
   }

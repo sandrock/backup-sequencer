@@ -117,56 +117,100 @@ Describe 'step execution' {
     }
 }
 
-Describe 'run orchestration' {
-    It 'runs a service and records success with size' {
-        $ev = Join-Path $Work 'run-ok.jsonl'
+Describe 'staging lifecycle (wip -> stage -> ready)' {
+    BeforeEach {
+        $script:n = [guid]::NewGuid().ToString('n').Substring(0, 8)
+        $script:ev = Join-Path $Work "lc-$n.jsonl"
+        $script:root = Join-Path $Work "lc-$n"
+        $script:paths = @{ BaseDir = $script:TestsDir; EventsPath = $script:ev; LockPath = ($script:root + '.lock'); StagingRoot = $script:root }
+    }
+
+    It 'publishes a successful backup to ready/ and clears wip/stage' {
         $cfg = @'
 { "window": { "open": "00:00", "close": "23:59" },
-  "services": { "svc1": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
     "steps": [ { "name": "dump", "resources": [] },
-               { "name": "start", "resources": [], "alwaysRun": true },
-               { "name": "cleanup", "resources": [], "alwaysRun": true } ] } } }
+               { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ | ConvertFrom-Json
-        $paths = @{ BaseDir = $TestsDir; EventsPath = $ev; LockPath = (Join-Path $Work 'run-ok.lock'); StagingRoot = (Join-Path $Work 'stg-ok') }
         $runId = Invoke-BackupRun -Config $cfg -Paths $paths -Force
         $runId | Should -Not -BeNullOrEmpty
-        $se = Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'svc1' } | Select-Object -First 1
+        (Test-Path (Join-Path $root 'ready/app/data.bin')) | Should -BeTrue
+        (Test-Path (Join-Path $root 'ready/app/config.bin')) | Should -BeTrue
+        (Test-Path (Join-Path $root 'wip/app')) | Should -BeFalse
+        (Test-Path (Join-Path $root 'stage/app')) | Should -BeFalse
+        $se = Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'app' } | Select-Object -First 1
         $se.status | Should -Be 'ok'
         $se.bytes | Should -BeGreaterThan 0
     }
 
-    It 'still runs recovery/cleanup steps after a mid-service failure' {
-        $ev = Join-Path $Work 'run-fail.jsonl'
+    It 'does not publish a failed backup, but still runs recovery' {
         $cfg = @'
 { "window": { "open": "00:00", "close": "23:59" },
-  "services": { "svc2": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
     "steps": [ { "name": "dump", "resources": [] },
                { "name": "boom", "resources": [] },
-               { "name": "start", "resources": [], "alwaysRun": true },
-               { "name": "cleanup", "resources": [], "alwaysRun": true } ] } } }
+               { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ | ConvertFrom-Json
-        $paths = @{ BaseDir = $TestsDir; EventsPath = $ev; LockPath = (Join-Path $Work 'run-fail.lock'); StagingRoot = (Join-Path $Work 'stg-fail') }
         Invoke-BackupRun -Config $cfg -Paths $paths -Force | Out-Null
+        (Test-Path (Join-Path $root 'ready/app')) | Should -BeFalse
         $events = Get-BackupEvents -EventsPath $ev
-        ($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'svc2' } | Select-Object -First 1).status | Should -Be 'fail'
+        ($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'app' } | Select-Object -First 1).status | Should -Be 'fail'
         @($events | Where-Object { $_.type -eq 'step.start' -and $_.step -eq 'start' }).Count | Should -BeGreaterThan 0
     }
 
-    It 'completes (emits run.end) even when a step empties staging (regression, under Stop)' {
-        $ErrorActionPreference = 'Stop'
-        $ev = Join-Path $Work 'run-wipe.jsonl'
+    It 'replaces an unconsumed previous backup and notifies' {
+        New-Item -ItemType Directory -Force -Path (Join-Path $root 'ready/app') | Out-Null
+        Set-Content -LiteralPath (Join-Path $root 'ready/app/old.bin') -Value 'old'
         $cfg = @'
 { "window": { "open": "00:00", "close": "23:59" },
-  "services": { "svc3": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
     "steps": [ { "name": "dump", "resources": [] },
-               { "name": "wipe", "resources": [] } ] } } }
+               { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ | ConvertFrom-Json
-        $paths = @{ BaseDir = $TestsDir; EventsPath = $ev; LockPath = (Join-Path $Work 'run-wipe.lock'); StagingRoot = (Join-Path $Work 'stg-wipe') }
-        $runId = Invoke-BackupRun -Config $cfg -Paths $paths -Force
-        $runId | Should -Not -BeNullOrEmpty
-        $events = Get-BackupEvents -EventsPath $ev
-        @($events | Where-Object { $_.type -eq 'run.end' }).Count | Should -Be 1
-        # dump size survives the wipe (max-across-steps), so it is recorded, not lost to 0
-        ($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'svc3' } | Select-Object -First 1).bytes | Should -BeGreaterThan 0
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force | Out-Null
+        @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.replaced' }).Count | Should -BeGreaterThan 0
+        (Test-Path (Join-Path $root 'ready/app/data.bin')) | Should -BeTrue
+        (Test-Path (Join-Path $root 'ready/app/old.bin')) | Should -BeFalse
+    }
+
+    It 'reaps trash/ at run start' {
+        New-Item -ItemType Directory -Force -Path (Join-Path $root 'trash/junk') | Out-Null
+        Set-Content -LiteralPath (Join-Path $root 'trash/junk/f') -Value 'x'
+        $cfg = @'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "steps": [ { "name": "dump", "resources": [] },
+               { "name": "start", "resources": [], "alwaysRun": true } ] } } }
+'@ | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force | Out-Null
+        (Test-Path (Join-Path $root 'trash/junk')) | Should -BeFalse
+    }
+
+    It 'sync-only (publishToReady=false) archives then leaves nothing in ready/' {
+        $cfg = @'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "publishToReady": false,
+    "syncArchive": { "script": "fixtures/mock-service.ps1", "env": {} },
+    "steps": [ { "name": "dump", "resources": [] },
+               { "name": "start", "resources": [], "alwaysRun": true } ] } } }
+'@ | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force | Out-Null
+        (Test-Path (Join-Path $root 'ready/app')) | Should -BeFalse
+        @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'step.end' -and $_.step -eq 'sync-archive' -and $_.status -eq 'ok' }).Count | Should -BeGreaterThan 0
+    }
+
+    It 'publishes to ready/ and flags syncfail when the sync step fails' {
+        $cfg = @'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "publishToReady": false,
+    "syncArchive": { "script": "fixtures/mock-service.ps1", "env": { "MOCK_ARCHIVE_FAIL": "1" } },
+    "steps": [ { "name": "dump", "resources": [] },
+               { "name": "start", "resources": [], "alwaysRun": true } ] } } }
+'@ | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force | Out-Null
+        @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.syncfail' }).Count | Should -BeGreaterThan 0
+        (Test-Path (Join-Path $root 'ready/app/data.bin')) | Should -BeTrue
     }
 }
