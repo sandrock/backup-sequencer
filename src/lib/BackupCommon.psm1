@@ -176,7 +176,7 @@ function Get-PathSizeBytes {
     }
     # Sum lengths directly. Avoid `(... | Measure-Object -Sum).Sum`: with zero
     # files the subexpression is $null, and $null.Sum throws under StrictMode
-    # (the empty-staging crash after a cleanup step).
+    # (the empty-dir crash after a cleanup/wipe step).
     $files = @(Get-ChildItem -LiteralPath $Path -Recurse -File -ErrorAction SilentlyContinue)
     $total = [long]0
     foreach ($f in $files) {
@@ -261,15 +261,15 @@ function Get-BackupPlan {
     return @($mandatory + $rest)
 }
 
-# --- staging phases (wip -> stage -> ready, trash) --------------------------
+# --- spool phases (wip -> stage -> ready, trash) ----------------------------
 
-function Get-StagingPaths {
-    param([Parameter(Mandatory)][string]$StagingRoot)
+function Get-SpoolPaths {
+    param([Parameter(Mandatory)][string]$SpoolRoot)
     return @{
-        Wip   = Join-Path $StagingRoot 'wip'
-        Stage = Join-Path $StagingRoot 'stage'
-        Ready = Join-Path $StagingRoot 'ready'
-        Trash = Join-Path $StagingRoot 'trash'
+        Wip   = Join-Path $SpoolRoot 'wip'
+        Stage = Join-Path $SpoolRoot 'stage'
+        Ready = Join-Path $SpoolRoot 'ready'
+        Trash = Join-Path $SpoolRoot 'trash'
     }
 }
 
@@ -329,7 +329,7 @@ function Restore-ServiceEnv {
 function Invoke-BackupRun {
     param(
         [Parameter(Mandatory)]$Config,
-        [Parameter(Mandatory)][hashtable]$Paths,   # BaseDir, EventsPath, LockPath, StagingRoot
+        [Parameter(Mandatory)][hashtable]$Paths,   # BaseDir, EventsPath, LockPath, SpoolRoot
         [switch]$Force                              # bypass window gating (manual/test runs)
     )
     if (-not (Enter-SequencerLock -LockPath $Paths.LockPath)) {
@@ -338,7 +338,7 @@ function Invoke-BackupRun {
     }
     try {
         $runId = New-RunId
-        $stg = Get-StagingPaths -StagingRoot $Paths.StagingRoot
+        $stg = Get-SpoolPaths -SpoolRoot $Paths.SpoolRoot
         foreach ($d in @($stg.Wip, $stg.Stage, $stg.Ready, $stg.Trash)) {
             if (-not (Test-Path -LiteralPath $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
         }
@@ -369,7 +369,7 @@ function Invoke-BackupRun {
             # pre-flight free-space check against the last recorded size (1.5x headroom)
             if ($proj.ContainsKey($svcName) -and $proj[$svcName].lastBytes -gt 0) {
                 $need = [long]($proj[$svcName].lastBytes * 1.5)
-                $free = Get-FreeSpaceBytes -Path $Paths.StagingRoot
+                $free = Get-FreeSpaceBytes -Path $Paths.SpoolRoot
                 if ($free -lt $need) {
                     Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.skip' `
                         -Props @{ runId = $runId; svc = $svcName; reason = 'insufficient-space'; needBytes = $need; freeBytes = $free }
@@ -394,7 +394,7 @@ function Invoke-BackupRun {
                     $retries = 0
                     if (Test-HasProp $stepDef 'retries') { $retries = [int]$stepDef.retries }
                     $action = [scriptblock]::Create(
-                        "& `"$scriptPath`" -Step `"$stepName`" -StagingDir `"$wipDir`" -Service `"$svcName`"")
+                        "& `"$scriptPath`" -Step `"$stepName`" -OutDir `"$wipDir`" -Service `"$svcName`"")
                     $r = Invoke-BackupStep -EventsPath $Paths.EventsPath -RunId $runId `
                         -Service $svcName -Step $stepName -Action $action -Retries $retries
                     if ($r -ne 'ok' -and -not $always) { $failed = $true }
@@ -426,7 +426,7 @@ function Invoke-BackupRun {
                 $savedSaEnv = Set-ServiceEnv $sa
                 try {
                     $saAction = [scriptblock]::Create(
-                        "& `"$saScript`" -Step `"archive`" -StagingDir `"$stageDir`" -Service `"$svcName`"")
+                        "& `"$saScript`" -Step `"archive`" -OutDir `"$stageDir`" -Service `"$svcName`"")
                     $rsa = Invoke-BackupStep -EventsPath $Paths.EventsPath -RunId $runId `
                         -Service $svcName -Step 'sync-archive' -Action $saAction
                     $syncFailed = ($rsa -ne 'ok')
@@ -533,5 +533,5 @@ Export-ModuleMember -Function `
     New-RunId, Get-NowIso, Add-BackupEvent, Get-BackupEvents, Test-HasProp, `
     Get-ServiceProjection, Get-EstimatedServiceSeconds, Enter-SequencerLock, Exit-SequencerLock, `
     Test-WithinWindow, Get-FreeSpaceBytes, Get-PathSizeBytes, Invoke-BackupStep, `
-    Get-StagingPaths, Move-ToTrash, Move-Phase, Clear-Trash, `
+    Get-SpoolPaths, Move-ToTrash, Move-Phase, Clear-Trash, `
     Get-BackupPlan, Invoke-BackupRun, Format-RunReport, Send-BackupReport

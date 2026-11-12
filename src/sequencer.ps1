@@ -50,6 +50,22 @@ function Get-VarDir {
     return '/var/lib/backup-sequencer'
 }
 
+function Get-SpoolDefault {
+    # transient backups awaiting archive -> /var/spool (FHS: data awaiting processing)
+    if ($env:BACKUP_SEQUENCER_SPOOL_DIR) { return $env:BACKUP_SEQUENCER_SPOOL_DIR }
+    if ($IsWindows) { return (Join-Path (Join-Path $env:ProgramData 'backup-sequencer') 'spool') }
+    return '/var/spool/backup-sequencer'
+}
+
+function Format-DisplayTime {
+    # ConvertFrom-Json parses the ISO ts into [datetime]; render it back as ISO
+    # 8601 explicitly so output doesn't follow the pwsh culture (e.g. US 12h).
+    param($Ts)
+    if ($null -eq $Ts -or "$Ts" -eq '') { return 'never' }
+    try { return ([datetime]$Ts).ToString('yyyy-MM-ddTHH:mm:sszzz') }
+    catch { return [string]$Ts }
+}
+
 function Show-Usage {
     @'
 backup sequencer
@@ -84,15 +100,15 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
 $Config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
 
 $VarDir = Get-VarDir
-$StagingRoot = Join-Path $VarDir 'staging'
-if ((Test-HasProp $Config 'staging') -and $Config.staging) {
-    $StagingRoot = $Config.staging
+$SpoolRoot = Get-SpoolDefault
+if ((Test-HasProp $Config 'spool') -and $Config.spool) {
+    $SpoolRoot = $Config.spool
 }
 $Paths = @{
-    BaseDir     = $BaseDir
-    EventsPath  = Join-Path $VarDir 'events.jsonl'
-    LockPath    = Join-Path $VarDir 'sequencer.lock'
-    StagingRoot = $StagingRoot
+    BaseDir    = $BaseDir
+    EventsPath = Join-Path $VarDir 'events.jsonl'
+    LockPath   = Join-Path $VarDir 'sequencer.lock'
+    SpoolRoot  = $SpoolRoot
 }
 
 switch ($Command) {
@@ -103,7 +119,7 @@ switch ($Command) {
                 $Config.window.open, $Config.window.close, (Test-WithinWindow $Config.window.open $Config.window.close))
         foreach ($p in $plan) {
             $flag = if ($p.Mandatory) { '*' } else { ' ' }
-            $last = if ($p.LastSuccess) { $p.LastSuccess } else { 'never' }
+            $last = Format-DisplayTime $p.LastSuccess
             Write-Host ("  {0} {1,-24} est={2,6:N0}s  lastSuccess={3}" -f $flag, $p.Service, $p.EstimatedSec, $last)
         }
     }
@@ -124,7 +140,7 @@ switch ($Command) {
         $recent = @($runEnds | Select-Object -Last $Limit)
         [array]::Reverse($recent)
         foreach ($r in $recent) {
-            Write-Host ("{0}  ok={1} failed={2} planned={3}" -f $r.ts, $r.summary.ok, $r.summary.failed, $r.summary.planned)
+            Write-Host ("{0}  ok={1} failed={2} planned={3}" -f (Format-DisplayTime $r.ts), $r.summary.ok, $r.summary.failed, $r.summary.planned)
         }
     }
     default {

@@ -1,6 +1,6 @@
 {
   "window": { "open": "23:00", "close": "06:00" },
-  "staging": "/srv/backup-staging",
+  "spool": "/var/spool/backup-sequencer",
   "resources": { "diskA": 1, "diskB": 1, "net-out": 1, "cpu": 2 },
   "notify": {
     "enabled": false,

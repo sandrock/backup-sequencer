@@ -1,13 +1,14 @@
-Staging and archiving model
+Spool and archiving model
 ================================
 
 How a completed backup is handed off to be archived. This is the boundary between
 the sequencer (which produces backups) and archivers (which ship them somewhere
 durable).
 
-Status: target design — not yet implemented. The current code uses a single
-`wip/` dir and a `cleanup` step; this document describes where it is going. See
-`architecture.md` for the as-built engine.
+Status: implemented — the engine follows this model (`wip -> stage -> ready`,
+atomic promotion, overwrite-and-notify, deletion via `trash/`). The async archiver
+itself (the consumer of `ready/`) is out of scope for the sequencer and not part
+of this repo.
 
 
 Principle: producer / consumer
@@ -24,17 +25,17 @@ The sequencer makes no assumption about the method. This keeps the tool generic
 and the sequencer free of archiving concerns.
 
 
-The staging lifecycle
+The spool lifecycle
 ----------------------------------------------------------------
 
 A backup is a *set of artifacts* (e.g. a compose dir, binaries, data, a database
 dump) — not a single file. Keeping them separate lets each be restored on its own
 and lets a dedup archiver (restic) skip the ones that didn't change.
 
-The staging root has top-level phase dirs; each holds one subdir per service:
+The spool root has top-level phase dirs; each holds one subdir per service:
 
 ```
-<staging-root>/
+<spool-root>/
   wip/      dumps being built              wip/<service>/
   stage/    complete; sync-archive step     stage/<service>/
   ready/    done; awaiting async archiver    ready/<service>/
@@ -48,7 +49,7 @@ several artifacts of that backup.
 
 The engine owns the promotions:
 1. backup steps (e.g. stop / dump / start) write the artifact set into
-   `wip/<service>/`;
+   `wip/<service>/` (passed to the recipe as `-OutDir`);
 2. engine: atomic `wip/<service> → stage/<service>` (the set is complete);
 3. the optional sync-archive step runs against `stage/<service>/`;
 4. engine: atomic `stage/<service> → ready/<service>` (publish).
@@ -89,7 +90,7 @@ The `ready/` contract
 - Bounded, never accumulating: `ready/` holds at most the latest backup per
   service. If the previous one is still there when a new one is published (the
   archiver has not taken it), the engine replaces it and emits a notification
-  ("archiver has not kept up") rather than piling copies up. One local copy only.
+  (`service.replaced`) rather than piling copies up. One local copy only.
 - One physical copy end to end: the backup is moved between phases by rename, not
   copied — safe for large backups.
 
@@ -100,15 +101,13 @@ Deletion is a rename, reaped asynchronously
 Removing a backup set can be slow (many gigabytes, many inodes), and some of those
 removals happen on the backup critical path — the engine's replace-and-publish
 runs inside the time window. So "delete" is not an inline `rm`; it is an atomic
-rename into `trash/` (instant), and a reaper empties `trash/` opportunistically,
-off the hot path (e.g. at the start of a run, or as a low-priority background
-task), where it does not compete with publishing.
+rename into `trash/` (instant), and a reaper empties `trash/` at the start of each
+run, off the publish hot path, where it does not compete with publishing.
 
-Both deleters use it: the engine's replace-delete and, if it wishes, the
-archiver's post-ship delete both just rename into `trash/`. This keeps every
-delete O(1) on the path that matters and lets the actual freeing happen when there
-is slack. The reaper is the engine's one piece of deletion work — and it only ever
-removes things already moved to `trash/`, never a live `ready/` set.
+The engine's replace-delete uses it; an archiver's post-ship delete may too. This
+keeps every delete O(1) on the path that matters and lets the actual freeing
+happen when there is slack. The reaper only ever removes things already moved to
+`trash/`, never a live `ready/` set.
 
 
 The replace-while-fetching race
@@ -162,8 +161,8 @@ Engine vs recipe responsibilities
 - Engine: the atomic promotions, the `ready/` contract (bound, replace + notify),
   running the optional sync-archive step in the `stage` phase, and reaping
   `trash/`.
-- Recipe: produce the artifact set into `wip/<service>/` (stop / dump / start).
-  Recipes do not deal with staging phases or archiving.
+- Recipe: produce the artifact set into the `-OutDir` it is given (stop / dump /
+  start). Recipes do not deal with spool phases or archiving.
 - Sync-archive step: a shared, optional step-script (not duplicated per recipe),
   selected per service in config, run in the `stage` phase.
 - Async archiver: entirely outside the sequencer.
@@ -173,5 +172,5 @@ Concurrency of runs
 ----------------------------------------------------------------
 
 Two sequencer runs never overlap: the single-instance lock (a PID lock file,
-reclaimed if stale) makes a second run exit immediately. So the staging dirs are
+reclaimed if stale) makes a second run exit immediately. So the spool dirs are
 only ever advanced by one producer at a time.

@@ -20,32 +20,38 @@ Where things go
 |---|---|---|
 | Code (this repo) | `/opt/backup-sequencer` | `C:\Program Files\backup-sequencer` |
 | Config | `/etc/backup-sequencer/` | `%ProgramData%\backup-sequencer\` |
-| State (events, lock, staging) | `/var/lib/backup-sequencer/` | `%ProgramData%\backup-sequencer\var\` |
+| State (events, lock) | `/var/lib/backup-sequencer/` | `%ProgramData%\backup-sequencer\var\` |
+| Spool (transient backups) | `/var/spool/backup-sequencer/` | `%ProgramData%\backup-sequencer\spool\` |
 
-All three are overridable with `BACKUP_SEQUENCER_CONFIG_DIR` and
-`BACKUP_SEQUENCER_VAR_DIR`. Deploy the code read-only (git pull / rsync /
+All are overridable with `BACKUP_SEQUENCER_CONFIG_DIR`, `BACKUP_SEQUENCER_VAR_DIR`,
+and `BACKUP_SEQUENCER_SPOOL_DIR`. Deploy the code read-only (git pull / rsync /
 package); keep config and secrets out of the code tree.
 
 
 Where backups land
 ----------------------------------------------------------------
 
-Each service's dump is produced under a *staging* directory:
+Each service's backup is produced and held under a *spool* root, which has phase
+dirs; a backup moves through them by atomic rename:
 
 ```
-<staging-root>/<service>/wip/<archive>
+<spool-root>/
+  wip/<service>/      being built
+  stage/<service>/    complete; an optional sync-archive step runs here
+  ready/<service>/    done; waiting for the async archiver to take it
+  trash/              deletions, reaped at the next run
 ```
 
-The staging root is resolved as:
+The spool root is resolved as:
 
-1. `staging` in `config.json`, if set; otherwise
-2. `<state dir>/staging` — i.e. `/var/lib/backup-sequencer/staging` (Linux) or
-   `%ProgramData%\backup-sequencer\var\staging` (Windows).
+1. `spool` in `config.json`, if set; otherwise
+2. `/var/spool/backup-sequencer` (Linux) or `%ProgramData%\backup-sequencer\spool`
+   (Windows) — override with `BACKUP_SEQUENCER_SPOOL_DIR`.
 
-Set `staging` explicitly to a path with room for a service's largest dump —
+Set `spool` explicitly to a path with room for a service's largest backup —
 especially if the state dir is on a small system disk. Put it on the volume that
-has the space. A shipping step, if present, reads from here; otherwise the recipe's
-`cleanup` frees it after the run.
+has the space. The async archiver takes completed backups from `ready/<service>/`
+and deletes them; see `../docs/archiving.md`.
 
 
 Configure

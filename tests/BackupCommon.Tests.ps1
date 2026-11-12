@@ -61,7 +61,7 @@ Describe 'time window' {
     }
 }
 
-Describe 'staging size measurement' {
+Describe 'path size measurement' {
     It 'returns 0 for a non-existent path' {
         Get-PathSizeBytes -Path (Join-Path $Work 'nope') | Should -Be 0
     }
@@ -117,12 +117,12 @@ Describe 'step execution' {
     }
 }
 
-Describe 'staging lifecycle (wip -> stage -> ready)' {
+Describe 'spool lifecycle (wip -> stage -> ready)' {
     BeforeEach {
         $script:n = [guid]::NewGuid().ToString('n').Substring(0, 8)
         $script:ev = Join-Path $Work "lc-$n.jsonl"
         $script:root = Join-Path $Work "lc-$n"
-        $script:paths = @{ BaseDir = $script:TestsDir; EventsPath = $script:ev; LockPath = ($script:root + '.lock'); StagingRoot = $script:root }
+        $script:paths = @{ BaseDir = $script:TestsDir; EventsPath = $script:ev; LockPath = ($script:root + '.lock'); SpoolRoot = $script:root }
     }
 
     It 'publishes a successful backup to ready/ and clears wip/stage' {
