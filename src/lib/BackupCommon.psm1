@@ -10,6 +10,8 @@ class RecipeContext {
     [string]    $Service
     [string]    $OutDir       # dir the recipe writes into (wip for backup, stage for archive)
     [object]    $Env          # the service's / step's config env object
+    [string]    $EventsPath   # sequencer event log path (read-only; archivers route by it)
+    [string]    $RunId        # the run id; name archives by it so they tie back to the run
     [hashtable] $State = @{}   # shared across this recipe's steps (e.g. WasRunning)
     [hashtable] $Steps = @{}   # step name -> scriptblock(param($ctx))
 
@@ -31,6 +33,15 @@ class RecipeContext {
         $v = $this.EnvValue($name, '')
         if ($v -eq '') { throw "$name not set" }
         return $v
+    }
+
+    [object[]] ReadEvents() {
+        # read-only access to the sequencer event log (for archivers that route/prune by it)
+        if (-not $this.EventsPath -or -not (Test-Path -LiteralPath $this.EventsPath)) { return @() }
+        $out = foreach ($line in (Get-Content -LiteralPath $this.EventsPath)) {
+            if ($line.Trim()) { $line | ConvertFrom-Json }
+        }
+        return @($out)
     }
 }
 
@@ -402,6 +413,8 @@ function Invoke-BackupRun {
             $rc.Service = $svcName
             $rc.OutDir = $wipDir
             $rc.Env = if (Test-HasProp $svc 'env') { $svc.env } else { $null }
+            $rc.EventsPath = $Paths.EventsPath
+            $rc.RunId = $runId
             & $scriptPath -Recipe $rc
 
             $failed = $false
@@ -457,7 +470,17 @@ function Invoke-BackupRun {
                     $arc = [RecipeContext]::new()
                     $arc.Service = $svcName
                     $arc.OutDir = $stageDir
-                    $arc.Env = if (Test-HasProp $sa 'env') { $sa.env } else { $null }
+                    $arc.EventsPath = $Paths.EventsPath
+                    $arc.RunId = $runId
+                    # archive env: top-level config.archive defaults, overridden per-service
+                    $archiveEnv = [ordered]@{}
+                    if ((Test-HasProp $Config 'archive') -and ($null -ne $Config.archive)) {
+                        foreach ($p in @($Config.archive.PSObject.Properties)) { $archiveEnv[$p.Name] = $p.Value }
+                    }
+                    if ((Test-HasProp $sa 'env') -and ($null -ne $sa.env)) {
+                        foreach ($p in @($sa.env.PSObject.Properties)) { $archiveEnv[$p.Name] = $p.Value }
+                    }
+                    $arc.Env = [pscustomobject]$archiveEnv
                     & $saScript -Recipe $arc
                     if (-not $arc.Steps.ContainsKey('archive')) {
                         $syncFailed = $true
@@ -480,6 +503,29 @@ function Invoke-BackupRun {
                             Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.syncfail' `
                                 -Props @{ runId = $runId; svc = $svcName; reason = $reason }
                             Write-Warning "$svcName sync-archive FAILED: $reason (backup still published)"
+                        }
+                        else {
+                            # record the archive in the sequencer log (reported by the recipe)
+                            $res = if ($arc.State.ContainsKey('Result')) { $arc.State['Result'] } else { @{} }
+                            $props = @{ runId = $runId; svc = $svcName }
+                            if ($res -is [hashtable]) {
+                                if ($res.ContainsKey('tier') -and $res['tier']) { $props['tier'] = $res['tier'] }
+                                if ($res.ContainsKey('path') -and $res['path']) { $props['path'] = $res['path'] }
+                            }
+                            Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.archived' -Props $props
+                            # record any archives the recipe pruned (log-driven retention)
+                            $prunedCount = 0
+                            if (($res -is [hashtable]) -and $res.ContainsKey('pruned') -and $res['pruned']) {
+                                foreach ($pp in @($res['pruned'])) {
+                                    Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.archive-pruned' `
+                                        -Props @{ runId = $runId; svc = $svcName; path = $pp }
+                                }
+                                $prunedCount = @($res['pruned']).Count
+                            }
+                            $archMsg = "  $svcName  archived"
+                            if ($props.ContainsKey('path')) { $archMsg += " -> $($props['path'])" }
+                            if ($prunedCount -gt 0) { $archMsg += "  (pruned $prunedCount)" }
+                            Write-Information $archMsg
                         }
                     }
                 }

@@ -213,4 +213,51 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.syncfail' }).Count | Should -BeGreaterThan 0
         (Test-Path (Join-Path $root 'ready/app/data.bin')) | Should -BeTrue
     }
+
+    It 'archive-copy copies the set to dest (ARCHIVE_DEST from top-level) and logs service.archived' {
+        $dest = Join-Path $Work "cloud-$n"
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "archive": { "ARCHIVE_DEST": "__DEST__" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "publishToReady": true,
+    "syncArchive": { "script": "../src/recipes/archive-copy.ps1", "env": { "ARCHIVE_KEEP": "3" } },
+    "steps": [ { "name": "dump", "resources": [] }, { "name": "start", "resources": [], "alwaysRun": true } ] } } }
+'@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        $copies = @(Get-ChildItem -Path (Join-Path $dest 'app') -Directory -ErrorAction SilentlyContinue)
+        $copies.Count | Should -Be 1
+        (Test-Path (Join-Path $copies[0].FullName 'data.bin')) | Should -BeTrue
+        @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archived' -and $_.svc -eq 'app' }).Count | Should -BeGreaterThan 0
+    }
+
+    It 'archive-copy prunes by the log (keep N), deleting recorded paths, leaving foreign dirs alone' {
+        $dest = Join-Path $Work "cloudp-$n"
+        $svcDir = Join-Path $dest 'app'
+        New-Item -ItemType Directory -Force -Path $svcDir | Out-Null
+        # a foreign dir the archiver never recorded -> must never be pruned
+        New-Item -ItemType Directory -Force -Path (Join-Path $svcDir 'daily') | Out-Null
+        # seed three prior archives in the log (oldest first) with matching dirs
+        foreach ($d in '2026-11-01', '2026-11-02', '2026-11-03') {
+            $p = Join-Path $svcDir ([datetime]"${d}T00:00:00").ToString('yyyyMMdd-HHmmss')
+            New-Item -ItemType Directory -Force -Path $p | Out-Null
+            Add-Content -LiteralPath $ev -Value (@{ ts = "${d}T00:00:00+00:00"; type = 'service.archived'; svc = 'app'; path = $p } | ConvertTo-Json -Compress)
+        }
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "publishToReady": false,
+    "syncArchive": { "script": "../src/recipes/archive-copy.ps1", "env": { "ARCHIVE_DEST": "__DEST__", "ARCHIVE_KEEP": "2" } },
+    "steps": [ { "name": "dump", "resources": [] } ] } } }
+'@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        # oldest two recorded archives pruned (by their logged paths); newest kept
+        (Test-Path (Join-Path $svcDir '20261101-000000')) | Should -BeFalse
+        (Test-Path (Join-Path $svcDir '20261102-000000')) | Should -BeFalse
+        (Test-Path (Join-Path $svcDir '20261103-000000')) | Should -BeTrue
+        # the foreign dir, never in the log, is untouched
+        (Test-Path (Join-Path $svcDir 'daily')) | Should -BeTrue
+        # two archive-pruned events recorded
+        @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archive-pruned' -and $_.svc -eq 'app' }).Count | Should -Be 2
+    }
 }

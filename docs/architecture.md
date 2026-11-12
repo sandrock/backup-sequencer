@@ -46,8 +46,10 @@ Two files, single-writer each:
   `alwaysRun`.
 - `events.jsonl` — engine-owned, append-only. One typed line per event
   (`run.start`, `run.plan`, `step.start`, `step.end`, `service.end`,
-  `service.skip`, `service.replaced`, `service.syncfail`, `run.windowclosed`,
-  `run.end`). Crash-safe and the single source of truth.
+  `service.skip`, `service.replaced`, `service.syncfail`, `service.archived`,
+  `service.archive-pruned`, `run.windowclosed`, `run.end`). Crash-safe and the
+  single source of truth — e.g. archivers route and prune by `service.archived` /
+  `service.archive-pruned` rather than by directory names.
 
 "Current state" is a projection folded from the event log
 (`Get-ServiceProjection`): per service, last success, typical step durations,

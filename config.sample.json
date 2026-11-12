@@ -2,6 +2,7 @@
   "window": { "open": "23:00", "close": "06:00" },
   "spool": "/var/spool/backup-sequencer",
   "resources": { "diskA": 1, "diskB": 1, "net-out": 1, "cpu": 2 },
+  "archive": { "ARCHIVE_DEST": "/var/backups/cloud" },
   "notify": {
     "enabled": false,
     "from": "backups@example.com",
@@ -21,6 +22,11 @@
         "DCC_DATA_DIR": "/srv/example-app/data",
         "DCC_COMPOSE_CMD": "docker compose",
         "DCC_ARCHIVE_NAME": "example-app_data.tar"
+      },
+      "publishToReady": true,
+      "syncArchive": {
+        "script": "recipes/archive-copy.ps1",
+        "env": { "ARCHIVE_KEEP": "7" }
       },
       "steps": [
         { "name": "stop", "resources": [] },
