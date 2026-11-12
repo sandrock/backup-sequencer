@@ -132,7 +132,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "steps": [ { "name": "dump", "resources": [] },
                { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ | ConvertFrom-Json
-        $runId = Invoke-BackupRun -Config $cfg -Paths $paths -Force
+        $runId = Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue
         $runId | Should -Not -BeNullOrEmpty
         (Test-Path (Join-Path $root 'ready/app/data.bin')) | Should -BeTrue
         (Test-Path (Join-Path $root 'ready/app/config.bin')) | Should -BeTrue
@@ -151,7 +151,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
                { "name": "boom", "resources": [] },
                { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
         (Test-Path (Join-Path $root 'ready/app')) | Should -BeFalse
         $events = Get-BackupEvents -EventsPath $ev
         ($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'app' } | Select-Object -First 1).status | Should -Be 'fail'
@@ -167,7 +167,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "steps": [ { "name": "dump", "resources": [] },
                { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
         @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.replaced' }).Count | Should -BeGreaterThan 0
         (Test-Path (Join-Path $root 'ready/app/data.bin')) | Should -BeTrue
         (Test-Path (Join-Path $root 'ready/app/old.bin')) | Should -BeFalse
@@ -182,7 +182,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "steps": [ { "name": "dump", "resources": [] },
                { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
         (Test-Path (Join-Path $root 'trash/junk')) | Should -BeFalse
     }
 
@@ -195,7 +195,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "steps": [ { "name": "dump", "resources": [] },
                { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
         (Test-Path (Join-Path $root 'ready/app')) | Should -BeFalse
         @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'step.end' -and $_.step -eq 'sync-archive' -and $_.status -eq 'ok' }).Count | Should -BeGreaterThan 0
     }
@@ -209,7 +209,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "steps": [ { "name": "dump", "resources": [] },
                { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
         @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.syncfail' }).Count | Should -BeGreaterThan 0
         (Test-Path (Join-Path $root 'ready/app/data.bin')) | Should -BeTrue
     }

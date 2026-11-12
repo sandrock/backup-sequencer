@@ -94,7 +94,7 @@ switch ($Step) {
             Invoke-Compose @('down')
         }
         else {
-            Write-Host "$Service is already down; not stopping"
+            Write-Information "$Service is already down; not stopping"
         }
     }
     'dump' {
@@ -114,7 +114,7 @@ switch ($Step) {
             Invoke-Compose @('up', '-d')
         }
         else {
-            Write-Host "$Service was not running before the backup; leaving it down"
+            Write-Information "$Service was not running before the backup; leaving it down"
         }
     }
     default {

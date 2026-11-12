@@ -124,14 +124,12 @@ switch ($Command) {
         }
     }
     'run' {
-        $runId = Invoke-BackupRun -Config $Config -Paths $Paths -Force:$Force
-        if ($runId) {
+        # the engine narrates the run live; here we only send the email report
+        $runId = Invoke-BackupRun -Config $Config -Paths $Paths -Force:$Force -InformationAction Continue
+        if ($runId -and (Test-HasProp $Config 'notify') -and $Config.notify.enabled) {
             $report = Format-RunReport -EventsPath $Paths.EventsPath -RunId $runId
-            Write-Host $report
-            if ((Test-HasProp $Config 'notify') -and $Config.notify.enabled) {
-                Send-BackupReport -Notify $Config.notify -Subject "backup report $runId" `
-                    -Body $report -BaseDir (Get-ConfigDir) | Out-Null
-            }
+            Send-BackupReport -Notify $Config.notify -Subject "backup report $runId" `
+                -Body $report -BaseDir (Get-ConfigDir) | Out-Null
         }
     }
     'history' {
@@ -140,7 +138,11 @@ switch ($Command) {
         $recent = @($runEnds | Select-Object -Last $Limit)
         [array]::Reverse($recent)
         foreach ($r in $recent) {
-            Write-Host ("{0}  ok={1} failed={2} planned={3}" -f (Format-DisplayTime $r.ts), $r.summary.ok, $r.summary.failed, $r.summary.planned)
+            $svcs = @($events |
+                    Where-Object { $_.type -eq 'service.end' -and (Test-HasProp $_ 'runId') -and $_.runId -eq $r.runId } |
+                    ForEach-Object { "{0}:{1}" -f $_.svc, $_.status })
+            $svcStr = if ($svcs.Count) { $svcs -join ' ' } else { '(nothing run)' }
+            Write-Host ("{0}  ok={1} failed={2} planned={3}  [{4}]" -f (Format-DisplayTime $r.ts), $r.summary.ok, $r.summary.failed, $r.summary.planned, $svcStr)
         }
     }
     default {

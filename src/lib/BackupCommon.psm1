@@ -327,10 +327,14 @@ function Restore-ServiceEnv {
 # --- run orchestration ------------------------------------------------------
 
 function Invoke-BackupRun {
+    # Narration goes to the Information stream (progress) and Warning stream
+    # (notable events). Callers choose visibility via -InformationAction /
+    # -WarningAction; recipes inherit the same streams.
+    [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)][hashtable]$Paths,   # BaseDir, EventsPath, LockPath, SpoolRoot
-        [switch]$Force                              # bypass window gating (manual/test runs)
+        [switch]$Force                             # bypass window gating (manual/test runs)
     )
     if (-not (Enter-SequencerLock -LockPath $Paths.LockPath)) {
         Write-Warning 'sequencer already running; exiting.'
@@ -346,6 +350,7 @@ function Invoke-BackupRun {
 
         Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'run.start' `
             -Props @{ runId = $runId; window = "$($Config.window.open)-$($Config.window.close)" }
+        Write-Information ("Backup run {0}  (window {1}-{2})" -f $runId, $Config.window.open, $Config.window.close)
 
         $proj = Get-ServiceProjection -EventsPath $Paths.EventsPath
         $plan = Get-BackupPlan -Config $Config -Projection $proj
@@ -357,6 +362,7 @@ function Invoke-BackupRun {
         foreach ($p in $plan) {
             if (-not $Force -and -not (Test-WithinWindow -Open $Config.window.open -Close $Config.window.close)) {
                 Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'run.windowclosed' -Props @{ runId = $runId }
+                Write-Information ("Outside the backup window ({0}-{1}); nothing run. Use -Force to override." -f $Config.window.open, $Config.window.close)
                 break
             }
             $svcName = $p.Service
@@ -373,6 +379,7 @@ function Invoke-BackupRun {
                 if ($free -lt $need) {
                     Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.skip' `
                         -Props @{ runId = $runId; svc = $svcName; reason = 'insufficient-space'; needBytes = $need; freeBytes = $free }
+                    Write-Warning "$svcName skipped: insufficient space (need $need, free $free)"
                     continue
                 }
             }
@@ -409,6 +416,7 @@ function Invoke-BackupRun {
                 $failCount++
                 Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
                     -Props @{ runId = $runId; svc = $svcName; status = 'fail'; bytes = 0 }
+                Write-Warning "$svcName FAILED: partial dump discarded"
                 continue
             }
 
@@ -423,20 +431,34 @@ function Invoke-BackupRun {
             if (Test-HasProp $svc 'syncArchive') {
                 $sa = $svc.syncArchive
                 $saScript = Join-Path $Paths.BaseDir $sa.script
-                $savedSaEnv = Set-ServiceEnv $sa
-                try {
-                    $saAction = [scriptblock]::Create(
-                        "& `"$saScript`" -Step `"archive`" -OutDir `"$stageDir`" -Service `"$svcName`"")
-                    $rsa = Invoke-BackupStep -EventsPath $Paths.EventsPath -RunId $runId `
-                        -Service $svcName -Step 'sync-archive' -Action $saAction
-                    $syncFailed = ($rsa -ne 'ok')
-                }
-                finally {
-                    Restore-ServiceEnv $savedSaEnv
-                }
-                if ($syncFailed) {
+                if (-not (Test-Path -LiteralPath $saScript)) {
+                    $syncFailed = $true
+                    $reason = "recipe not found: $($sa.script)"
                     Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.syncfail' `
-                        -Props @{ runId = $runId; svc = $svcName }
+                        -Props @{ runId = $runId; svc = $svcName; reason = $reason }
+                    Write-Warning "$svcName sync-archive skipped: $reason (backup still published)"
+                }
+                else {
+                    $savedSaEnv = Set-ServiceEnv $sa
+                    try {
+                        $saAction = [scriptblock]::Create(
+                            "& `"$saScript`" -Step `"archive`" -OutDir `"$stageDir`" -Service `"$svcName`"")
+                        $rsa = Invoke-BackupStep -EventsPath $Paths.EventsPath -RunId $runId `
+                            -Service $svcName -Step 'sync-archive' -Action $saAction
+                        $syncFailed = ($rsa -ne 'ok')
+                    }
+                    finally {
+                        Restore-ServiceEnv $savedSaEnv
+                    }
+                    if ($syncFailed) {
+                        $reason = (Get-BackupEvents -EventsPath $Paths.EventsPath |
+                            Where-Object { $_.type -eq 'step.end' -and $_.svc -eq $svcName -and $_.step -eq 'sync-archive' -and $_.status -eq 'fail' } |
+                            Select-Object -Last 1).error
+                        if (-not $reason) { $reason = 'see events.jsonl' }
+                        Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.syncfail' `
+                            -Props @{ runId = $runId; svc = $svcName; reason = $reason }
+                        Write-Warning "$svcName sync-archive FAILED: $reason (backup still published)"
+                    }
                 }
             }
 
@@ -451,6 +473,7 @@ function Invoke-BackupRun {
                     Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.replaced' `
                         -Props @{ runId = $runId; svc = $svcName; reason = 'previous-unarchived' }
                     Move-ToTrash -Path $readyDir -TrashRoot $stg.Trash
+                    Write-Warning "$svcName replaced previous un-archived backup (archiver behind)"
                 }
                 Move-Phase -Src $stageDir -Dst $readyDir
             }
@@ -461,10 +484,14 @@ function Invoke-BackupRun {
             $okCount++
             Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
                 -Props @{ runId = $runId; svc = $svcName; status = 'ok'; bytes = $bytes }
+            $mb = [math]::Round(($bytes / 1MB), 1)
+            $dest = if ($publishToReady) { "ready/$svcName" } else { 'archived (sync); local copy dropped' }
+            Write-Information ("  {0}  OK  ({1} MB)  -> {2}" -f $svcName, $mb, $dest)
         }
 
         Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'run.end' `
             -Props @{ runId = $runId; summary = @{ ok = $okCount; failed = $failCount; planned = $plan.Count } }
+        Write-Information ("  -- ok={0} failed={1} planned={2}" -f $okCount, $failCount, $plan.Count)
         return $runId
     }
     finally {
