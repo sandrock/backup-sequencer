@@ -5,119 +5,87 @@
 .SYNOPSIS
   Recipe: cold backup of a docker-compose service (stop -> tar -> start).
 .DESCRIPTION
-  Reusable across any docker-compose service. Parameters via environment
-  (set by the service's config entry):
+  A backup recipe. The engine passes a RecipeContext as -Recipe; this script
+  registers its steps into it. Each step receives the context ($ctx) and shares
+  state through $ctx.State. Parameters come from the service config env (read via
+  $ctx.RequireEnv / $ctx.EnvValue):
     DCC_COMPOSE_DIR    directory containing docker-compose.yml   (required by stop/start)
     DCC_DATA_DIR       the data directory to archive             (required by dump)
     DCC_COMPOSE_CMD    compose command        (default: 'docker compose')
     DCC_ARCHIVE_NAME   output tar file name    (default: '<service>_data.tar')
-  Writes an uncompressed tar into the dir the sequencer passes as -OutDir (the
-  service's wip dir). The sequencer owns everything after.
+  Writes an uncompressed tar into $ctx.OutDir (the service's wip dir). The
+  sequencer owns everything after.
 
   Restart policy: 'start' only brings the service back up if it was running when
-  'stop' ran. A service already down at backup time stays down — the sequencer
-  restores state, it does not resurrect stopped services.
+  'stop' ran (tracked in $ctx.State.WasRunning). A service already down at backup
+  time stays down.
 #>
 
-[CmdletBinding()]
-param(
-    [string]$Step,
-    [string]$OutDir,
-    [string]$Service = 'service',
-    [switch]$Help
-)
+param($Recipe)
 
-Set-StrictMode -Version Latest
-$ErrorActionPreference = 'Stop'
-
-if ($Help -or -not $Step) {
-    @'
-docker-compose-cold recipe — steps: stop | dump | start
-Environment: DCC_COMPOSE_DIR, DCC_DATA_DIR, DCC_COMPOSE_CMD, DCC_ARCHIVE_NAME
-'start' only restarts a service that was running before 'stop'.
-'@ | Write-Host
+if ($null -eq $Recipe) {
+    Write-Host 'This is a sequencer recipe; it is loaded by the engine, not run directly.'
     return
 }
 
-function Get-RequiredEnv {
-    param([Parameter(Mandatory)][string]$Name)
-    $v = [System.Environment]::GetEnvironmentVariable($Name)
-    if (-not $v) { throw "$Name not set" }
-    return $v
-}
-
-function Get-ComposeParts {
-    # DCC_COMPOSE_CMD may be multi-word (e.g. 'sudo docker-compose'); split it.
-    $composeCmd = if ($env:DCC_COMPOSE_CMD) { $env:DCC_COMPOSE_CMD } else { 'docker compose' }
+$Recipe.AddStep('stop', {
+    param($ctx)
+    $composeDir = $ctx.RequireEnv('DCC_COMPOSE_DIR')
+    $composeCmd = $ctx.EnvValue('DCC_COMPOSE_CMD', 'docker compose')
     $parts = $composeCmd.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
-    $pre = @()
-    if ($parts.Count -gt 1) { $pre = $parts[1..($parts.Count - 1)] }
-    return @{ Exe = $parts[0]; Pre = $pre }
-}
+    $exe = $parts[0]
+    $pre = @(); if ($parts.Count -gt 1) { $pre = $parts[1..($parts.Count - 1)] }
 
-function Invoke-Compose {
-    param([string[]]$ComposeArgs)
-    $composeDir = Get-RequiredEnv 'DCC_COMPOSE_DIR'
-    $c = Get-ComposeParts
-    Push-Location $composeDir
-    try {
-        & $c.Exe @($c.Pre) @ComposeArgs
-        if ($LASTEXITCODE -ne 0) { throw "compose '$($ComposeArgs -join ' ')' failed (exit $LASTEXITCODE)" }
-    }
-    finally {
-        Pop-Location
-    }
-}
-
-function Test-ComposeRunning {
-    $composeDir = Get-RequiredEnv 'DCC_COMPOSE_DIR'
-    $c = Get-ComposeParts
     Push-Location $composeDir
     try {
         $ids = $null
-        try { $ids = & $c.Exe @($c.Pre) ps -q 2>$null } catch { $ids = $null }
-        return [bool]($ids)
+        try { $ids = & $exe @pre ps -q 2>$null } catch { $ids = $null }
+        $running = [bool]$ids
+        $ctx.State['WasRunning'] = $running
+        if ($running) {
+            & $exe @pre down
+            if ($LASTEXITCODE -ne 0) { throw "compose down failed (exit $LASTEXITCODE)" }
+        }
+        else {
+            Write-Information "$($ctx.Service) is already down; not stopping"
+        }
     }
     finally {
         Pop-Location
     }
-}
+})
 
-# running state is carried from stop to start within the same process
-$wasKey = "DCC_WAS_RUNNING__$Service"
+$Recipe.AddStep('dump', {
+    param($ctx)
+    $dataDir = $ctx.RequireEnv('DCC_DATA_DIR')
+    $archive = $ctx.EnvValue('DCC_ARCHIVE_NAME', "$($ctx.Service)_data.tar")
+    New-Item -ItemType Directory -Force -Path $ctx.OutDir | Out-Null
+    $out = Join-Path $ctx.OutDir $archive
+    $parent = Split-Path -Parent $dataDir
+    $leaf = Split-Path -Leaf $dataDir
+    # uncompressed tar (compression, if any, happens downstream)
+    & tar -C $parent -cf $out $leaf
+    if ($LASTEXITCODE -ne 0) { throw "tar of '$dataDir' failed (exit $LASTEXITCODE)" }
+})
 
-switch ($Step) {
-    'stop' {
-        $running = Test-ComposeRunning
-        [System.Environment]::SetEnvironmentVariable($wasKey, $(if ($running) { '1' } else { '0' }), 'Process')
-        if ($running) {
-            Invoke-Compose @('down')
+$Recipe.AddStep('start', {
+    param($ctx)
+    if ($ctx.State.ContainsKey('WasRunning') -and $ctx.State['WasRunning']) {
+        $composeDir = $ctx.RequireEnv('DCC_COMPOSE_DIR')
+        $composeCmd = $ctx.EnvValue('DCC_COMPOSE_CMD', 'docker compose')
+        $parts = $composeCmd.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)
+        $exe = $parts[0]
+        $pre = @(); if ($parts.Count -gt 1) { $pre = $parts[1..($parts.Count - 1)] }
+        Push-Location $composeDir
+        try {
+            & $exe @pre up -d
+            if ($LASTEXITCODE -ne 0) { throw "compose up failed (exit $LASTEXITCODE)" }
         }
-        else {
-            Write-Information "$Service is already down; not stopping"
-        }
-    }
-    'dump' {
-        $dataDir = Get-RequiredEnv 'DCC_DATA_DIR'
-        $archive = if ($env:DCC_ARCHIVE_NAME) { $env:DCC_ARCHIVE_NAME } else { "${Service}_data.tar" }
-        New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-        $out = Join-Path $OutDir $archive
-        $parent = Split-Path -Parent $dataDir
-        $leaf = Split-Path -Leaf $dataDir
-        # uncompressed tar (compression, if any, happens downstream)
-        & tar -C $parent -cf $out $leaf
-        if ($LASTEXITCODE -ne 0) { throw "tar of '$dataDir' failed (exit $LASTEXITCODE)" }
-    }
-    'start' {
-        $was = [System.Environment]::GetEnvironmentVariable($wasKey)
-        if ($was -eq '1') {
-            Invoke-Compose @('up', '-d')
-        }
-        else {
-            Write-Information "$Service was not running before the backup; leaving it down"
+        finally {
+            Pop-Location
         }
     }
-    default {
-        throw "unknown step: $Step"
+    else {
+        Write-Information "$($ctx.Service) was not running before the backup; leaving it down"
     }
-}
+})

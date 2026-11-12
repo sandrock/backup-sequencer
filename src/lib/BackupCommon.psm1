@@ -4,6 +4,36 @@
 
 Set-StrictMode -Version Latest
 
+# --- recipe context (IoC: the engine owns it; a recipe registers its steps) -
+
+class RecipeContext {
+    [string]    $Service
+    [string]    $OutDir       # dir the recipe writes into (wip for backup, stage for archive)
+    [object]    $Env          # the service's / step's config env object
+    [hashtable] $State = @{}   # shared across this recipe's steps (e.g. WasRunning)
+    [hashtable] $Steps = @{}   # step name -> scriptblock(param($ctx))
+
+    [void] AddStep([string]$name, [scriptblock]$block) {
+        $this.Steps[$name] = $block
+    }
+
+    [string] EnvValue([string]$name, [string]$fallback) {
+        if ($null -ne $this.Env) {
+            $prop = $this.Env.PSObject.Properties[$name]
+            if ($null -ne $prop -and $null -ne $prop.Value -and "$($prop.Value)" -ne '') {
+                return [string]$prop.Value
+            }
+        }
+        return $fallback
+    }
+
+    [string] RequireEnv([string]$name) {
+        $v = $this.EnvValue($name, '')
+        if ($v -eq '') { throw "$name not set" }
+        return $v
+    }
+}
+
 # --- time / ids -------------------------------------------------------------
 
 function New-RunId {
@@ -303,27 +333,6 @@ function Clear-Trash {
     }
 }
 
-function Set-ServiceEnv {
-    # Apply an object's .env vars; return the prior values for restoration.
-    param($Obj)
-    $saved = @{}
-    if ((Test-HasProp $Obj 'env') -and ($null -ne $Obj.env)) {
-        # iterate the property objects (safe on an empty env {} under StrictMode)
-        foreach ($prop in @($Obj.env.PSObject.Properties)) {
-            $saved[$prop.Name] = [System.Environment]::GetEnvironmentVariable($prop.Name)
-            [System.Environment]::SetEnvironmentVariable($prop.Name, [string]$prop.Value)
-        }
-    }
-    return $saved
-}
-
-function Restore-ServiceEnv {
-    param([hashtable]$Saved)
-    foreach ($k in $Saved.Keys) {
-        [System.Environment]::SetEnvironmentVariable($k, $Saved[$k])
-    }
-}
-
 # --- run orchestration ------------------------------------------------------
 
 function Invoke-BackupRun {
@@ -388,27 +397,33 @@ function Invoke-BackupRun {
             Move-ToTrash -Path $wipDir -TrashRoot $stg.Trash
             New-Item -ItemType Directory -Force -Path $wipDir | Out-Null
 
-            # --- produce the artifact set into wip/<service> ---
-            $savedEnv = Set-ServiceEnv $svc
+            # --- load the recipe (it registers its steps) and produce into wip/<service> ---
+            $rc = [RecipeContext]::new()
+            $rc.Service = $svcName
+            $rc.OutDir = $wipDir
+            $rc.Env = if (Test-HasProp $svc 'env') { $svc.env } else { $null }
+            & $scriptPath -Recipe $rc
+
             $failed = $false
-            try {
-                foreach ($stepDef in $svc.steps) {
-                    $stepName = $stepDef.name
-                    $always = (Test-HasProp $stepDef 'alwaysRun') -and $stepDef.alwaysRun
-                    if ($failed -and -not $always) {
-                        continue   # skip normal steps after a failure, but still run recovery (e.g. start)
-                    }
-                    $retries = 0
-                    if (Test-HasProp $stepDef 'retries') { $retries = [int]$stepDef.retries }
-                    $action = [scriptblock]::Create(
-                        "& `"$scriptPath`" -Step `"$stepName`" -OutDir `"$wipDir`" -Service `"$svcName`"")
-                    $r = Invoke-BackupStep -EventsPath $Paths.EventsPath -RunId $runId `
-                        -Service $svcName -Step $stepName -Action $action -Retries $retries
-                    if ($r -ne 'ok' -and -not $always) { $failed = $true }
+            foreach ($stepDef in $svc.steps) {
+                $stepName = $stepDef.name
+                $always = (Test-HasProp $stepDef 'alwaysRun') -and $stepDef.alwaysRun
+                if ($failed -and -not $always) {
+                    continue   # skip normal steps after a failure, but still run recovery (e.g. start)
                 }
-            }
-            finally {
-                Restore-ServiceEnv $savedEnv
+                $retries = 0
+                if (Test-HasProp $stepDef 'retries') { $retries = [int]$stepDef.retries }
+                if ($rc.Steps.ContainsKey($stepName)) {
+                    $stepBlock = $rc.Steps[$stepName]
+                    $action = { & $stepBlock $rc }.GetNewClosure()
+                }
+                else {
+                    $missing = $stepName
+                    $action = { throw "recipe did not register step '$missing'" }.GetNewClosure()
+                }
+                $r = Invoke-BackupStep -EventsPath $Paths.EventsPath -RunId $runId `
+                    -Service $svcName -Step $stepName -Action $action -Retries $retries
+                if ($r -ne 'ok' -and -not $always) { $failed = $true }
             }
 
             if ($failed) {
@@ -439,25 +454,33 @@ function Invoke-BackupRun {
                     Write-Warning "$svcName sync-archive skipped: $reason (backup still published)"
                 }
                 else {
-                    $savedSaEnv = Set-ServiceEnv $sa
-                    try {
-                        $saAction = [scriptblock]::Create(
-                            "& `"$saScript`" -Step `"archive`" -OutDir `"$stageDir`" -Service `"$svcName`"")
-                        $rsa = Invoke-BackupStep -EventsPath $Paths.EventsPath -RunId $runId `
-                            -Service $svcName -Step 'sync-archive' -Action $saAction
-                        $syncFailed = ($rsa -ne 'ok')
-                    }
-                    finally {
-                        Restore-ServiceEnv $savedSaEnv
-                    }
-                    if ($syncFailed) {
-                        $reason = (Get-BackupEvents -EventsPath $Paths.EventsPath |
-                            Where-Object { $_.type -eq 'step.end' -and $_.svc -eq $svcName -and $_.step -eq 'sync-archive' -and $_.status -eq 'fail' } |
-                            Select-Object -Last 1).error
-                        if (-not $reason) { $reason = 'see events.jsonl' }
+                    $arc = [RecipeContext]::new()
+                    $arc.Service = $svcName
+                    $arc.OutDir = $stageDir
+                    $arc.Env = if (Test-HasProp $sa 'env') { $sa.env } else { $null }
+                    & $saScript -Recipe $arc
+                    if (-not $arc.Steps.ContainsKey('archive')) {
+                        $syncFailed = $true
+                        $reason = "recipe did not register an 'archive' step"
                         Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.syncfail' `
                             -Props @{ runId = $runId; svc = $svcName; reason = $reason }
                         Write-Warning "$svcName sync-archive FAILED: $reason (backup still published)"
+                    }
+                    else {
+                        $archiveBlock = $arc.Steps['archive']
+                        $saAction = { & $archiveBlock $arc }.GetNewClosure()
+                        $rsa = Invoke-BackupStep -EventsPath $Paths.EventsPath -RunId $runId `
+                            -Service $svcName -Step 'sync-archive' -Action $saAction
+                        $syncFailed = ($rsa -ne 'ok')
+                        if ($syncFailed) {
+                            $reason = (Get-BackupEvents -EventsPath $Paths.EventsPath |
+                                Where-Object { $_.type -eq 'step.end' -and $_.svc -eq $svcName -and $_.step -eq 'sync-archive' -and $_.status -eq 'fail' } |
+                                Select-Object -Last 1).error
+                            if (-not $reason) { $reason = 'see events.jsonl' }
+                            Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.syncfail' `
+                                -Props @{ runId = $runId; svc = $svcName; reason = $reason }
+                            Write-Warning "$svcName sync-archive FAILED: $reason (backup still published)"
+                        }
                     }
                 }
             }
