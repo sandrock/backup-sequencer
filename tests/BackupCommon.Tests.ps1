@@ -231,6 +231,34 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archived' -and $_.svc -eq 'app' }).Count | Should -BeGreaterThan 0
     }
 
+    It 'isolates a broken service: it fails but other services still run' {
+        $cfg = @'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": {
+    "broken": { "enabled": true, "mandatory": true, "script": "fixtures/throwing-recipe.ps1",
+      "steps": [ { "name": "dump", "resources": [] } ] },
+    "good": { "enabled": true, "mandatory": false, "script": "fixtures/mock-service.ps1",
+      "steps": [ { "name": "dump", "resources": [] }, { "name": "start", "resources": [], "alwaysRun": true } ] }
+  } }
+'@ | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        $events = Get-BackupEvents -EventsPath $ev
+        ($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'broken' } | Select-Object -First 1).status | Should -Be 'fail'
+        ($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'good' } | Select-Object -First 1).status | Should -Be 'ok'
+        @($events | Where-Object { $_.type -eq 'run.end' }).Count | Should -Be 1
+    }
+
+    It 'recipe registration output does not taint the returned run id' {
+        $cfg = @'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/noisy-recipe.ps1",
+    "steps": [ { "name": "dump", "resources": [] } ] } } }
+'@ | ConvertFrom-Json
+        $runId = Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue
+        $runId | Should -BeOfType [string]
+        $runId | Should -Match '^\d{8}-\d{6}-'
+    }
+
     It 'archive-copy prunes by the log (keep N), deleting recorded paths, leaving foreign dirs alone' {
         $dest = Join-Path $Work "cloudp-$n"
         $svcDir = Join-Path $dest 'app'

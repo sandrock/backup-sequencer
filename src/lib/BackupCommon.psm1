@@ -386,10 +386,12 @@ function Invoke-BackupRun {
                 break
             }
             $svcName = $p.Service
-            $svc = $Config.services.$svcName
             $wipDir = Join-Path $stg.Wip $svcName
             $stageDir = Join-Path $stg.Stage $svcName
             $readyDir = Join-Path $stg.Ready $svcName
+            try {
+            # isolate per-service failures: an unhandled error here fails only this service
+            $svc = $Config.services.$svcName
             $scriptPath = Join-Path $Paths.BaseDir $svc.script
 
             # pre-flight free-space check against the last recorded size (1.5x headroom)
@@ -415,7 +417,7 @@ function Invoke-BackupRun {
             $rc.Env = if (Test-HasProp $svc 'env') { $svc.env } else { $null }
             $rc.EventsPath = $Paths.EventsPath
             $rc.RunId = $runId
-            & $scriptPath -Recipe $rc
+            & $scriptPath -Recipe $rc | Out-Null   # registration only; don't let output taint the run
 
             $failed = $false
             foreach ($stepDef in $svc.steps) {
@@ -481,7 +483,7 @@ function Invoke-BackupRun {
                         foreach ($p in @($sa.env.PSObject.Properties)) { $archiveEnv[$p.Name] = $p.Value }
                     }
                     $arc.Env = [pscustomobject]$archiveEnv
-                    & $saScript -Recipe $arc
+                    & $saScript -Recipe $arc | Out-Null
                     if (-not $arc.Steps.ContainsKey('archive')) {
                         $syncFailed = $true
                         $reason = "recipe did not register an 'archive' step"
@@ -556,6 +558,15 @@ function Invoke-BackupRun {
             $mb = [math]::Round(($bytes / 1MB), 1)
             $dest = if ($publishToReady) { "ready/$svcName" } else { 'archived (sync); local copy dropped' }
             Write-Information ("  {0}  OK  ({1} MB)  -> {2}" -f $svcName, $mb, $dest)
+            }
+            catch {
+                $emsg = $_.Exception.Message
+                $failCount++
+                Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
+                    -Props @{ runId = $runId; svc = $svcName; status = 'fail'; bytes = 0; error = $emsg }
+                Write-Warning "$svcName FAILED: $emsg"
+                try { Move-ToTrash -Path $wipDir -TrashRoot $stg.Trash; Move-ToTrash -Path $stageDir -TrashRoot $stg.Trash } catch { }
+            }
         }
 
         Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'run.end' `
