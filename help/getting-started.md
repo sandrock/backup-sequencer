@@ -86,10 +86,14 @@ Schedule
 ----------------------------------------------------------------
 
 Run once at window open; the sequencer stops starting new work at window close.
+The run is not a daemon — it is invoked, enforces the window, and exits — so a
+scheduler fires it, it does not sleep until the window.
 
-- Linux (systemd): a `.timer` with `OnCalendar` at the window open, triggering a
-  oneshot service that runs `sequencer.ps1 run`. The single-instance lock makes a
-  double-trigger a no-op.
+- Linux (systemd): sample `.service` + `.timer` units are in
+  [`packages/systemd/`](../packages/systemd/README.md) — copy them to
+  `/etc/systemd/system/`, adjust paths and schedule, then
+  `systemctl enable --now backup-sequencer.timer`. The single-instance lock makes
+  a double-trigger a no-op.
 - Windows (Task Scheduler): a daily trigger at the window open running
   `pwsh.exe <install>\src\sequencer.ps1 run`.
 

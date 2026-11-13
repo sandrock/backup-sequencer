@@ -1,0 +1,32 @@
+# Sample unit. Copy to /etc/systemd/system/ and adjust the paths/user for your host.
+# Triggered by backup-sequencer.timer; not meant to be enabled on its own.
+
+[Unit]
+Description=Backup sequencer run
+Documentation=https://github.com/sandrock/backup-sequencer
+# Wait for the network and (if services are containers) the container runtime.
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Run as root: cold-backing docker volumes and assorted service data dirs usually
+# needs it. For a dedicated user instead, set User=backup and make sure it can
+# reach the container runtime and every data dir you back up.
+User=root
+
+# Absolute path to pwsh (check with: command -v pwsh) and to the installed code.
+# -SettingsFile points pwsh at a quiet logging config (LogLevel: Error), so pwsh's
+# own perftrack/script-block lines stay out of the journal — only the sequencer's
+# own output is logged. -NoProfile/-NonInteractive: don't load profiles, never prompt.
+ExecStart=/usr/bin/pwsh -NoProfile -NonInteractive -SettingsFile /opt/backup-sequencer/packages/systemd/powershell.config.json /opt/backup-sequencer/src/sequencer.ps1 run
+
+# A run can last the whole night window, so do not time it out.
+TimeoutStartSec=0
+
+# Config/state/spool use the FHS defaults (/etc, /var/lib, /var/spool/backup-sequencer).
+# Uncomment and edit only if your layout differs:
+#Environment=BACKUP_SEQUENCER_CONFIG_DIR=/etc/backup-sequencer
+#Environment=BACKUP_SEQUENCER_VAR_DIR=/var/lib/backup-sequencer
+#Environment=BACKUP_SEQUENCER_SPOOL_DIR=/var/spool/backup-sequencer

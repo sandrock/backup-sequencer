@@ -1,0 +1,17 @@
+# Sample unit. Copy to /etc/systemd/system/ and adjust the schedule for your host.
+
+[Unit]
+Description=Nightly backup sequencer timer
+Documentation=https://github.com/sandrock/backup-sequencer
+
+[Timer]
+# Start once at the window open; the run itself enforces the window and then exits.
+OnCalendar=*-*-* 23:00
+# If the machine was off at the scheduled time, run as soon as it is next up.
+Persistent=true
+# Spread the start a little (useful when several hosts share one backup target).
+RandomizedDelaySec=300
+Unit=backup-sequencer.service
+
+[Install]
+WantedBy=timers.target
