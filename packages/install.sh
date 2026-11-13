@@ -142,6 +142,8 @@ chmod +x "$wrapper"
 
 # --- config / state / spool ---
 ensure_dir "$CONFIG_DIR"
+ensure_dir "$CONFIG_DIR/secrets"            # for notify.passwordFile etc.
+chmod 700 "$CONFIG_DIR/secrets" 2>/dev/null || true
 ensure_dir "$VAR_DIR"
 ensure_dir "$SPOOL_DIR"
 cp "$SRC/config.sample.json" "$CONFIG_DIR/config.sample.json"

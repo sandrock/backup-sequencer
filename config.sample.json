@@ -15,7 +15,6 @@
     "example-app": {
       "enabled": true,
       "mandatory": true,
-      "class": "triggered",
       "script": "recipes/docker-compose-cold.ps1",
       "env": {
         "DCC_COMPOSE_DIR": "/srv/example-app",
@@ -26,11 +25,11 @@
       "publishToReady": true,
       "syncArchive": {
         "script": "recipes/archive-gfsy.ps1",
-        "env": { "ARCHIVE_KEEP_DAILY": "7", "ARCHIVE_KEEP_WEEKLY": "5", "ARCHIVE_KEEP_YEARLY": "3" }
+        "env": { "ARCHIVE_KEEP_DAILY": "3", "ARCHIVE_KEEP_WEEKLY": "3", "ARCHIVE_KEEP_YEARLY": "3" }
       },
       "steps": [
         { "name": "stop", "resources": [] },
-        { "name": "dump", "resources": ["diskA"], "timeoutSec": 1800 },
+        { "name": "dump", "resources": ["diskA"] },
         { "name": "start", "resources": [], "alwaysRun": true }
       ]
     }
