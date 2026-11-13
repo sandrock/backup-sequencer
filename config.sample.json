@@ -19,9 +19,9 @@
       "script": "recipes/docker-compose-cold.ps1",
       "env": {
         "DCC_COMPOSE_DIR": "/srv/example-app",
-        "DCC_DATA_DIR": "/srv/example-app/data",
-        "DCC_COMPOSE_CMD": "docker compose",
-        "DCC_ARCHIVE_NAME": "example-app_data.tar"
+        "DCC_DATA_DIRS": "/srv/example-app/data;/mnt/vol2/example-app-extra",
+        "DCC_COMPOSE_EXCLUDES": "logs;cache",
+        "DCC_COMPOSE_CMD": "docker compose"
       },
       "publishToReady": true,
       "syncArchive": {

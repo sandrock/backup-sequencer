@@ -9,12 +9,20 @@
   registers its steps into it. Each step receives the context ($ctx) and shares
   state through $ctx.State. Parameters come from the service config env (read via
   $ctx.RequireEnv / $ctx.EnvValue):
-    DCC_COMPOSE_DIR    directory containing docker-compose.yml   (required by stop/start)
-    DCC_DATA_DIR       the data directory to archive             (required by dump)
-    DCC_COMPOSE_CMD    compose command        (default: 'docker compose')
-    DCC_ARCHIVE_NAME   output tar file name    (default: '<service>_data.tar')
-  Writes an uncompressed tar into $ctx.OutDir (the service's wip dir). The
-  sequencer owns everything after.
+    DCC_COMPOSE_DIR          the compose dir (compose.yml + siblings)        (required)
+    DCC_DATA_DIRS            data dir(s) to archive; ';'-separated, may span
+                             volumes. Legacy DCC_DATA_DIR (single) accepted.  (required)
+    DCC_COMPOSE_EXCLUDES     extra paths (relative to the compose dir) to keep
+                             out of the compose archive, ';'-separated, e.g. 'logs'  (optional)
+    DCC_COMPOSE_CMD          compose command           (default: 'docker compose')
+    DCC_COMPOSE_ARCHIVE_NAME compose tar name   (default: '<service>_compose.tar')
+    DCC_DATA_ARCHIVE_NAME    data tar name; legacy DCC_ARCHIVE_NAME accepted
+                             (default: '<service>_data.tar')
+  The dump step writes two uncompressed tars into $ctx.OutDir: a compose archive
+  (the compose dir, automatically excluding any DCC_DATA_DIRS that live inside it,
+  plus DCC_COMPOSE_EXCLUDES) and a data archive (all DCC_DATA_DIRS, each stored
+  under its own leaf name). Compression, if any, happens downstream. The sequencer
+  owns everything after.
 
   Restart policy: 'start' only brings the service back up if it was running when
   'stop' ran (tracked in $ctx.State.WasRunning). A service already down at backup
@@ -57,15 +65,52 @@ $Recipe.AddStep('stop', {
 
 $Recipe.AddStep('dump', {
     param($ctx)
-    $dataDir = $ctx.RequireEnv('DCC_DATA_DIR')
-    $archive = $ctx.EnvValue('DCC_ARCHIVE_NAME', "$($ctx.Service)_data.tar")
     New-Item -ItemType Directory -Force -Path $ctx.OutDir | Out-Null
-    $out = Join-Path $ctx.OutDir $archive
-    $parent = Split-Path -Parent $dataDir
-    $leaf = Split-Path -Leaf $dataDir
-    # uncompressed tar (compression, if any, happens downstream)
-    & tar -C $parent -cf $out $leaf
-    if ($LASTEXITCODE -ne 0) { throw "tar of '$dataDir' failed (exit $LASTEXITCODE)" }
+
+    # data dirs: DCC_DATA_DIRS (';'-separated, may span volumes); legacy DCC_DATA_DIR as fallback
+    $dataSpec = $ctx.EnvValue('DCC_DATA_DIRS', $ctx.EnvValue('DCC_DATA_DIR', ''))
+    if ([string]::IsNullOrWhiteSpace($dataSpec)) { throw 'no data dir configured (set DCC_DATA_DIRS)' }
+    $dataDirs = @($dataSpec.Split(';', [System.StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() })
+
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+
+    # --- compose archive: the compose dir, minus any data dir inside it, minus configured excludes ---
+    $composeDir = $ctx.RequireEnv('DCC_COMPOSE_DIR')
+    $composeName = $ctx.EnvValue('DCC_COMPOSE_ARCHIVE_NAME', "$($ctx.Service)_compose.tar")
+    $composeParent = Split-Path -Parent $composeDir
+    $composeLeaf = Split-Path -Leaf $composeDir
+    $composeOut = Join-Path $ctx.OutDir $composeName
+    $composeFull = [System.IO.Path]::GetFullPath($composeDir).TrimEnd($sep)
+
+    $excludes = @()
+    foreach ($d in $dataDirs) {
+        # auto-exclude a data dir that lives inside the compose dir (the data tar already has it)
+        $full = [System.IO.Path]::GetFullPath($d).TrimEnd($sep)
+        if ($full.StartsWith($composeFull + $sep, [System.StringComparison]::Ordinal)) {
+            $rel = $full.Substring($composeFull.Length).TrimStart($sep) -replace '\\', '/'
+            $excludes += "$composeLeaf/$rel"
+        }
+    }
+    foreach ($e in @($ctx.EnvValue('DCC_COMPOSE_EXCLUDES', '').Split(';', [System.StringSplitOptions]::RemoveEmptyEntries))) {
+        $excludes += "$composeLeaf/$($e.Trim().Trim('/'))"
+    }
+    $composeArgs = @('-C', $composeParent)
+    foreach ($e in $excludes) { $composeArgs += "--exclude=$e" }
+    $composeArgs += @('-cf', $composeOut, $composeLeaf)
+    & tar @composeArgs
+    if ($LASTEXITCODE -ne 0) { throw "tar of compose dir '$composeDir' failed (exit $LASTEXITCODE)" }
+    # manifest (later TODO): record how this archive was made so the manifest can guide a restore.
+    # $ctx.AddArtifact(@{ name = $composeName; role = 'compose'; command = "tar $($composeArgs -join ' ')"; cwd = $composeParent })
+
+    # --- data archive: all data dirs in one tar, each under its leaf (multi-volume via repeated -C) ---
+    $dataName = $ctx.EnvValue('DCC_DATA_ARCHIVE_NAME', $ctx.EnvValue('DCC_ARCHIVE_NAME', "$($ctx.Service)_data.tar"))
+    $dataOut = Join-Path $ctx.OutDir $dataName
+    $dataArgs = @('-cf', $dataOut)
+    foreach ($d in $dataDirs) { $dataArgs += @('-C', (Split-Path -Parent $d), (Split-Path -Leaf $d)) }
+    & tar @dataArgs
+    if ($LASTEXITCODE -ne 0) { throw "tar of data dirs failed (exit $LASTEXITCODE)" }
+    # manifest (later TODO):
+    # $ctx.AddArtifact(@{ name = $dataName; role = 'data'; command = "tar $($dataArgs -join ' ')"; cwd = $ctx.OutDir })
 })
 
 $Recipe.AddStep('start', {

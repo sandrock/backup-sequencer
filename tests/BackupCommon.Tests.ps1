@@ -380,4 +380,47 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         @(Get-ChildItem -Path $dailyDir -Directory).Count | Should -Be 2   # d2 + the new copy
         @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archive-pruned' -and $_.svc -eq 'app' }).Count | Should -Be 1
     }
+
+    It 'docker-compose-cold dump makes compose + data tars, excluding inner data and logs from the compose one' {
+        # compose dir with compose.yml + an inner data dir + an inner logs dir
+        $composeDir = Join-Path (Join-Path $Work "csvc-$n") 'app'
+        New-Item -ItemType Directory -Force -Path $composeDir | Out-Null
+        Set-Content -LiteralPath (Join-Path $composeDir 'docker-compose.yml') -Value 'services: {}'
+        $innerData = Join-Path $composeDir 'data'
+        $innerLogs = Join-Path $composeDir 'logs'
+        New-Item -ItemType Directory -Force -Path $innerData | Out-Null
+        New-Item -ItemType Directory -Force -Path $innerLogs | Out-Null
+        Set-Content -LiteralPath (Join-Path $innerData 'db.sqlite') -Value 'DBDATA'
+        Set-Content -LiteralPath (Join-Path $innerLogs 'app.log') -Value 'noise'
+        # a second data dir on another "volume" (outside the compose dir)
+        $extData = Join-Path (Join-Path $Work "csvc-$n-vol2") 'app-extra'
+        New-Item -ItemType Directory -Force -Path $extData | Out-Null
+        Set-Content -LiteralPath (Join-Path $extData 'blob.bin') -Value 'EXTRA'
+
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true,
+    "script": "../src/recipes/docker-compose-cold.ps1",
+    "env": { "DCC_COMPOSE_DIR": "__COMPOSE__", "DCC_DATA_DIRS": "__DATA1__;__DATA2__", "DCC_COMPOSE_EXCLUDES": "logs" },
+    "steps": [ { "name": "dump", "resources": [] } ] } } }
+'@ -replace '__COMPOSE__', ($composeDir -replace '\\', '/') `
+            -replace '__DATA1__', ($innerData -replace '\\', '/') `
+            -replace '__DATA2__', ($extData -replace '\\', '/')) | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+
+        $set = Join-Path $root 'ready/app'
+        (Test-Path (Join-Path $set 'app_compose.tar')) | Should -BeTrue
+        (Test-Path (Join-Path $set 'app_data.tar')) | Should -BeTrue
+
+        # compose tar: carries compose.yml, excludes the inner data/ and logs/
+        $cl = (& tar -tf (Join-Path $set 'app_compose.tar')) -join "`n"
+        $cl | Should -Match 'app/docker-compose.yml'
+        $cl | Should -Not -Match 'app/data'
+        $cl | Should -Not -Match 'app/logs'
+
+        # data tar: both data dirs, including the other-volume one
+        $dl = (& tar -tf (Join-Path $set 'app_data.tar')) -join "`n"
+        $dl | Should -Match 'data/db.sqlite'
+        $dl | Should -Match 'app-extra/blob.bin'
+    }
 }
