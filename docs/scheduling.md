@@ -46,6 +46,25 @@ score     = overdue + sizeNudge        # sort descending
 - Mandatory services are forced to the front (still score-ordered among themselves)
   and bypass the fit check below — for a must-run-every-window service.
 
+The generic `overdue = age/target` is a fallback. When a service has an archiver,
+**the archive recipe computes `overdue` instead** (via `SetOverdue`) — only it knows
+its retention periods and cross-tier coverage. `archive-gfsy` reports the service
+covered (`overdue < 1`) if *any* tier was archived within the daily period, so a
+yearly or weekly backup also covers the daily. `archive-copy` uses a flat
+`ARCHIVE_MIN_INTERVAL_HOURS`.
+
+
+Coverage (don't re-back-up)
+----------------------------------------------------------------
+
+Before the fit check, a service whose `overdue < 1` is **covered** — it already has a
+fresh-enough backup for its period — and is skipped (`service.skip reason=covered`),
+producing no backup and no downtime. This is what stops multiple windows or extra
+triggers in one day from making many same-day copies (which, with count-based
+pruning, would erode the number of distinct backup *days* you keep). `-ForceAllJobs`
+overrides it. Pairs with the period-aware prune (see archiving.md): even a forced
+extra same-period run collapses to one kept archive per period.
+
 
 Window packing (execution)
 ----------------------------------------------------------------
@@ -55,11 +74,13 @@ The run loop walks the scored plan. Before starting each service, with
 
 1. Past close → stop (`-ForceWindow` bypasses this; a job already running is never
    killed and may overrun).
-2. Mandatory, or `-ForceAllJobs` → run (no fit check).
-3. Estimate unknown (never run) → run optimistically — first backup, learns its
+2. `overdue < 1` → **covered**, skip (`service.skip reason=covered`); `-ForceAllJobs`
+   overrides.
+3. Mandatory, or `-ForceAllJobs` → run (no fit check).
+4. Estimate unknown (never run) → run optimistically — first backup, learns its
    duration for next time; it may overrun a lot (accepted).
-4. `estimate <= remaining` → run (it fits).
-5. Otherwise it does not fit. Run it **only if no non-mandatory job has run yet this
+5. `estimate <= remaining` → run (it fits).
+6. Otherwise it does not fit. Run it **only if no non-mandatory job has run yet this
    window** (the guaranteed job); else defer it (`service.skip reason=deferred`).
 
 Rule 5 is the key. The fit check (`estimate <= remaining`) is strict — no grace; the

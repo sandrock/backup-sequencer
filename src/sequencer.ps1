@@ -117,15 +117,23 @@ $Paths = @{
 switch ($Command) {
     'plan' {
         $projection = Get-ServiceProjection -EventsPath $Paths.EventsPath
-        $plan = Get-BackupPlan -Config $Config -Projection $projection
-        Write-Host ("Plan  window={0}-{1}  (within window now: {2})  [* = mandatory, by score]" -f `
+        $planNow = Get-Date
+        $overdueByService = @{}
+        foreach ($name in $Config.services.PSObject.Properties.Name) {
+            if (-not ((Test-HasProp $Config.services.$name 'enabled') -and [bool]$Config.services.$name.enabled)) { continue }
+            $od = Get-ServiceOverdue -Config $Config -Service $name -BaseDir $Paths.BaseDir -EventsPath $Paths.EventsPath -At $planNow
+            if ($null -ne $od) { $overdueByService[$name] = $od }
+        }
+        $plan = Get-BackupPlan -Config $Config -Projection $projection -At $planNow -OverdueByService $overdueByService
+        Write-Host ("Plan  window={0}-{1}  (within window now: {2})  [* = mandatory, by score; <1 = covered]" -f `
                 $Config.window.open, $Config.window.close, (Test-WithinWindow $Config.window.open $Config.window.close))
         foreach ($plannedJob in $plan) {
             $flag = if ($plannedJob.Mandatory) { '*' } else { ' ' }
             $lastSuccess = Format-DisplayTime $plannedJob.LastSuccess
-            $overdue = if ($plannedJob.AgeSeconds -lt 0) { 'new' } else { ('x{0:N1}' -f $plannedJob.Overdue) }
-            Write-Host ("  {0} {1,-22} est={2,6:N0}s  overdue={3,-5}  score={4,7:N2}  last={5}" -f `
-                    $flag, $plannedJob.Service, $plannedJob.EstimatedSeconds, $overdue, $plannedJob.Score, $lastSuccess)
+            $overdue = if ($plannedJob.Overdue -ge 1e6) { 'new' } else { ('x{0:N1}' -f $plannedJob.Overdue) }
+            $covered = if ($plannedJob.Overdue -lt 1) { ' covered' } else { '' }
+            Write-Host ("  {0} {1,-22} est={2,6:N0}s  overdue={3,-5}  score={4,7:N2}  last={5}{6}" -f `
+                    $flag, $plannedJob.Service, $plannedJob.EstimatedSeconds, $overdue, $plannedJob.Score, $lastSuccess, $covered)
         }
     }
     'run' {

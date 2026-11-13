@@ -64,3 +64,20 @@ $Recipe.AddStep('archive', {
 
     $ctx.State['Result'] = @{ path = $target; pruned = $prunedNow }
 })
+
+# overdue query (plan time): flat archiver has no tiers, so coverage is a simple
+# minimum interval — covered if the newest archive is younger than
+# ARCHIVE_MIN_INTERVAL_HOURS (default 24). overdue = newest age / that interval.
+$Recipe.SetOverdue({
+    param($ctx)
+    $minHours = [double]($ctx.EnvValue('ARCHIVE_MIN_INTERVAL_HOURS', '24'))
+    if ($minHours -le 0) { $minHours = 24 }
+    $mine = @($ctx.ReadEvents() | Where-Object {
+            $_.type -eq 'service.archived' -and $_.svc -eq $ctx.Service -and $_.PSObject.Properties['ts']
+        })
+    if (-not $mine) { return 1e6 }   # never archived -> very overdue
+    $newest = ($mine | Sort-Object { [datetime]$_.ts } | Select-Object -Last 1)
+    $ageSeconds = ($ctx.Now - [datetime]$newest.ts).TotalSeconds
+    if ($ageSeconds -lt 0) { $ageSeconds = 0 }
+    return $ageSeconds / ($minHours * 3600.0)
+})

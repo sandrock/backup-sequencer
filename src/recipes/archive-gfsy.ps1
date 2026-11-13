@@ -11,14 +11,19 @@
     - yearly, if the log shows no yearly archive this calendar year;
     - else weekly, if the log shows no weekly archive this ISO week;
     - else daily.
-  The copy lands in a per-tier directory and the chosen tier is pruned to keep-N,
-  also log-driven: delete the recorded paths of the oldest, newest kept. Each tier
-  prunes only on the runs that land in it, so the other tiers are never touched.
+  The copy lands in a per-tier directory, then that tier is pruned to keep the
+  newest archive of each of the last N PERIODS (not the N most recent copies), so
+  extra same-period runs can never erode day/week/year coverage. Log-driven, by the
+  recorded ts/path — never by dir names.
+  It also answers an overdue query for the planner (SetOverdue): the service is
+  covered for the day if ANY tier was archived within the daily period (a yearly or
+  weekly backup also covers the daily), so the planner can skip a covered service.
   Env (via $ctx):
     ARCHIVE_DEST         (required) destination base dir; the service name is appended.
-    ARCHIVE_KEEP_DAILY   (default 2) how many daily copies to keep.
-    ARCHIVE_KEEP_WEEKLY  (default 2) how many weekly copies to keep.
-    ARCHIVE_KEEP_YEARLY  (default 2) how many yearly copies to keep.
+    ARCHIVE_KEEP_DAILY   (default 2) daily periods to keep.
+    ARCHIVE_KEEP_WEEKLY  (default 2) weekly periods to keep.
+    ARCHIVE_KEEP_YEARLY  (default 2) yearly periods to keep.
+    ARCHIVE_DAILY_HOURS  (default 24) the daily coverage period, for the overdue query.
   Layout: <ARCHIVE_DEST>/<service>/<tier>/<runId>/<artifacts>
   Reports { tier, path, pruned } back through $ctx.State.Result so the engine
   can log the tier on service.archived and record each pruned path.
@@ -33,10 +38,21 @@ if ($null -eq $Recipe) {
 
 $Recipe.AddStep('archive', {
     param($ctx)
+    # period key for a tier + timestamp (groups archives into their retention period)
+    $periodKeyOf = {
+        param($tier, [datetime]$ts)
+        switch ($tier) {
+            'yearly' { 'Y{0:D4}' -f $ts.Year }
+            'weekly' { 'W{0:D4}-{1:D2}' -f [System.Globalization.ISOWeek]::GetYear($ts), [System.Globalization.ISOWeek]::GetWeekOfYear($ts) }
+            default { 'D{0:yyyyMMdd}' -f $ts }
+        }
+    }
     $destBase = $ctx.RequireEnv('ARCHIVE_DEST')
-    $keepDaily = [int]($ctx.EnvValue('ARCHIVE_KEEP_DAILY', '2'))
-    $keepWeekly = [int]($ctx.EnvValue('ARCHIVE_KEEP_WEEKLY', '2'))
-    $keepYearly = [int]($ctx.EnvValue('ARCHIVE_KEEP_YEARLY', '2'))
+    $keepByTier = @{
+        yearly = [int]($ctx.EnvValue('ARCHIVE_KEEP_YEARLY', '2'))
+        weekly = [int]($ctx.EnvValue('ARCHIVE_KEEP_WEEKLY', '2'))
+        daily  = [int]($ctx.EnvValue('ARCHIVE_KEEP_DAILY', '2'))
+    }
 
     $events = $ctx.ReadEvents()
     # prior archives of this service that carry a tier (log is the single source of truth)
@@ -64,12 +80,7 @@ $Recipe.AddStep('archive', {
         $tier = if ($hasWeeklyThisWeek) { 'daily' } else { 'weekly' }
     }
 
-    $keep = switch ($tier) {
-        'yearly' { $keepYearly }
-        'weekly' { $keepWeekly }
-        default { $keepDaily }
-    }
-    if ($keep -lt 1) { $keep = 1 }
+    $keep = [math]::Max(1, $keepByTier[$tier])
 
     # --- copy the set into <dest>/<svc>/<tier>/<runId>/ ---
     $tierDir = Join-Path (Join-Path $destBase $ctx.Service) $tier
@@ -79,27 +90,56 @@ $Recipe.AddStep('archive', {
     New-Item -ItemType Directory -Force -Path $target | Out-Null
     Copy-Item -Path (Join-Path $ctx.OutDir '*') -Destination $target -Recurse -Force
 
-    # --- prune this tier by the recorded history, never by dir names ---
+    # --- prune this tier: keep the newest archive of each of the last N PERIODS ---
     $prunedPaths = @($events |
             Where-Object { $_.type -eq 'service.archive-pruned' -and $_.PSObject.Properties['path'] } |
             ForEach-Object { $_.path })
-    $live = @($events |
+    # every live archive of this tier, plus the copy just made (current period)
+    $tierArchives = @($events |
             Where-Object {
                 $_.type -eq 'service.archived' -and $_.svc -eq $ctx.Service -and
                 $_.PSObject.Properties['tier'] -and $_.tier -eq $tier -and
                 $_.PSObject.Properties['path'] -and ($prunedPaths -notcontains $_.path)
             } |
-            Sort-Object { [datetime]$_.ts })   # oldest first
+            ForEach-Object { [pscustomobject]@{ ts = [datetime]$_.ts; path = $_.path; isNew = $false } })
+    $tierArchives += [pscustomobject]@{ ts = $now; path = $target; isNew = $true }
+    foreach ($a in $tierArchives) {
+        $a | Add-Member -NotePropertyName periodKey -NotePropertyValue (& $periodKeyOf $tier $a.ts)
+    }
+
+    # newest archive per period, then keep the newest $keep periods
+    $newestByPeriod = @{}
+    foreach ($a in ($tierArchives | Sort-Object ts)) { $newestByPeriod[$a.periodKey] = $a }  # last wins = newest
+    $keepPeriods = @($newestByPeriod.Keys | Sort-Object { $newestByPeriod[$_].ts } -Descending | Select-Object -First $keep)
+
     $prunedNow = @()
-    $over = ($live.Count + 1) - $keep           # +1 for the copy just made (not yet logged)
-    if ($over -gt 0) {
-        foreach ($old in (@($live) | Select-Object -First $over)) {
-            if (Test-Path -LiteralPath $old.path) {
-                Remove-Item -LiteralPath $old.path -Recurse -Force -ErrorAction SilentlyContinue
+    foreach ($a in $tierArchives) {
+        if ($a.isNew) { continue }   # never prune the copy just made
+        $keepThis = ($keepPeriods -contains $a.periodKey) -and ($newestByPeriod[$a.periodKey].path -eq $a.path)
+        if (-not $keepThis) {
+            if (Test-Path -LiteralPath $a.path) {
+                Remove-Item -LiteralPath $a.path -Recurse -Force -ErrorAction SilentlyContinue
             }
-            $prunedNow += $old.path
+            $prunedNow += $a.path
         }
     }
 
     $ctx.State['Result'] = @{ tier = $tier; path = $target; pruned = $prunedNow }
+})
+
+# overdue query (plan time): covered for the day if ANY tier was archived within the
+# daily period — a yearly/weekly backup also covers the daily. overdue = newest
+# archive age / daily period; >= 1 means due, < 1 means already covered.
+$Recipe.SetOverdue({
+    param($ctx)
+    $dailyHours = [double]($ctx.EnvValue('ARCHIVE_DAILY_HOURS', '24'))
+    if ($dailyHours -le 0) { $dailyHours = 24 }
+    $mine = @($ctx.ReadEvents() | Where-Object {
+            $_.type -eq 'service.archived' -and $_.svc -eq $ctx.Service -and $_.PSObject.Properties['ts']
+        })
+    if (-not $mine) { return 1e6 }   # never archived -> very overdue
+    $newest = ($mine | Sort-Object { [datetime]$_.ts } | Select-Object -Last 1)
+    $ageSeconds = ($ctx.Now - [datetime]$newest.ts).TotalSeconds
+    if ($ageSeconds -lt 0) { $ageSeconds = 0 }
+    return $ageSeconds / ($dailyHours * 3600.0)
 })

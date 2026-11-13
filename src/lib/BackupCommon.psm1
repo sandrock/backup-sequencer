@@ -12,11 +12,20 @@ class RecipeContext {
     [object]    $Env          # the service's / step's config env object
     [string]    $EventsPath   # sequencer event log path (read-only; archivers route by it)
     [string]    $RunId        # the run id; name archives by it so they tie back to the run
+    [datetime]  $Now          # reference time (run start, or plan time for the overdue query)
     [hashtable] $State = @{}   # shared across this recipe's steps (e.g. WasRunning)
     [hashtable] $Steps = @{}   # step name -> scriptblock(param($ctx))
+    [scriptblock] $OverdueBlock # optional: archiver's plan-time overdue query (param($ctx) -> double)
 
     [void] AddStep([string]$name, [scriptblock]$block) {
         $this.Steps[$name] = $block
+    }
+
+    # Archivers set this so the planner can ask "how overdue is this service under my
+    # retention policy?" — only the archive recipe knows its periods/tiers. Returns an
+    # overdue ratio: >= 1 means due, < 1 means already covered for now.
+    [void] SetOverdue([scriptblock]$block) {
+        $this.OverdueBlock = $block
     }
 
     [string] EnvValue([string]$name, [string]$fallback) {
@@ -293,6 +302,45 @@ function Invoke-BackupStep {
 
 # --- planning ---------------------------------------------------------------
 
+function Get-MergedArchiveEnv {
+    # top-level config.archive defaults, overridden by the service's syncArchive.env
+    param([Parameter(Mandatory)]$Config, $SyncArchive)
+    $envMap = [ordered]@{}
+    if ((Test-HasProp $Config 'archive') -and ($null -ne $Config.archive)) {
+        foreach ($prop in @($Config.archive.PSObject.Properties)) { $envMap[$prop.Name] = $prop.Value }
+    }
+    if ($SyncArchive -and (Test-HasProp $SyncArchive 'env') -and ($null -ne $SyncArchive.env)) {
+        foreach ($prop in @($SyncArchive.env.PSObject.Properties)) { $envMap[$prop.Name] = $prop.Value }
+    }
+    return [pscustomobject]$envMap
+}
+
+function Get-ServiceOverdue {
+    # Ask a service's archive recipe how overdue it is (plan time). Only the archiver
+    # knows its retention periods / cross-tier coverage. Returns $null if the service
+    # has no archiver or its recipe registers no overdue query.
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$Service,
+        [Parameter(Mandatory)][string]$BaseDir,
+        [Parameter(Mandatory)][string]$EventsPath,
+        [datetime]$At = (Get-Date)
+    )
+    $serviceConfig = $Config.services.$Service
+    if (-not (Test-HasProp $serviceConfig 'syncArchive')) { return $null }
+    $syncArchive = $serviceConfig.syncArchive
+    $scriptPath = Join-Path $BaseDir $syncArchive.script
+    if (-not (Test-Path -LiteralPath $scriptPath)) { return $null }
+    $arc = [RecipeContext]::new()
+    $arc.Service = $Service
+    $arc.EventsPath = $EventsPath
+    $arc.Now = $At
+    $arc.Env = Get-MergedArchiveEnv -Config $Config -SyncArchive $syncArchive
+    & $scriptPath -Recipe $arc | Out-Null     # registration only
+    if ($null -eq $arc.OverdueBlock) { return $null }
+    try { return [double](& $arc.OverdueBlock $arc) } catch { return $null }
+}
+
 function Get-BackupPlan {
     # Pure: (config, projection, now) -> ALL enabled services, score-sorted.
     # Fluid scheduling — score = overdue + sizeNudge:
@@ -303,10 +351,13 @@ function Get-BackupPlan {
     # age dominates (whole-interval units) so rotation is fair; size only nudges ties.
     # Mandatory services are forced to the front (still score-ordered among themselves).
     # target = <service>.targetIntervalHours, else <config>.targetIntervalHours, else 24h.
+    # OverdueByService: archiver-computed overdue per service (from Get-ServiceOverdue);
+    # overrides the generic age/target when present (the archiver knows its coverage).
     param(
         [Parameter(Mandatory)]$Config,
         $Projection = @{},
-        [datetime]$At = (Get-Date)
+        [datetime]$At = (Get-Date),
+        [hashtable]$OverdueByService = @{}
     )
     $windowSeconds = Get-WindowLengthSeconds -Open $Config.window.open -Close $Config.window.close
     $defaultTargetHours = 24.0
@@ -329,11 +380,20 @@ function Get-BackupPlan {
         if ($lastSuccess) {
             $ageSeconds = ($At - [datetime]$lastSuccess).TotalSeconds
             if ($ageSeconds -lt 0) { $ageSeconds = 0 }
-            $overdue = $ageSeconds / $targetSeconds
         }
         else {
             $ageSeconds = -1.0        # never run
-            $overdue = 1e6            # float to the top for a first baseline
+        }
+        # overdue: the archiver's judgement if it gave one (it knows coverage), else
+        # the generic age/target (never-run floats to the top for a first baseline).
+        if ($OverdueByService.ContainsKey($serviceName)) {
+            $overdue = [double]$OverdueByService[$serviceName]
+        }
+        elseif ($lastSuccess) {
+            $overdue = $ageSeconds / $targetSeconds
+        }
+        else {
+            $overdue = 1e6
         }
         $sizeNudge = if ($windowSeconds -gt 0) { $estimatedSeconds / $windowSeconds } else { 0 }
 
@@ -424,7 +484,15 @@ function Invoke-BackupRun {
         Write-Information ("Backup run {0}  (window {1}-{2})" -f $runId, $Config.window.open, $Config.window.close)
 
         $projection = Get-ServiceProjection -EventsPath $Paths.EventsPath
-        $plan = Get-BackupPlan -Config $Config -Projection $projection
+        # ask each service's archiver how overdue it is (it knows its own coverage)
+        $planNow = Get-Date
+        $overdueByService = @{}
+        foreach ($name in $Config.services.PSObject.Properties.Name) {
+            if (-not ((Test-HasProp $Config.services.$name 'enabled') -and [bool]$Config.services.$name.enabled)) { continue }
+            $od = Get-ServiceOverdue -Config $Config -Service $name -BaseDir $Paths.BaseDir -EventsPath $Paths.EventsPath -At $planNow
+            if ($null -ne $od) { $overdueByService[$name] = $od }
+        }
+        $plan = Get-BackupPlan -Config $Config -Projection $projection -At $planNow -OverdueByService $overdueByService
         Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'run.plan' `
             -Props @{ runId = $runId; plan = @($plan.Service) }
 
@@ -444,6 +512,16 @@ function Invoke-BackupRun {
                 break
             }
             $serviceName = $plannedJob.Service
+
+            # coverage gate: skip a service already backed up for its period (the
+            # archiver judged overdue < 1 — e.g. a yearly/weekly also covers the daily).
+            # No backup produced, so no wasted downtime. -ForceAllJobs overrides.
+            if (-not $ForceAllJobs -and $plannedJob.Overdue -lt 1) {
+                Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.skip' `
+                    -Props @{ runId = $runId; svc = $serviceName; reason = 'covered'; overdue = [math]::Round([double]$plannedJob.Overdue, 3) }
+                Write-Information ("  {0}  covered (overdue x{1:N2}) - skipped" -f $serviceName, $plannedJob.Overdue)
+                continue
+            }
 
             # fluid fit decision: start a service only if its estimate fits the time
             # left before close. Exceptions that still run: an unknown estimate
@@ -719,4 +797,5 @@ Export-ModuleMember -Function `
     Test-WithinWindow, Get-WindowLengthSeconds, Get-SecondsUntilClose, `
     Get-FreeSpaceBytes, Get-PathSizeBytes, Invoke-BackupStep, `
     Get-SpoolPaths, Move-ToTrash, Move-Phase, Clear-Trash, `
+    Get-MergedArchiveEnv, Get-ServiceOverdue, `
     Get-BackupPlan, Invoke-BackupRun, Format-RunReport, Send-BackupReport

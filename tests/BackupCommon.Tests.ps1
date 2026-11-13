@@ -165,6 +165,42 @@ Describe 'window math' {
     }
 }
 
+Describe 'coverage (archiver-computed overdue)' {
+    It 'gfsy reports covered (<1) right after an archive, overdue (>=1) when stale' {
+        $ev = Join-Path $Work "ov-$([guid]::NewGuid().ToString('n').Substring(0,6)).jsonl"
+        Add-Content -LiteralPath $ev -Value (@{ ts = '2026-11-06T10:00:00+00:00'; type = 'service.archived'; svc = 'app'; tier = 'daily'; path = '/x' } | ConvertTo-Json -Compress)
+        $cfg = @'
+{ "window": { "open": "23:00", "close": "06:00" },
+  "services": { "app": { "enabled": true, "script": "fixtures/mock-service.ps1",
+    "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1" }, "steps": [] } } }
+'@ | ConvertFrom-Json
+        # 2h after the archive -> covered
+        (Get-ServiceOverdue -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev -At ([datetime]'2026-11-06T12:00:00+00:00')) | Should -BeLessThan 1
+        # 2 days after -> due
+        (Get-ServiceOverdue -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev -At ([datetime]'2026-11-08T12:00:00+00:00')) | Should -BeGreaterThan 1
+    }
+
+    It 'gfsy: a yearly within the daily period also covers the daily' {
+        $ev = Join-Path $Work "ovy-$([guid]::NewGuid().ToString('n').Substring(0,6)).jsonl"
+        Add-Content -LiteralPath $ev -Value (@{ ts = '2026-11-06T10:00:00+00:00'; type = 'service.archived'; svc = 'app'; tier = 'yearly'; path = '/x' } | ConvertTo-Json -Compress)
+        $cfg = @'
+{ "window": { "open": "23:00", "close": "06:00" },
+  "services": { "app": { "enabled": true, "script": "fixtures/mock-service.ps1",
+    "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1" }, "steps": [] } } }
+'@ | ConvertFrom-Json
+        (Get-ServiceOverdue -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev -At ([datetime]'2026-11-06T13:00:00+00:00')) | Should -BeLessThan 1
+    }
+
+    It 'returns null for a service with no archiver' {
+        $ev = Join-Path $Work "ovn-$([guid]::NewGuid().ToString('n').Substring(0,6)).jsonl"
+        $cfg = @'
+{ "window": { "open": "23:00", "close": "06:00" },
+  "services": { "app": { "enabled": true, "script": "fixtures/mock-service.ps1", "steps": [] } } }
+'@ | ConvertFrom-Json
+        (Get-ServiceOverdue -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev) | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'step execution' {
     It 'records duration and ok status' {
         $ev = Join-Path $Work 'step-ok.jsonl'
@@ -403,7 +439,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1", "env": { "ARCHIVE_DEST": "__DEST__" } },
     "steps": [ { "name": "dump", "resources": [] } ] } } }
 '@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -ForceAllJobs -WarningAction SilentlyContinue | Out-Null
         @(Get-ChildItem -Path (Join-Path $appDir 'daily') -Directory -ErrorAction SilentlyContinue).Count | Should -Be 1
         $arch = Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archived' -and $_.svc -eq 'app' } | Select-Object -Last 1
         $arch.tier | Should -Be 'daily'
@@ -435,7 +471,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1", "env": { "ARCHIVE_DEST": "__DEST__", "ARCHIVE_KEEP_DAILY": "2" } },
     "steps": [ { "name": "dump", "resources": [] } ] } } }
 '@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -ForceAllJobs -WarningAction SilentlyContinue | Out-Null
         (Test-Path -LiteralPath $d1) | Should -BeFalse   # oldest daily pruned
         (Test-Path -LiteralPath $d2) | Should -BeTrue    # newer daily kept
         (Test-Path -LiteralPath $yPath) | Should -BeTrue # other tiers untouched
@@ -513,5 +549,58 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         # 'second' does not fit and the guarantee is already spent -> deferred, not run
         ($events | Where-Object { $_.type -eq 'service.skip' -and $_.svc -eq 'second' -and $_.reason -eq 'deferred' }).Count | Should -BeGreaterThan 0
         (Test-Path (Join-Path $root 'ready/second')) | Should -BeFalse
+    }
+
+    It 'skips a service already covered for its period (no backup produced)' {
+        $dest = Join-Path $Work "cov-$n"
+        # a gfsy archive 1h ago -> the archiver reports covered for the day
+        $arch = Join-Path (Join-Path (Join-Path $dest 'app') 'daily') 'seed'
+        New-Item -ItemType Directory -Force -Path $arch | Out-Null
+        Add-Content -LiteralPath $ev -Value (@{ ts = (Get-Date).AddHours(-1).ToString('o'); type = 'service.archived'; svc = 'app'; tier = 'daily'; path = $arch } | ConvertTo-Json -Compress)
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "archive": { "ARCHIVE_DEST": "__DEST__" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1" },
+    "steps": [ { "name": "dump", "resources": [] }, { "name": "start", "resources": [], "alwaysRun": true } ] } } }
+'@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -WarningAction SilentlyContinue -InformationAction SilentlyContinue | Out-Null
+        $events = Get-BackupEvents -EventsPath $ev
+        ($events | Where-Object { $_.type -eq 'service.skip' -and $_.svc -eq 'app' -and $_.reason -eq 'covered' }).Count | Should -BeGreaterThan 0
+        (Test-Path (Join-Path $root 'ready/app')) | Should -BeFalse
+    }
+
+    It 'archive-gfsy prune keeps newest-per-day, collapsing same-day duplicates' {
+        $dest = Join-Path $Work "gfsy-sd-$n"
+        $appDir = Join-Path $dest 'app'
+        $y = (Get-Date).Year
+        # route to daily: a yearly this year + a weekly this ISO week already logged
+        $yPath = Join-Path (Join-Path $appDir 'yearly') 'seed-y'
+        $wPath = Join-Path (Join-Path $appDir 'weekly') 'seed-w'
+        New-Item -ItemType Directory -Force -Path $yPath | Out-Null
+        New-Item -ItemType Directory -Force -Path $wPath | Out-Null
+        Add-Content -LiteralPath $ev -Value (@{ ts = "$y-01-01T00:00:00+00:00"; type = 'service.archived'; svc = 'app'; tier = 'yearly'; path = $yPath } | ConvertTo-Json -Compress)
+        Add-Content -LiteralPath $ev -Value (@{ ts = (Get-Date).ToString('o'); type = 'service.archived'; svc = 'app'; tier = 'weekly'; path = $wPath } | ConvertTo-Json -Compress)
+        # two daily archives on the SAME (old) day
+        $dailyDir = Join-Path $appDir 'daily'
+        $old1 = Join-Path $dailyDir '20200101-010000'
+        $old2 = Join-Path $dailyDir '20200101-020000'
+        New-Item -ItemType Directory -Force -Path $old1 | Out-Null
+        New-Item -ItemType Directory -Force -Path $old2 | Out-Null
+        Add-Content -LiteralPath $ev -Value (@{ ts = '2020-01-01T01:00:00+00:00'; type = 'service.archived'; svc = 'app'; tier = 'daily'; path = $old1 } | ConvertTo-Json -Compress)
+        Add-Content -LiteralPath $ev -Value (@{ ts = '2020-01-01T02:00:00+00:00'; type = 'service.archived'; svc = 'app'; tier = 'daily'; path = $old2 } | ConvertTo-Json -Compress)
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "publishToReady": false,
+    "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1", "env": { "ARCHIVE_DEST": "__DEST__", "ARCHIVE_KEEP_DAILY": "2" } },
+    "steps": [ { "name": "dump", "resources": [] } ] } } }
+'@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -ForceAllJobs -WarningAction SilentlyContinue | Out-Null
+        (Test-Path -LiteralPath $old1) | Should -BeFalse   # older same-day collapsed away
+        (Test-Path -LiteralPath $old2) | Should -BeTrue    # newest of that day kept
+        (Test-Path -LiteralPath $yPath) | Should -BeTrue   # other tiers untouched
+        (Test-Path -LiteralPath $wPath) | Should -BeTrue
+        @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archive-pruned' -and $_.svc -eq 'app' -and $_.path -eq $old1 }).Count | Should -Be 1
     }
 }

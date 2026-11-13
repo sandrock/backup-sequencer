@@ -98,15 +98,20 @@ top-level `archive` block or the step's own `env`.
     - yearly, if the log shows no yearly archive this calendar year;
     - else weekly, if none this ISO week;
     - else daily.
-  The copy lands in `<ARCHIVE_DEST>/<service>/<tier>/<runId>/`, and that tier is
-  pruned to its own keep count: `ARCHIVE_KEEP_DAILY` / `ARCHIVE_KEEP_WEEKLY` /
-  `ARCHIVE_KEEP_YEARLY` (default 2 each). Each tier is pruned only on the runs that
-  land in it, so the coarser tiers keep a long history while daily churns.
+  The copy lands in `<ARCHIVE_DEST>/<service>/<tier>/<runId>/`, and that tier keeps
+  **the newest archive of each of the last N periods** — not the N most recent copies
+  — via `ARCHIVE_KEEP_DAILY` / `ARCHIVE_KEEP_WEEKLY` / `ARCHIVE_KEEP_YEARLY` (default 2
+  each). Keeping per-period means extra same-period runs collapse to one, so they can
+  never erode the number of distinct days/weeks/years retained. Each tier is pruned
+  only on the runs that land in it.
+  It also tells the planner when a service is **covered**: `overdue < 1` if any tier
+  was archived within the daily period (a yearly/weekly also covers the daily), so the
+  planner skips a service that already has a fresh backup — see docs/scheduling.md.
 
 Both name the copy by the run id, so an archive ties directly back to the run that
-produced it — and to its `service.archived` event. Routing and pruning read the
-log, never directory names or mtimes: correct even under the sequencer's irregular,
-non-cron timing.
+produced it — and to its `service.archived` event. Routing, pruning, and coverage
+read the log, never directory names or mtimes: correct even under the sequencer's
+irregular, non-cron timing.
 
 
 The `ready/` contract
