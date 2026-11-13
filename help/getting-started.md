@@ -51,7 +51,7 @@ The spool root is resolved as:
 Set `spool` explicitly to a path with room for a service's largest backup —
 especially if the state dir is on a small system disk. Put it on the volume that
 has the space. The async archiver takes completed backups from `ready/<service>/`
-and deletes them; see `../docs/archiving.md`.
+and deletes them; see [the spool and archiving model](../docs/archiving.md).
 
 
 Configure
@@ -62,7 +62,8 @@ Copy `config.sample.json` to the config dir as `config.json` and edit it:
 - `window` — the time window (`HH:mm`), may wrap past midnight.
 - `services` — one entry per service. Set `mandatory: true` for the ones that
   must always run first. Point `script` at a recipe or a bespoke service script,
-  and pass that script's parameters in `env`.
+  and pass that script's parameters in `env`. For the bundled recipe, see the
+  [docker-compose-cold recipe](recipe-docker-compose-cold.md).
 - `notify` — set `enabled: true` and your SMTP details; put the password in the
   file named by `passwordFile` (relative to the config dir), mode `0600`.
 
