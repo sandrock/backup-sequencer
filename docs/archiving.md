@@ -79,6 +79,36 @@ archiver only ever looks at `ready/`, so it can never touch a backup that is sti
 being sync-archived. The phase boundary is the coordination — no lock needed.
 
 
+Shipped archiver recipes
+----------------------------------------------------------------
+
+Two archiver recipes ship with the tool; both implement the optional sync-archive
+step above, copying the completed set from `stage/<service>/` into a durable
+destination and pruning old copies. Both prune strictly by the event log — they
+only ever delete paths they themselves recorded as archived, so a foreign file in
+the destination is never at risk. Select one per service via `syncArchive.script`.
+`ARCHIVE_DEST` (the destination base; the service name is appended) comes from the
+top-level `archive` block or the step's own `env`.
+
+- `archive-copy` — a flat history. Each run copies the set to
+  `<ARCHIVE_DEST>/<service>/<runId>/` and keeps the newest `ARCHIVE_KEEP`
+  (default 3). One tier, simplest to reason about.
+- `archive-gfsy` — a tiered history (grandfather-father-son, with a yearly top
+  tier). Each run is routed to exactly one tier, decided from the log:
+    - yearly, if the log shows no yearly archive this calendar year;
+    - else weekly, if none this ISO week;
+    - else daily.
+  The copy lands in `<ARCHIVE_DEST>/<service>/<tier>/<runId>/`, and that tier is
+  pruned to its own keep count: `ARCHIVE_KEEP_DAILY` / `ARCHIVE_KEEP_WEEKLY` /
+  `ARCHIVE_KEEP_YEARLY` (default 2 each). Each tier is pruned only on the runs that
+  land in it, so the coarser tiers keep a long history while daily churns.
+
+Both name the copy by the run id, so an archive ties directly back to the run that
+produced it — and to its `service.archived` event. Routing and pruning read the
+log, never directory names or mtimes: correct even under the sequencer's irregular,
+non-cron timing.
+
+
 The `ready/` contract
 ----------------------------------------------------------------
 

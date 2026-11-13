@@ -25,8 +25,8 @@
       },
       "publishToReady": true,
       "syncArchive": {
-        "script": "recipes/archive-copy.ps1",
-        "env": { "ARCHIVE_KEEP": "7" }
+        "script": "recipes/archive-gfsy.ps1",
+        "env": { "ARCHIVE_KEEP_DAILY": "7", "ARCHIVE_KEEP_WEEKLY": "5", "ARCHIVE_KEEP_YEARLY": "3" }
       },
       "steps": [
         { "name": "stop", "resources": [] },

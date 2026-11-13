@@ -288,4 +288,96 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         # two archive-pruned events recorded
         @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archive-pruned' -and $_.svc -eq 'app' }).Count | Should -Be 2
     }
+
+    It 'archive-gfsy routes the first archive to the yearly tier' {
+        $dest = Join-Path $Work "gfsy-a-$n"
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "publishToReady": false,
+    "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1", "env": { "ARCHIVE_DEST": "__DEST__" } },
+    "steps": [ { "name": "dump", "resources": [] } ] } } }
+'@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        @(Get-ChildItem -Path (Join-Path (Join-Path $dest 'app') 'yearly') -Directory -ErrorAction SilentlyContinue).Count | Should -Be 1
+        $arch = Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archived' -and $_.svc -eq 'app' } | Select-Object -Last 1
+        $arch.tier | Should -Be 'yearly'
+    }
+
+    It 'archive-gfsy routes to weekly when a yearly already exists this year' {
+        $dest = Join-Path $Work "gfsy-b-$n"
+        $y = (Get-Date).Year
+        $yPath = Join-Path (Join-Path (Join-Path $dest 'app') 'yearly') 'seed-yearly'
+        New-Item -ItemType Directory -Force -Path $yPath | Out-Null
+        Add-Content -LiteralPath $ev -Value (@{ ts = "$y-01-01T00:00:00+00:00"; type = 'service.archived'; svc = 'app'; tier = 'yearly'; path = $yPath } | ConvertTo-Json -Compress)
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "publishToReady": false,
+    "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1", "env": { "ARCHIVE_DEST": "__DEST__" } },
+    "steps": [ { "name": "dump", "resources": [] } ] } } }
+'@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        @(Get-ChildItem -Path (Join-Path (Join-Path $dest 'app') 'weekly') -Directory -ErrorAction SilentlyContinue).Count | Should -Be 1
+        $arch = Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archived' -and $_.svc -eq 'app' } | Select-Object -Last 1
+        $arch.tier | Should -Be 'weekly'
+    }
+
+    It 'archive-gfsy routes to daily when yearly and weekly already exist' {
+        $dest = Join-Path $Work "gfsy-c-$n"
+        $appDir = Join-Path $dest 'app'
+        $y = (Get-Date).Year
+        $yPath = Join-Path (Join-Path $appDir 'yearly') 'seed-yearly'
+        $wPath = Join-Path (Join-Path $appDir 'weekly') 'seed-weekly'
+        New-Item -ItemType Directory -Force -Path $yPath | Out-Null
+        New-Item -ItemType Directory -Force -Path $wPath | Out-Null
+        Add-Content -LiteralPath $ev -Value (@{ ts = "$y-01-01T00:00:00+00:00"; type = 'service.archived'; svc = 'app'; tier = 'yearly'; path = $yPath } | ConvertTo-Json -Compress)
+        Add-Content -LiteralPath $ev -Value (@{ ts = (Get-Date).ToString('o'); type = 'service.archived'; svc = 'app'; tier = 'weekly'; path = $wPath } | ConvertTo-Json -Compress)
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "publishToReady": false,
+    "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1", "env": { "ARCHIVE_DEST": "__DEST__" } },
+    "steps": [ { "name": "dump", "resources": [] } ] } } }
+'@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        @(Get-ChildItem -Path (Join-Path $appDir 'daily') -Directory -ErrorAction SilentlyContinue).Count | Should -Be 1
+        $arch = Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archived' -and $_.svc -eq 'app' } | Select-Object -Last 1
+        $arch.tier | Should -Be 'daily'
+    }
+
+    It 'archive-gfsy prunes within a tier by the log (keep N), leaving other tiers alone' {
+        $dest = Join-Path $Work "gfsy-d-$n"
+        $appDir = Join-Path $dest 'app'
+        $y = (Get-Date).Year
+        # force daily routing: a yearly this year + a weekly this ISO week already exist
+        $yPath = Join-Path (Join-Path $appDir 'yearly') 'seed-yearly'
+        $wPath = Join-Path (Join-Path $appDir 'weekly') 'seed-weekly'
+        New-Item -ItemType Directory -Force -Path $yPath | Out-Null
+        New-Item -ItemType Directory -Force -Path $wPath | Out-Null
+        Add-Content -LiteralPath $ev -Value (@{ ts = "$y-01-01T00:00:00+00:00"; type = 'service.archived'; svc = 'app'; tier = 'yearly'; path = $yPath } | ConvertTo-Json -Compress)
+        Add-Content -LiteralPath $ev -Value (@{ ts = (Get-Date).ToString('o'); type = 'service.archived'; svc = 'app'; tier = 'weekly'; path = $wPath } | ConvertTo-Json -Compress)
+        # two prior daily archives (oldest first), keep 2 -> the new copy pushes one out
+        $dailyDir = Join-Path $appDir 'daily'
+        $d1 = Join-Path $dailyDir '20260101-000000'
+        $d2 = Join-Path $dailyDir '20260102-000000'
+        New-Item -ItemType Directory -Force -Path $d1 | Out-Null
+        New-Item -ItemType Directory -Force -Path $d2 | Out-Null
+        Add-Content -LiteralPath $ev -Value (@{ ts = "$y-01-01T00:00:00+00:00"; type = 'service.archived'; svc = 'app'; tier = 'daily'; path = $d1 } | ConvertTo-Json -Compress)
+        Add-Content -LiteralPath $ev -Value (@{ ts = "$y-01-02T00:00:00+00:00"; type = 'service.archived'; svc = 'app'; tier = 'daily'; path = $d2 } | ConvertTo-Json -Compress)
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "publishToReady": false,
+    "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1", "env": { "ARCHIVE_DEST": "__DEST__", "ARCHIVE_KEEP_DAILY": "2" } },
+    "steps": [ { "name": "dump", "resources": [] } ] } } }
+'@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        (Test-Path -LiteralPath $d1) | Should -BeFalse   # oldest daily pruned
+        (Test-Path -LiteralPath $d2) | Should -BeTrue    # newer daily kept
+        (Test-Path -LiteralPath $yPath) | Should -BeTrue # other tiers untouched
+        (Test-Path -LiteralPath $wPath) | Should -BeTrue
+        @(Get-ChildItem -Path $dailyDir -Directory).Count | Should -Be 2   # d2 + the new copy
+        @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archive-pruned' -and $_.svc -eq 'app' }).Count | Should -Be 1
+    }
 }
