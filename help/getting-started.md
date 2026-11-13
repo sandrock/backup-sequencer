@@ -107,11 +107,16 @@ Run
 ----------------------------------------------------------------
 
 ```sh
-bseq plan        # show the plan, no side effects
-bseq run         # execute (respects the window)
-bseq run -Force  # execute now, ignore the window
-bseq history     # recent runs, newest first
+bseq plan                      # show the plan, no side effects
+bseq run                       # execute (respects the window + fluid scheduling)
+bseq run -ForceWindow          # run even outside the window
+bseq run -ForceWindow -ForceAllJobs   # run everything now, ignore window + fit check
+bseq history                   # recent runs, newest first
 ```
+
+The plan is ordered by a score (most overdue first); within a window the run packs
+what fits and defers the rest to a later run — see
+[the scheduling model](../docs/scheduling.md).
 
 Without installing (from a checkout), use `pwsh src/sequencer.ps1 <command>` instead.
 

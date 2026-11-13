@@ -100,6 +100,69 @@ Describe 'planning' {
         $plan = Get-BackupPlan -Config $cfg
         @($plan.Service) | Should -Be @('beta', 'alpha', 'delta')
     }
+
+    It 'scores the more overdue service first' {
+        $ev = Join-Path $Work "plan-age-$([guid]::NewGuid().ToString('n').Substring(0,6)).jsonl"
+        Add-Content -LiteralPath $ev -Value (@{ ts = '2026-11-01T00:00:00+00:00'; type = 'service.end'; svc = 'old'; status = 'ok'; bytes = 10 } | ConvertTo-Json -Compress)
+        Add-Content -LiteralPath $ev -Value (@{ ts = '2026-11-06T00:00:00+00:00'; type = 'service.end'; svc = 'fresh'; status = 'ok'; bytes = 10 } | ConvertTo-Json -Compress)
+        $proj = Get-ServiceProjection -EventsPath $ev
+        $cfg = @'
+{ "window": { "open": "23:00", "close": "06:00" },
+  "services": { "old": { "enabled": true, "script": "x", "steps": [] }, "fresh": { "enabled": true, "script": "x", "steps": [] } } }
+'@ | ConvertFrom-Json
+        $plan = Get-BackupPlan -Config $cfg -Projection $proj -At ([datetime]'2026-11-06T12:00:00+00:00')
+        @($plan.Service)[0] | Should -Be 'old'
+    }
+
+    It 'floats a never-run service above a recently backed-up one' {
+        $ev = Join-Path $Work "plan-new-$([guid]::NewGuid().ToString('n').Substring(0,6)).jsonl"
+        Add-Content -LiteralPath $ev -Value (@{ ts = '2026-11-06T00:00:00+00:00'; type = 'service.end'; svc = 'done'; status = 'ok'; bytes = 10 } | ConvertTo-Json -Compress)
+        $proj = Get-ServiceProjection -EventsPath $ev
+        $cfg = @'
+{ "window": { "open": "23:00", "close": "06:00" },
+  "services": { "done": { "enabled": true, "script": "x", "steps": [] }, "newbie": { "enabled": true, "script": "x", "steps": [] } } }
+'@ | ConvertFrom-Json
+        $plan = Get-BackupPlan -Config $cfg -Projection $proj -At ([datetime]'2026-11-06T12:00:00+00:00')
+        @($plan.Service)[0] | Should -Be 'newbie'
+    }
+
+    It 'breaks never-run ties by size (biggest estimate first)' {
+        $ev = Join-Path $Work "plan-size-$([guid]::NewGuid().ToString('n').Substring(0,6)).jsonl"
+        Add-Content -LiteralPath $ev -Value (@{ ts = '2026-11-06T00:00:00+00:00'; type = 'step.end'; svc = 'big'; step = 'dump'; status = 'ok'; durationSec = 1000 } | ConvertTo-Json -Compress)
+        Add-Content -LiteralPath $ev -Value (@{ ts = '2026-11-06T00:00:00+00:00'; type = 'step.end'; svc = 'small'; step = 'dump'; status = 'ok'; durationSec = 10 } | ConvertTo-Json -Compress)
+        $proj = Get-ServiceProjection -EventsPath $ev   # both never *succeeded* -> never-run tie, est differs
+        $cfg = @'
+{ "window": { "open": "23:00", "close": "06:00" },
+  "services": { "small": { "enabled": true, "script": "x", "steps": [] }, "big": { "enabled": true, "script": "x", "steps": [] } } }
+'@ | ConvertFrom-Json
+        $plan = Get-BackupPlan -Config $cfg -Projection $proj
+        @($plan.Service)[0] | Should -Be 'big'
+    }
+
+    It 'forces mandatory to the front even against a higher score' {
+        $ev = Join-Path $Work "plan-mand-$([guid]::NewGuid().ToString('n').Substring(0,6)).jsonl"
+        # must: backed up recently (low score, but mandatory). other: very overdue (high score)
+        Add-Content -LiteralPath $ev -Value (@{ ts = '2026-11-06T11:00:00+00:00'; type = 'service.end'; svc = 'must'; status = 'ok'; bytes = 10 } | ConvertTo-Json -Compress)
+        Add-Content -LiteralPath $ev -Value (@{ ts = '2026-10-01T00:00:00+00:00'; type = 'service.end'; svc = 'other'; status = 'ok'; bytes = 10 } | ConvertTo-Json -Compress)
+        $proj = Get-ServiceProjection -EventsPath $ev
+        $cfg = @'
+{ "window": { "open": "23:00", "close": "06:00" },
+  "services": { "other": { "enabled": true, "mandatory": false, "script": "x", "steps": [] }, "must": { "enabled": true, "mandatory": true, "script": "x", "steps": [] } } }
+'@ | ConvertFrom-Json
+        $plan = Get-BackupPlan -Config $cfg -Projection $proj -At ([datetime]'2026-11-06T12:00:00+00:00')
+        @($plan.Service)[0] | Should -Be 'must'
+    }
+}
+
+Describe 'window math' {
+    It 'computes window length across the midnight wrap' {
+        (Get-WindowLengthSeconds -Open '23:00' -Close '06:00') | Should -Be 25200
+        (Get-WindowLengthSeconds -Open '09:00' -Close '17:00') | Should -Be 28800
+    }
+    It 'computes seconds until the next close' {
+        (Get-SecondsUntilClose -Close '06:00' -Now ([datetime]'2026-11-06T02:00:00')) | Should -Be 14400
+        (Get-SecondsUntilClose -Close '06:00' -Now ([datetime]'2026-11-06T23:30:00')) | Should -Be 23400
+    }
 }
 
 Describe 'step execution' {
@@ -132,7 +195,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "steps": [ { "name": "dump", "resources": [] },
                { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ | ConvertFrom-Json
-        $runId = Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue
+        $runId = Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue
         $runId | Should -Not -BeNullOrEmpty
         (Test-Path (Join-Path $root 'ready/app/data.bin')) | Should -BeTrue
         (Test-Path (Join-Path $root 'ready/app/config.bin')) | Should -BeTrue
@@ -151,7 +214,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
                { "name": "boom", "resources": [] },
                { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
         (Test-Path (Join-Path $root 'ready/app')) | Should -BeFalse
         $events = Get-BackupEvents -EventsPath $ev
         ($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'app' } | Select-Object -First 1).status | Should -Be 'fail'
@@ -167,7 +230,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "steps": [ { "name": "dump", "resources": [] },
                { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
         @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.replaced' }).Count | Should -BeGreaterThan 0
         (Test-Path (Join-Path $root 'ready/app/data.bin')) | Should -BeTrue
         (Test-Path (Join-Path $root 'ready/app/old.bin')) | Should -BeFalse
@@ -182,7 +245,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "steps": [ { "name": "dump", "resources": [] },
                { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
         (Test-Path (Join-Path $root 'trash/junk')) | Should -BeFalse
     }
 
@@ -195,7 +258,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "steps": [ { "name": "dump", "resources": [] },
                { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
         (Test-Path (Join-Path $root 'ready/app')) | Should -BeFalse
         @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'step.end' -and $_.step -eq 'sync-archive' -and $_.status -eq 'ok' }).Count | Should -BeGreaterThan 0
     }
@@ -209,7 +272,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "steps": [ { "name": "dump", "resources": [] },
                { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
         @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.syncfail' }).Count | Should -BeGreaterThan 0
         (Test-Path (Join-Path $root 'ready/app/data.bin')) | Should -BeTrue
     }
@@ -224,7 +287,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "syncArchive": { "script": "../src/recipes/archive-copy.ps1", "env": { "ARCHIVE_KEEP": "3" } },
     "steps": [ { "name": "dump", "resources": [] }, { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
         $copies = @(Get-ChildItem -Path (Join-Path $dest 'app') -Directory -ErrorAction SilentlyContinue)
         $copies.Count | Should -Be 1
         (Test-Path (Join-Path $copies[0].FullName 'data.bin')) | Should -BeTrue
@@ -241,7 +304,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
       "steps": [ { "name": "dump", "resources": [] }, { "name": "start", "resources": [], "alwaysRun": true } ] }
   } }
 '@ | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
         $events = Get-BackupEvents -EventsPath $ev
         ($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'broken' } | Select-Object -First 1).status | Should -Be 'fail'
         ($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'good' } | Select-Object -First 1).status | Should -Be 'ok'
@@ -254,7 +317,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
   "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/noisy-recipe.ps1",
     "steps": [ { "name": "dump", "resources": [] } ] } } }
 '@ | ConvertFrom-Json
-        $runId = Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue
+        $runId = Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue
         $runId | Should -BeOfType [string]
         $runId | Should -Match '^\d{8}-\d{6}-'
     }
@@ -278,7 +341,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "syncArchive": { "script": "../src/recipes/archive-copy.ps1", "env": { "ARCHIVE_DEST": "__DEST__", "ARCHIVE_KEEP": "2" } },
     "steps": [ { "name": "dump", "resources": [] } ] } } }
 '@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
         # oldest two recorded archives pruned (by their logged paths); newest kept
         (Test-Path (Join-Path $svcDir '20261101-000000')) | Should -BeFalse
         (Test-Path (Join-Path $svcDir '20261102-000000')) | Should -BeFalse
@@ -298,7 +361,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1", "env": { "ARCHIVE_DEST": "__DEST__" } },
     "steps": [ { "name": "dump", "resources": [] } ] } } }
 '@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
         @(Get-ChildItem -Path (Join-Path (Join-Path $dest 'app') 'yearly') -Directory -ErrorAction SilentlyContinue).Count | Should -Be 1
         $arch = Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archived' -and $_.svc -eq 'app' } | Select-Object -Last 1
         $arch.tier | Should -Be 'yearly'
@@ -317,7 +380,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1", "env": { "ARCHIVE_DEST": "__DEST__" } },
     "steps": [ { "name": "dump", "resources": [] } ] } } }
 '@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
         @(Get-ChildItem -Path (Join-Path (Join-Path $dest 'app') 'weekly') -Directory -ErrorAction SilentlyContinue).Count | Should -Be 1
         $arch = Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archived' -and $_.svc -eq 'app' } | Select-Object -Last 1
         $arch.tier | Should -Be 'weekly'
@@ -340,7 +403,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1", "env": { "ARCHIVE_DEST": "__DEST__" } },
     "steps": [ { "name": "dump", "resources": [] } ] } } }
 '@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
         @(Get-ChildItem -Path (Join-Path $appDir 'daily') -Directory -ErrorAction SilentlyContinue).Count | Should -Be 1
         $arch = Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archived' -and $_.svc -eq 'app' } | Select-Object -Last 1
         $arch.tier | Should -Be 'daily'
@@ -372,7 +435,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
     "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1", "env": { "ARCHIVE_DEST": "__DEST__", "ARCHIVE_KEEP_DAILY": "2" } },
     "steps": [ { "name": "dump", "resources": [] } ] } } }
 '@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
         (Test-Path -LiteralPath $d1) | Should -BeFalse   # oldest daily pruned
         (Test-Path -LiteralPath $d2) | Should -BeTrue    # newer daily kept
         (Test-Path -LiteralPath $yPath) | Should -BeTrue # other tiers untouched
@@ -406,7 +469,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
 '@ -replace '__COMPOSE__', ($composeDir -replace '\\', '/') `
             -replace '__DATA1__', ($innerData -replace '\\', '/') `
             -replace '__DATA2__', ($extData -replace '\\', '/')) | ConvertFrom-Json
-        Invoke-BackupRun -Config $cfg -Paths $paths -Force -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
 
         $set = Join-Path $root 'ready/app'
         (Test-Path (Join-Path $set 'app_compose.tar')) | Should -BeTrue
@@ -422,5 +485,33 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         $dl = (& tar -tf (Join-Path $set 'app_data.tar')) -join "`n"
         $dl | Should -Match 'data/db.sqlite'
         $dl | Should -Match 'app-extra/blob.bin'
+    }
+
+    It 'runs the guaranteed first job but defers a second that will not fit' {
+        # window centred on now so we are inside it with ~2h left
+        $now = Get-Date
+        $open = $now.AddHours(-2).ToString('HH:mm')
+        $close = $now.AddHours(2).ToString('HH:mm')
+        # both never-succeeded, both with a huge estimate (>> the ~2h left) -> neither "fits"
+        foreach ($s in 'first', 'second') {
+            Add-Content -LiteralPath $ev -Value (@{ ts = '2026-11-06T00:00:00+00:00'; type = 'step.end'; svc = $s; step = 'dump'; status = 'ok'; durationSec = 100000 } | ConvertTo-Json -Compress)
+        }
+        $cfg = (@'
+{ "window": { "open": "__OPEN__", "close": "__CLOSE__" },
+  "services": {
+    "first":  { "enabled": true, "mandatory": false, "script": "fixtures/mock-service.ps1",
+      "steps": [ { "name": "dump", "resources": [] }, { "name": "start", "resources": [], "alwaysRun": true } ] },
+    "second": { "enabled": true, "mandatory": false, "script": "fixtures/mock-service.ps1",
+      "steps": [ { "name": "dump", "resources": [] }, { "name": "start", "resources": [], "alwaysRun": true } ] }
+  } }
+'@ -replace '__OPEN__', $open -replace '__CLOSE__', $close) | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -WarningAction SilentlyContinue -InformationAction SilentlyContinue | Out-Null
+        $events = Get-BackupEvents -EventsPath $ev
+        # 'first' is the guaranteed job: it runs even though it does not fit
+        ($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'first' } | Select-Object -Last 1).status | Should -Be 'ok'
+        (Test-Path (Join-Path $root 'ready/first')) | Should -BeTrue
+        # 'second' does not fit and the guarantee is already spent -> deferred, not run
+        ($events | Where-Object { $_.type -eq 'service.skip' -and $_.svc -eq 'second' -and $_.reason -eq 'deferred' }).Count | Should -BeGreaterThan 0
+        (Test-Path (Join-Path $root 'ready/second')) | Should -BeFalse
     }
 }

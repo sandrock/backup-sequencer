@@ -63,7 +63,8 @@ Run lifecycle
 1. Take the single-instance lock (a second run exits immediately).
 2. Reap `trash/` (off the publish path); emit `run.start`; fold the projection;
    compute the plan; emit `run.plan`.
-3. For each planned service, while inside the window (unless `-Force`):
+3. For each planned service, while inside the window (unless `-ForceWindow`) and it
+   fits the time left (unless mandatory or `-ForceAllJobs`; see docs/scheduling.md):
    - pre-flight free-space check against the last recorded size;
    - apply the service's `env`; run each step via `Invoke-BackupStep` (timing,
      retries, events), producing the artifact set into `wip/<service>/`;

@@ -30,7 +30,8 @@ journalctl -u backup-sequencer.service -e         # output of the last run
 ```
 
 To run a backup now ignoring the window, invoke the sequencer directly with
-`-Force` rather than the unit — see the [getting started guide](../../help/getting-started.md).
+`-ForceWindow` (add `-ForceAllJobs` to also bypass the fit check) rather than the
+unit — see the [getting started guide](../../help/getting-started.md).
 
 
 Quiet logging

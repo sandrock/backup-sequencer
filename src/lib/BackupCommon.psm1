@@ -97,14 +97,14 @@ function Get-ServiceProjection {
     # Fold the event log into a per-service summary used by planning + status.
     param([Parameter(Mandatory)][string]$EventsPath)
     $events = Get-BackupEvents -EventsPath $EventsPath
-    $proj = @{}
+    $projection = @{}
     foreach ($e in $events) {
         if (-not (Test-HasProp $e 'svc')) {
             continue
         }
         $svc = $e.svc
-        if (-not $proj.ContainsKey($svc)) {
-            $proj[$svc] = [ordered]@{
+        if (-not $projection.ContainsKey($svc)) {
+            $projection[$svc] = [ordered]@{
                 service = $svc; lastSuccess = $null; lastStatus = $null
                 lastBytes = [long]0; failCount = 0; stepDurations = @{}
             }
@@ -112,23 +112,23 @@ function Get-ServiceProjection {
         switch ($e.type) {
             'step.end' {
                 if ((Test-HasProp $e 'durationSec') -and (Test-HasProp $e 'step')) {
-                    $proj[$svc].stepDurations[$e.step] = [double]$e.durationSec
+                    $projection[$svc].stepDurations[$e.step] = [double]$e.durationSec
                 }
             }
             'service.end' {
-                $proj[$svc].lastStatus = $e.status
+                $projection[$svc].lastStatus = $e.status
                 if ($e.status -eq 'ok') {
-                    $proj[$svc].lastSuccess = $e.ts
-                    if (Test-HasProp $e 'bytes') { $proj[$svc].lastBytes = [long]$e.bytes }
-                    $proj[$svc].failCount = 0
+                    $projection[$svc].lastSuccess = $e.ts
+                    if (Test-HasProp $e 'bytes') { $projection[$svc].lastBytes = [long]$e.bytes }
+                    $projection[$svc].failCount = 0
                 }
                 else {
-                    $proj[$svc].failCount++
+                    $projection[$svc].failCount++
                 }
             }
         }
     }
-    return $proj
+    return $projection
 }
 
 function Get-EstimatedServiceSeconds {
@@ -175,14 +175,33 @@ function Test-WithinWindow {
         [Parameter(Mandatory)][string]$Close,
         [datetime]$Now = (Get-Date)
     )
-    $o = [datetime]::ParseExact($Open, 'HH:mm', $null).TimeOfDay
-    $c = [datetime]::ParseExact($Close, 'HH:mm', $null).TimeOfDay
-    $n = $Now.TimeOfDay
-    if ($o -le $c) {
-        return ($n -ge $o -and $n -lt $c)
+    $openTime = [datetime]::ParseExact($Open, 'HH:mm', $null).TimeOfDay
+    $closeTime = [datetime]::ParseExact($Close, 'HH:mm', $null).TimeOfDay
+    $nowTime = $Now.TimeOfDay
+    if ($openTime -le $closeTime) {
+        return ($nowTime -ge $openTime -and $nowTime -lt $closeTime)
     }
     # window wraps past midnight (e.g. 23:00 -> 06:00)
-    return ($n -ge $o -or $n -lt $c)
+    return ($nowTime -ge $openTime -or $nowTime -lt $closeTime)
+}
+
+function Get-WindowLengthSeconds {
+    # Total length of the window, handling the past-midnight wrap.
+    param([Parameter(Mandatory)][string]$Open, [Parameter(Mandatory)][string]$Close)
+    $openTime = [datetime]::ParseExact($Open, 'HH:mm', $null).TimeOfDay
+    $closeTime = [datetime]::ParseExact($Close, 'HH:mm', $null).TimeOfDay
+    $lengthSeconds = ($closeTime - $openTime).TotalSeconds
+    if ($lengthSeconds -le 0) { $lengthSeconds += 86400 }   # wraps past midnight
+    return $lengthSeconds
+}
+
+function Get-SecondsUntilClose {
+    # Seconds from Now until the next occurrence of the close time.
+    param([Parameter(Mandatory)][string]$Close, [datetime]$Now = (Get-Date))
+    $closeTime = [datetime]::ParseExact($Close, 'HH:mm', $null).TimeOfDay
+    $nextClose = $Now.Date.Add($closeTime)
+    if ($nextClose -le $Now) { $nextClose = $nextClose.AddDays(1) }
+    return ($nextClose - $Now).TotalSeconds
 }
 
 function Get-FreeSpaceBytes {
@@ -275,31 +294,62 @@ function Invoke-BackupStep {
 # --- planning ---------------------------------------------------------------
 
 function Get-BackupPlan {
-    # Pure: (config, projection, time) -> ordered plan. Mandatory services first
-    # (in config order), then the rest (in config order). Smarter choosing can
-    # replace the tail later; the data to do so is in the projection.
+    # Pure: (config, projection, now) -> ALL enabled services, score-sorted.
+    # Fluid scheduling — score = overdue + sizeNudge:
+    #   overdue   = age / target        (how overdue vs the desired interval;
+    #                                    never-run floats to the top for a baseline)
+    #   sizeNudge = est / windowLength  (biggest-first tie-break + head start for big
+    #                                    jobs, which need the most room to fit)
+    # age dominates (whole-interval units) so rotation is fair; size only nudges ties.
+    # Mandatory services are forced to the front (still score-ordered among themselves).
+    # target = <service>.targetIntervalHours, else <config>.targetIntervalHours, else 24h.
     param(
         [Parameter(Mandatory)]$Config,
         $Projection = @{},
         [datetime]$At = (Get-Date)
     )
-    $mandatory = @()
-    $rest = @()
-    foreach ($name in $Config.services.PSObject.Properties.Name) {
-        $svc = $Config.services.$name
-        if (-not $svc.enabled) { continue }
-        $est = Get-EstimatedServiceSeconds -Projection $Projection -Service $name
-        $last = $null
-        if ($Projection.ContainsKey($name)) { $last = $Projection[$name].lastSuccess }
-        $entry = [pscustomobject]@{
-            Service      = $name
-            Mandatory    = [bool]$svc.mandatory
-            EstimatedSec = $est
-            LastSuccess  = $last
+    $windowSeconds = Get-WindowLengthSeconds -Open $Config.window.open -Close $Config.window.close
+    $defaultTargetHours = 24.0
+    if (Test-HasProp $Config 'targetIntervalHours') { $defaultTargetHours = [double]$Config.targetIntervalHours }
+
+    $entries = @()
+    foreach ($serviceName in $Config.services.PSObject.Properties.Name) {
+        $serviceConfig = $Config.services.$serviceName
+        $enabled = (Test-HasProp $serviceConfig 'enabled') -and [bool]$serviceConfig.enabled
+        if (-not $enabled) { continue }
+        $isMandatory = (Test-HasProp $serviceConfig 'mandatory') -and [bool]$serviceConfig.mandatory
+        $estimatedSeconds = Get-EstimatedServiceSeconds -Projection $Projection -Service $serviceName
+        $lastSuccess = $null
+        if ($Projection.ContainsKey($serviceName)) { $lastSuccess = $Projection[$serviceName].lastSuccess }
+
+        $targetHours = $defaultTargetHours
+        if (Test-HasProp $serviceConfig 'targetIntervalHours') { $targetHours = [double]$serviceConfig.targetIntervalHours }
+        $targetSeconds = [math]::Max(1.0, $targetHours * 3600.0)
+
+        if ($lastSuccess) {
+            $ageSeconds = ($At - [datetime]$lastSuccess).TotalSeconds
+            if ($ageSeconds -lt 0) { $ageSeconds = 0 }
+            $overdue = $ageSeconds / $targetSeconds
         }
-        if ($entry.Mandatory) { $mandatory += $entry } else { $rest += $entry }
+        else {
+            $ageSeconds = -1.0        # never run
+            $overdue = 1e6            # float to the top for a first baseline
+        }
+        $sizeNudge = if ($windowSeconds -gt 0) { $estimatedSeconds / $windowSeconds } else { 0 }
+
+        $entries += [pscustomobject]@{
+            Service          = $serviceName
+            Mandatory        = $isMandatory
+            EstimatedSeconds = $estimatedSeconds
+            LastSuccess      = $lastSuccess
+            AgeSeconds       = $ageSeconds
+            Overdue          = $overdue
+            Score            = $overdue + $sizeNudge
+        }
     }
-    return @($mandatory + $rest)
+    $mandatoryJobs = @($entries | Where-Object { $_.Mandatory } | Sort-Object -Property Score -Descending -Stable)
+    $otherJobs = @($entries | Where-Object { -not $_.Mandatory } | Sort-Object -Property Score -Descending -Stable)
+    return @($mandatoryJobs + $otherJobs)
 }
 
 # --- spool phases (wip -> stage -> ready, trash) ----------------------------
@@ -354,7 +404,8 @@ function Invoke-BackupRun {
     param(
         [Parameter(Mandatory)]$Config,
         [Parameter(Mandatory)][hashtable]$Paths,   # BaseDir, EventsPath, LockPath, SpoolRoot
-        [switch]$Force                             # bypass window gating (manual/test runs)
+        [switch]$ForceWindow,                      # run even when outside the window
+        [switch]$ForceAllJobs                      # skip the fit check: attempt every job (no deferral)
     )
     if (-not (Enter-SequencerLock -LockPath $Paths.LockPath)) {
         Write-Warning 'sequencer already running; exiting.'
@@ -372,36 +423,62 @@ function Invoke-BackupRun {
             -Props @{ runId = $runId; window = "$($Config.window.open)-$($Config.window.close)" }
         Write-Information ("Backup run {0}  (window {1}-{2})" -f $runId, $Config.window.open, $Config.window.close)
 
-        $proj = Get-ServiceProjection -EventsPath $Paths.EventsPath
-        $plan = Get-BackupPlan -Config $Config -Projection $proj
+        $projection = Get-ServiceProjection -EventsPath $Paths.EventsPath
+        $plan = Get-BackupPlan -Config $Config -Projection $projection
         Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'run.plan' `
             -Props @{ runId = $runId; plan = @($plan.Service) }
 
         $okCount = 0
         $failCount = 0
-        foreach ($p in $plan) {
-            if (-not $Force -and -not (Test-WithinWindow -Open $Config.window.open -Close $Config.window.close)) {
+        $ranGuaranteed = $false   # has a non-mandatory job started this run? (fluid: >=1 per window)
+        foreach ($plannedJob in $plan) {
+            # hard window gate: never START work past close (a running job may overrun)
+            if (-not $ForceWindow -and -not (Test-WithinWindow -Open $Config.window.open -Close $Config.window.close)) {
                 Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'run.windowclosed' -Props @{ runId = $runId }
-                Write-Information ("Outside the backup window ({0}-{1}); nothing run. Use -Force to override." -f $Config.window.open, $Config.window.close)
+                if (($okCount + $failCount) -gt 0) {
+                    Write-Information ("Backup window closed ({0}-{1}); remaining services deferred to the next run." -f $Config.window.open, $Config.window.close)
+                }
+                else {
+                    Write-Information ("Outside the backup window ({0}-{1}); nothing run. Use -ForceWindow to override." -f $Config.window.open, $Config.window.close)
+                }
                 break
             }
-            $svcName = $p.Service
-            $wipDir = Join-Path $stg.Wip $svcName
-            $stageDir = Join-Path $stg.Stage $svcName
-            $readyDir = Join-Path $stg.Ready $svcName
+            $serviceName = $plannedJob.Service
+
+            # fluid fit decision: start a service only if its estimate fits the time
+            # left before close. Exceptions that still run: an unknown estimate
+            # (first-ever, optimistic) and the FIRST non-mandatory job of the run
+            # (guaranteed progress — lets an over-window job take a solo night when it
+            # is the most overdue). Mandatory and -ForceAllJobs bypass the check.
+            if (-not $ForceAllJobs -and -not $plannedJob.Mandatory) {
+                $estimatedSeconds = [double]$plannedJob.EstimatedSeconds
+                $remainingSeconds = Get-SecondsUntilClose -Close $Config.window.close
+                $fitsInWindow = ($estimatedSeconds -le 0) -or ($estimatedSeconds -le $remainingSeconds)
+                if (-not $fitsInWindow -and $ranGuaranteed) {
+                    Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.skip' `
+                        -Props @{ runId = $runId; svc = $serviceName; reason = 'deferred'; estSec = [int]$estimatedSeconds; remainingSec = [int]$remainingSeconds }
+                    Write-Information ("  {0}  deferred (est {1}s, {2}s left in window)" -f $serviceName, [int]$estimatedSeconds, [int]$remainingSeconds)
+                    continue
+                }
+                $ranGuaranteed = $true
+            }
+
+            $wipDir = Join-Path $stg.Wip $serviceName
+            $stageDir = Join-Path $stg.Stage $serviceName
+            $readyDir = Join-Path $stg.Ready $serviceName
             try {
             # isolate per-service failures: an unhandled error here fails only this service
-            $svc = $Config.services.$svcName
+            $svc = $Config.services.$serviceName
             $scriptPath = Join-Path $Paths.BaseDir $svc.script
 
             # pre-flight free-space check against the last recorded size (1.5x headroom)
-            if ($proj.ContainsKey($svcName) -and $proj[$svcName].lastBytes -gt 0) {
-                $need = [long]($proj[$svcName].lastBytes * 1.5)
+            if ($projection.ContainsKey($serviceName) -and $projection[$serviceName].lastBytes -gt 0) {
+                $need = [long]($projection[$serviceName].lastBytes * 1.5)
                 $free = Get-FreeSpaceBytes -Path $Paths.SpoolRoot
                 if ($free -lt $need) {
                     Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.skip' `
-                        -Props @{ runId = $runId; svc = $svcName; reason = 'insufficient-space'; needBytes = $need; freeBytes = $free }
-                    Write-Warning "$svcName skipped: insufficient space (need $need, free $free)"
+                        -Props @{ runId = $runId; svc = $serviceName; reason = 'insufficient-space'; needBytes = $need; freeBytes = $free }
+                    Write-Warning "$serviceName skipped: insufficient space (need $need, free $free)"
                     continue
                 }
             }
@@ -412,7 +489,7 @@ function Invoke-BackupRun {
 
             # --- load the recipe (it registers its steps) and produce into wip/<service> ---
             $rc = [RecipeContext]::new()
-            $rc.Service = $svcName
+            $rc.Service = $serviceName
             $rc.OutDir = $wipDir
             $rc.Env = if (Test-HasProp $svc 'env') { $svc.env } else { $null }
             $rc.EventsPath = $Paths.EventsPath
@@ -437,7 +514,7 @@ function Invoke-BackupRun {
                     $action = { throw "recipe did not register step '$missing'" }.GetNewClosure()
                 }
                 $r = Invoke-BackupStep -EventsPath $Paths.EventsPath -RunId $runId `
-                    -Service $svcName -Step $stepName -Action $action -Retries $retries
+                    -Service $serviceName -Step $stepName -Action $action -Retries $retries
                 if ($r -ne 'ok' -and -not $always) { $failed = $true }
             }
 
@@ -445,8 +522,8 @@ function Invoke-BackupRun {
                 Move-ToTrash -Path $wipDir -TrashRoot $stg.Trash   # discard the partial dump
                 $failCount++
                 Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
-                    -Props @{ runId = $runId; svc = $svcName; status = 'fail'; bytes = 0 }
-                Write-Warning "$svcName FAILED: partial dump discarded"
+                    -Props @{ runId = $runId; svc = $serviceName; status = 'fail'; bytes = 0 }
+                Write-Warning "$serviceName FAILED: partial dump discarded"
                 continue
             }
 
@@ -465,22 +542,22 @@ function Invoke-BackupRun {
                     $syncFailed = $true
                     $reason = "recipe not found: $($sa.script)"
                     Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.syncfail' `
-                        -Props @{ runId = $runId; svc = $svcName; reason = $reason }
-                    Write-Warning "$svcName sync-archive skipped: $reason (backup still published)"
+                        -Props @{ runId = $runId; svc = $serviceName; reason = $reason }
+                    Write-Warning "$serviceName sync-archive skipped: $reason (backup still published)"
                 }
                 else {
                     $arc = [RecipeContext]::new()
-                    $arc.Service = $svcName
+                    $arc.Service = $serviceName
                     $arc.OutDir = $stageDir
                     $arc.EventsPath = $Paths.EventsPath
                     $arc.RunId = $runId
                     # archive env: top-level config.archive defaults, overridden per-service
                     $archiveEnv = [ordered]@{}
                     if ((Test-HasProp $Config 'archive') -and ($null -ne $Config.archive)) {
-                        foreach ($p in @($Config.archive.PSObject.Properties)) { $archiveEnv[$p.Name] = $p.Value }
+                        foreach ($prop in @($Config.archive.PSObject.Properties)) { $archiveEnv[$prop.Name] = $prop.Value }
                     }
                     if ((Test-HasProp $sa 'env') -and ($null -ne $sa.env)) {
-                        foreach ($p in @($sa.env.PSObject.Properties)) { $archiveEnv[$p.Name] = $p.Value }
+                        foreach ($prop in @($sa.env.PSObject.Properties)) { $archiveEnv[$prop.Name] = $prop.Value }
                     }
                     $arc.Env = [pscustomobject]$archiveEnv
                     & $saScript -Recipe $arc | Out-Null
@@ -488,28 +565,28 @@ function Invoke-BackupRun {
                         $syncFailed = $true
                         $reason = "recipe did not register an 'archive' step"
                         Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.syncfail' `
-                            -Props @{ runId = $runId; svc = $svcName; reason = $reason }
-                        Write-Warning "$svcName sync-archive FAILED: $reason (backup still published)"
+                            -Props @{ runId = $runId; svc = $serviceName; reason = $reason }
+                        Write-Warning "$serviceName sync-archive FAILED: $reason (backup still published)"
                     }
                     else {
                         $archiveBlock = $arc.Steps['archive']
                         $saAction = { & $archiveBlock $arc }.GetNewClosure()
                         $rsa = Invoke-BackupStep -EventsPath $Paths.EventsPath -RunId $runId `
-                            -Service $svcName -Step 'sync-archive' -Action $saAction
+                            -Service $serviceName -Step 'sync-archive' -Action $saAction
                         $syncFailed = ($rsa -ne 'ok')
                         if ($syncFailed) {
                             $reason = (Get-BackupEvents -EventsPath $Paths.EventsPath |
-                                Where-Object { $_.type -eq 'step.end' -and $_.svc -eq $svcName -and $_.step -eq 'sync-archive' -and $_.status -eq 'fail' } |
+                                Where-Object { $_.type -eq 'step.end' -and $_.svc -eq $serviceName -and $_.step -eq 'sync-archive' -and $_.status -eq 'fail' } |
                                 Select-Object -Last 1).error
                             if (-not $reason) { $reason = 'see events.jsonl' }
                             Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.syncfail' `
-                                -Props @{ runId = $runId; svc = $svcName; reason = $reason }
-                            Write-Warning "$svcName sync-archive FAILED: $reason (backup still published)"
+                                -Props @{ runId = $runId; svc = $serviceName; reason = $reason }
+                            Write-Warning "$serviceName sync-archive FAILED: $reason (backup still published)"
                         }
                         else {
                             # record the archive in the sequencer log (reported by the recipe)
                             $res = if ($arc.State.ContainsKey('Result')) { $arc.State['Result'] } else { @{} }
-                            $props = @{ runId = $runId; svc = $svcName }
+                            $props = @{ runId = $runId; svc = $serviceName }
                             if ($res -is [hashtable]) {
                                 if ($res.ContainsKey('tier') -and $res['tier']) { $props['tier'] = $res['tier'] }
                                 if ($res.ContainsKey('path') -and $res['path']) { $props['path'] = $res['path'] }
@@ -520,11 +597,11 @@ function Invoke-BackupRun {
                             if (($res -is [hashtable]) -and $res.ContainsKey('pruned') -and $res['pruned']) {
                                 foreach ($pp in @($res['pruned'])) {
                                     Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.archive-pruned' `
-                                        -Props @{ runId = $runId; svc = $svcName; path = $pp }
+                                        -Props @{ runId = $runId; svc = $serviceName; path = $pp }
                                 }
                                 $prunedCount = @($res['pruned']).Count
                             }
-                            $archMsg = "  $svcName  archived"
+                            $archMsg = "  $serviceName  archived"
                             if ($props.ContainsKey('path')) { $archMsg += " -> $($props['path'])" }
                             if ($prunedCount -gt 0) { $archMsg += "  (pruned $prunedCount)" }
                             Write-Information $archMsg
@@ -542,9 +619,9 @@ function Invoke-BackupRun {
                 if (Test-Path -LiteralPath $readyDir) {
                     # previous backup never taken by the archiver: replace + notify
                     Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.replaced' `
-                        -Props @{ runId = $runId; svc = $svcName; reason = 'previous-unarchived' }
+                        -Props @{ runId = $runId; svc = $serviceName; reason = 'previous-unarchived' }
                     Move-ToTrash -Path $readyDir -TrashRoot $stg.Trash
-                    Write-Warning "$svcName replaced previous un-archived backup (archiver behind)"
+                    Write-Warning "$serviceName replaced previous un-archived backup (archiver behind)"
                 }
                 Move-Phase -Src $stageDir -Dst $readyDir
             }
@@ -554,17 +631,17 @@ function Invoke-BackupRun {
 
             $okCount++
             Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
-                -Props @{ runId = $runId; svc = $svcName; status = 'ok'; bytes = $bytes }
+                -Props @{ runId = $runId; svc = $serviceName; status = 'ok'; bytes = $bytes }
             $mb = [math]::Round(($bytes / 1MB), 1)
-            $dest = if ($publishToReady) { "ready/$svcName" } else { 'archived (sync); local copy dropped' }
-            Write-Information ("  {0}  OK  ({1} MB)  -> {2}" -f $svcName, $mb, $dest)
+            $dest = if ($publishToReady) { "ready/$serviceName" } else { 'archived (sync); local copy dropped' }
+            Write-Information ("  {0}  OK  ({1} MB)  -> {2}" -f $serviceName, $mb, $dest)
             }
             catch {
                 $emsg = $_.Exception.Message
                 $failCount++
                 Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
-                    -Props @{ runId = $runId; svc = $svcName; status = 'fail'; bytes = 0; error = $emsg }
-                Write-Warning "$svcName FAILED: $emsg"
+                    -Props @{ runId = $runId; svc = $serviceName; status = 'fail'; bytes = 0; error = $emsg }
+                Write-Warning "$serviceName FAILED: $emsg"
                 try { Move-ToTrash -Path $wipDir -TrashRoot $stg.Trash; Move-ToTrash -Path $stageDir -TrashRoot $stg.Trash } catch { }
             }
         }
@@ -639,6 +716,7 @@ function Send-BackupReport {
 Export-ModuleMember -Function `
     New-RunId, Get-NowIso, Add-BackupEvent, Get-BackupEvents, Test-HasProp, `
     Get-ServiceProjection, Get-EstimatedServiceSeconds, Enter-SequencerLock, Exit-SequencerLock, `
-    Test-WithinWindow, Get-FreeSpaceBytes, Get-PathSizeBytes, Invoke-BackupStep, `
+    Test-WithinWindow, Get-WindowLengthSeconds, Get-SecondsUntilClose, `
+    Get-FreeSpaceBytes, Get-PathSizeBytes, Invoke-BackupStep, `
     Get-SpoolPaths, Move-ToTrash, Move-Phase, Clear-Trash, `
     Get-BackupPlan, Invoke-BackupRun, Format-RunReport, Send-BackupReport

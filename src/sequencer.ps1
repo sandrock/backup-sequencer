@@ -13,21 +13,24 @@
   plan | run | history | help
 .PARAMETER ConfigPath
   Path to config.json. Defaults to the OS config dir (see help/).
-.PARAMETER Force
-  Bypass the time-window gate (manual/test runs).
+.PARAMETER ForceWindow
+  Run even when outside the configured time window (manual/test runs).
+.PARAMETER ForceAllJobs
+  Skip the fit check: attempt every planned job, no deferral (accepts overruns).
 .PARAMETER Limit
   history: number of recent runs to show.
 .EXAMPLE
   pwsh sequencer.ps1 plan
 .EXAMPLE
-  pwsh sequencer.ps1 run -ConfigPath ./config.json -Force
+  pwsh sequencer.ps1 run -ConfigPath ./config.json -ForceWindow -ForceAllJobs
 #>
 
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)][string]$Command = 'help',
     [string]$ConfigPath,
-    [switch]$Force,
+    [switch]$ForceWindow,
+    [switch]$ForceAllJobs,
     [int]$Limit = 20,
     [switch]$Help
 )
@@ -71,7 +74,7 @@ function Show-Usage {
 backup sequencer
 
 Usage:
-  pwsh sequencer.ps1 <command> [-ConfigPath <path>] [-Force] [-Limit <n>]
+  pwsh sequencer.ps1 <command> [-ConfigPath <path>] [-ForceWindow] [-ForceAllJobs] [-Limit <n>]
 
 Commands:
   plan      Show the ordered plan for the current window (no side effects)
@@ -113,19 +116,21 @@ $Paths = @{
 
 switch ($Command) {
     'plan' {
-        $proj = Get-ServiceProjection -EventsPath $Paths.EventsPath
-        $plan = Get-BackupPlan -Config $Config -Projection $proj
-        Write-Host ("Plan  window={0}-{1}  (within window now: {2})" -f `
+        $projection = Get-ServiceProjection -EventsPath $Paths.EventsPath
+        $plan = Get-BackupPlan -Config $Config -Projection $projection
+        Write-Host ("Plan  window={0}-{1}  (within window now: {2})  [* = mandatory, by score]" -f `
                 $Config.window.open, $Config.window.close, (Test-WithinWindow $Config.window.open $Config.window.close))
-        foreach ($p in $plan) {
-            $flag = if ($p.Mandatory) { '*' } else { ' ' }
-            $last = Format-DisplayTime $p.LastSuccess
-            Write-Host ("  {0} {1,-24} est={2,6:N0}s  lastSuccess={3}" -f $flag, $p.Service, $p.EstimatedSec, $last)
+        foreach ($plannedJob in $plan) {
+            $flag = if ($plannedJob.Mandatory) { '*' } else { ' ' }
+            $lastSuccess = Format-DisplayTime $plannedJob.LastSuccess
+            $overdue = if ($plannedJob.AgeSeconds -lt 0) { 'new' } else { ('x{0:N1}' -f $plannedJob.Overdue) }
+            Write-Host ("  {0} {1,-22} est={2,6:N0}s  overdue={3,-5}  score={4,7:N2}  last={5}" -f `
+                    $flag, $plannedJob.Service, $plannedJob.EstimatedSeconds, $overdue, $plannedJob.Score, $lastSuccess)
         }
     }
     'run' {
         # the engine narrates the run live; here we only send the email report
-        $runId = Invoke-BackupRun -Config $Config -Paths $Paths -Force:$Force -InformationAction Continue
+        $runId = Invoke-BackupRun -Config $Config -Paths $Paths -ForceWindow:$ForceWindow -ForceAllJobs:$ForceAllJobs -InformationAction Continue
         if ($runId -and (Test-HasProp $Config 'notify') -and $Config.notify.enabled) {
             $report = Format-RunReport -EventsPath $Paths.EventsPath -RunId $runId
             Send-BackupReport -Notify $Config.notify -Subject "backup report $runId" `
