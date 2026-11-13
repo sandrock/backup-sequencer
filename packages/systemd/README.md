@@ -39,7 +39,7 @@ Quiet logging
 Under systemd, PowerShell otherwise floods the journal with its own startup
 (`Perftrack_ConsoleStartup`) and script-block-compile lines — separate from the
 sequencer's own output. The service's `ExecStart` passes
-`-SettingsFile powershell.config.json` (shipped here, `LogLevel: Error`) to silence
-them for this session only, leaving the host's global pwsh config untouched. If you
-install the code somewhere other than `/opt/backup-sequencer`, fix that path in the
-unit.
+`-SettingsFile ../powershell.config.json` (shipped at `packages/powershell.config.json`,
+`LogLevel: Error`) to silence them for this session only, leaving the host's global
+pwsh config untouched. The `bseq` CLI wrapper uses the same file. If you install
+the code somewhere other than `/opt/backup-sequencer`, fix that path in the unit.

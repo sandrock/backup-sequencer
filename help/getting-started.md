@@ -24,8 +24,40 @@ Where things go
 | Spool (transient backups) | `/var/spool/backup-sequencer/` | `%ProgramData%\backup-sequencer\spool\` |
 
 All are overridable with `BACKUP_SEQUENCER_CONFIG_DIR`, `BACKUP_SEQUENCER_VAR_DIR`,
-and `BACKUP_SEQUENCER_SPOOL_DIR`. Deploy the code read-only (git pull / rsync /
-package); keep config and secrets out of the code tree.
+and `BACKUP_SEQUENCER_SPOOL_DIR`. Keep config and secrets out of the code tree.
+
+
+Install
+----------------------------------------------------------------
+
+`packages/install.sh` installs the tool system-wide on Linux. It needs `pwsh`
+already present (it does not install PowerShell). It puts the code in
+`/opt/backup-sequencer`, a `bseq` command in `/usr/local/bin`, creates the
+config/state/spool dirs above, and — when systemd is present — installs the
+service/timer units (disabled).
+
+Download and install the latest `main`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/sandrock/backup-sequencer/main/packages/install.sh | sudo bash
+```
+
+Or install from a local checkout (air-gapped, or a specific branch):
+
+```sh
+sudo ./packages/install.sh --from .
+```
+
+Flags: `--no-systemd` skips the service/timer units (otherwise installed, disabled,
+when systemd is present — see [packages/systemd/](../packages/systemd/README.md)),
+`--ref <branch|tag>` selects what to download, `--yes` skips the prompt, `--help`
+lists everything. The install locations are overridable with `BSEQ_CODE_DIR`,
+`BSEQ_BIN_DIR`, `BSEQ_CONFIG_DIR`, `BSEQ_VAR_DIR`, `BSEQ_SPOOL_DIR` (handy for a dry
+run into a temp prefix). Re-running the installer updates the code in place; an
+existing `config.json` and existing units are never touched.
+
+The `bseq` wrapper runs the tool under `pwsh` with quiet logging, so `bseq plan` /
+`bseq run` work from anywhere once installed.
 
 
 Where backups land
@@ -75,11 +107,13 @@ Run
 ----------------------------------------------------------------
 
 ```sh
-pwsh <install>/src/sequencer.ps1 plan       # show the plan, no side effects
-pwsh <install>/src/sequencer.ps1 run        # execute (respects the window)
-pwsh <install>/src/sequencer.ps1 run -Force # execute now, ignore the window
-pwsh <install>/src/sequencer.ps1 history    # recent runs, newest first
+bseq plan        # show the plan, no side effects
+bseq run         # execute (respects the window)
+bseq run -Force  # execute now, ignore the window
+bseq history     # recent runs, newest first
 ```
+
+Without installing (from a checkout), use `pwsh src/sequencer.ps1 <command>` instead.
 
 
 Schedule

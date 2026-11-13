@@ -20,7 +20,7 @@ User=root
 # -SettingsFile points pwsh at a quiet logging config (LogLevel: Error), so pwsh's
 # own perftrack/script-block lines stay out of the journal — only the sequencer's
 # own output is logged. -NoProfile/-NonInteractive: don't load profiles, never prompt.
-ExecStart=/usr/bin/pwsh -NoProfile -NonInteractive -SettingsFile /opt/backup-sequencer/packages/systemd/powershell.config.json /opt/backup-sequencer/src/sequencer.ps1 run
+ExecStart=/usr/bin/pwsh -NoProfile -NonInteractive -SettingsFile /opt/backup-sequencer/packages/powershell.config.json /opt/backup-sequencer/src/sequencer.ps1 run
 
 # A run can last the whole night window, so do not time it out.
 TimeoutStartSec=0
