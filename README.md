@@ -1,49 +1,82 @@
 backup-sequencer
 ================================
 
-A small, dependency-light backup orchestrator written in PowerShell. It runs a
-set of per-service backups in a defined time window — mandatory services first —
-without overlapping, records a structured event log, and reports each run by
-email. Services are described in JSON and implemented by step scripts: reusable
-*recipes* or *bespoke* scripts, both following the same step contract.
+A small, dependency-light backup orchestrator in PowerShell. It runs a set of
+per-service backups inside one nightly window, driven entirely by an append-only
+event log, and stays out of the way of *how* each service is backed up or *where*
+the result is shipped.
 
-It is a coordinator, not a backup format, and it is only a *producer*: it drives
-your stop/dump/start steps in the right order, publishes each finished backup to a
-spool area, and records what happened. Archiving — shipping a backup somewhere
-durable, with or without deduplication — is a separate, pluggable concern handled
-by an external archiver, not by the sequencer. See `docs/archiving.md`.
+
+Why
+----------------------------------------------------------------
+
+A machine accrues a pile of independent backup cron jobs. They overlap and fight
+for disk and I/O; a slow one overruns into working hours; a service is left stopped
+after a failed dump; one job quietly stops running and nobody notices; and naive
+"delete files older than N days" retention slowly erodes how many distinct days you
+can actually restore.
+
+The sequencer replaces that pile with one coordinator that plans each night from
+what has — and hasn't — happened, and records everything. It is a *coordinator*,
+not a backup format: it drives your stop/dump/start steps in order, publishes each
+finished backup to a spool, runs whatever *archiver* you plug in to ship and retain
+it, and logs the outcome — without baking a format, a destination, or a retention
+policy into the engine. See `docs/archiving.md`.
 
 
 Principles
 ----------------------------------------------------------------
 
-- Producer, not archiver. The sequencer builds backups and publishes them to a
-  spool area; it never ships them, and the only backup it deletes is a stale,
-  unconsumed one it replaces (with a notification). Archiving is an external,
-  pluggable consumer — FTP, a remote pull, restic, object storage — and the
-  sequencer is indifferent to the method.
-- A backup is a set of artifacts. A service backup is a directory of separate
-  files (e.g. config, binaries, data, a database dump), not one archive, so each
-  can be restored or deduplicated on its own.
-- Atomic handoff. A finished backup moves `wip → stage → ready` by atomic
-  directory rename, so a consumer never sees a half-written backup.
-- Bounded on disk. The spool keeps at most the latest backup per service; if the
-  archiver falls behind, the old one is replaced with a notification rather than
-  accumulated. Deletion is a rename into `trash/`, reaped off the hot path.
+**The event log is the single source of truth.** Every run appends structured
+events (JSONL). `plan`, `history`, retention, and "is this already backed up?" are
+all *projections* over that log — never over directory names or file mtimes. There
+is no hidden state.
+
+**Fluid, not cron.** Each run computes a fresh plan and packs the window with as
+much backup as it can. Services are ordered by a fairness score — most overdue
+first — so every service gets its turn and nothing starves; a job that will not fit
+the time left is deferred to a later night, and anything that can't keep up shows as
+a rising *overdue* in `plan` rather than being silently dropped. A started job is
+never killed, so backups finish; the window only gates what *starts*.
+
+**Don't do needless work.** A service already backed up for its period is skipped —
+no dump, no downtime. The archiver makes that call, because only it knows its own
+retention: with GFS tiers, a yearly or weekly backup also covers the day.
+
+**Archiving is pluggable, not built in.** The engine produces each backup and
+publishes it to a spool; it has no shipping method or retention policy of its own.
+Copying the set to a destination and pruning old copies is an *archiver recipe* — it
+can run as a step inside the run (the bundled `archive-*` recipes do this: ship to a
+destination and prune by GFS / keep-N) or as an external consumer that drains
+`ready/` on its own schedule. The method lives in the recipe; the engine stays
+indifferent to it. The one thing the engine itself ever deletes is a stale,
+unconsumed backup it replaces at publish time (with a notification).
+
+**A backup is a set of artifacts.** A service backup is a directory of separate
+files (config, binaries, data, a database dump), not one blob — so each can be
+restored or deduplicated on its own.
+
+**Atomic and bounded.** A finished backup moves `wip → stage → ready` by atomic
+directory rename, so a consumer never sees a half-written set. The spool keeps at
+most the latest backup per service; deletion is a rename into `trash/`, reaped off
+the hot path.
 
 
-Features
+What it does
 ----------------------------------------------------------------
 
-- One time window, no overlap — replaces a pile of independent cron jobs.
-- Mandatory services always run first.
-- Structured, append-only event log (JSONL) → `plan`, `history`, and reports
-  are all projections over it.
-- Resource-aware step model (named locks) so independent steps can run in
-  parallel later without config changes.
-- Per-service failure isolation, with `alwaysRun` steps so a service is never
-  left stopped after a failed backup.
-- Cross-platform (Linux + Windows, PowerShell 7).
+- One nightly window, no overlapping runs (a single-instance lock) — in place of a
+  pile of independent cron jobs.
+- Log-driven `plan` / `run` / `history`, plus an email report per run that doubles
+  as a dead-man's-switch (no mail means the run did not happen).
+- Fluid scheduling: fairness-ordered, window-packed, coverage-aware, with tiered
+  (GFS) retention that keeps N distinct periods, not N recent copies.
+- Per-service failure isolation, with `alwaysRun` steps so a service is never left
+  stopped after a failed backup.
+- Pluggable *recipes* (reusable, e.g. `docker-compose-cold`) and *bespoke*
+  per-service scripts, both on the same step contract.
+- Cross-platform (Linux + Windows, PowerShell 7); no runtime dependency beyond
+  `pwsh` and whatever a given recipe's steps call.
 
 
 Layout
@@ -51,14 +84,15 @@ Layout
 
 ```
 src/
-  sequencer.ps1        entry point: plan | run | history | help
+  sequencer.ps1         entry point: plan | run | history | help
   lib/BackupCommon.psm1 engine (events, projection, locking, planning, run)
-  recipes/             reusable step scripts (e.g. docker-compose-cold)
-  services/            bespoke per-service step scripts (same contract)
-tests/                 Pester tests + abstract fixtures
-docs/                  developer specs and internals (see archiving.md)
-help/                  end-user documentation
-config.sample.json     example config (placeholders)
+  recipes/              reusable step scripts (e.g. docker-compose-cold)
+  services/             bespoke per-service step scripts (same contract)
+tests/                  Pester tests + abstract fixtures
+docs/                   design and internals (archiving.md, scheduling.md)
+help/                   end-user documentation (install, schedule, notify)
+packages/               installer + systemd units
+config.sample.json      example config (placeholders)
 ```
 
 
@@ -69,15 +103,17 @@ Quick start
 # run the tests (no docker, no network needed)
 pwsh -c "Invoke-Pester -Path ./tests"
 
-# dry-run a plan against a config
+# dry-run a plan against a config (no side effects)
 pwsh src/sequencer.ps1 plan -ConfigPath ./config.sample.json
 
-# execute (use -Force to bypass the time-window gate for a manual run)
-pwsh src/sequencer.ps1 run -ConfigPath ./config.sample.json -Force
+# execute; -ForceWindow runs outside the time window for a manual run,
+# -ForceAllJobs also ignores the fit/coverage checks (back up everything now)
+pwsh src/sequencer.ps1 run -ConfigPath ./config.sample.json -ForceWindow
 ```
 
-See `help/` for installation locations, scheduling, and notifications, and
-`docs/` for the internals and how to add a recipe or service.
+Installed (see `help/getting-started.md`), the same commands are `bseq plan`,
+`bseq run`, `bseq history`. `help/` covers install locations, scheduling, and
+notifications; `docs/` covers the internals and how to add a recipe or service.
 
 
 License
