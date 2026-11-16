@@ -1,11 +1,13 @@
 Architecture and internals
 ================================
 
-Developer-facing design of the sequencer. For usage see `../help/`.
+Developer-facing design of the sequencer. For usage see the
+[help guides](../help/getting-started.md).
 
-The spool and archiving handoff is specified in `archiving.md` (producer/consumer
-split, the `wip → stage → ready` lifecycle) and is implemented. This file covers
-the engine's structure; see `archiving.md` for the spool model in depth.
+The spool and archiving handoff is specified in [the spool and archiving
+model](archiving.md) (producer/consumer split, the `wip → stage → ready`
+lifecycle) and is implemented. This file covers the engine's structure; see that
+doc for the spool model in depth.
 
 
 Components
@@ -23,16 +25,38 @@ Components
 The step contract
 ----------------------------------------------------------------
 
-A recipe or service script is invoked once per step:
+A recipe or service script takes a single parameter, a `RecipeContext`, and uses it
+to register its steps:
 
 ```
-<script>.ps1 -Step <name> -OutDir <path> -Service <name>
+param($Recipe)
+$Recipe.AddStep('dump', { param($ctx) ... })   # register a step
+$Recipe.SetOverdue({ param($ctx) ... })        # optional: archiver coverage query
 ```
 
-It performs exactly that step and throws on failure. Per-service parameters are
-passed as environment variables, declared in the service's `env` block in the
-config — this is what lets one recipe serve many services, and the same script
-target different hosts.
+The engine loads the script once per service (which only *registers* steps), then
+runs each step listed in the service's `steps`, in order, by invoking that step's
+block with a shared context `$ctx`. A step throws on failure.
+
+The context carries everything a step needs:
+
+- `$ctx.Service` / `$ctx.RunId` / `$ctx.Now` — the service name, run id, reference time.
+- `$ctx.OutDir` — where to write: the service's `wip/` dir for a backup step, its
+  `stage/` dir for the archive step.
+- `$ctx.Env` — the merged env, read via `$ctx.EnvValue(name, default)` /
+  `$ctx.RequireEnv(name)`. Per-service parameters come from `env`, which is what lets
+  one recipe serve many services and target different hosts.
+- `$ctx.State` — a hashtable shared across this recipe's steps (e.g. `WasRunning`, so
+  `start` only restarts what `stop` took down).
+- `$ctx.EventsPath` / `$ctx.ReadEvents()` — read-only access to the event log, for
+  archivers that route / prune / compute coverage from it.
+
+An archiver recipe additionally registers `SetOverdue` (its plan-time coverage
+query) and returns its result (tier / path / snapshot, pruned paths) via
+`$ctx.State['Result']`, which the engine records as `service.archived`.
+
+Env resolves along a scope chain, later overriding earlier: a backup recipe sees
+`config.env ← service.env`; an archiver also sees `← syncArchive.env`.
 
 
 Data model
@@ -41,9 +65,10 @@ Data model
 Two files, single-writer each:
 
 - `config.json` — admin-owned, declarative. Window, named resources, notify
-  settings, and a `services` map. Each service lists ordered `steps`; each step
-  declares the `resources` it holds and optional `retries` / `timeoutSec` /
-  `alwaysRun`.
+  settings, a shared `env`, and a `services` map. Each service lists ordered
+  `steps`; a step may set `retries` and `alwaysRun` (both honored), plus the
+  `resources` it holds and a `timeoutSec` — the latter two are declared but not yet
+  enforced (see Resource model).
 - `events.jsonl` — engine-owned, append-only. One typed line per event
   (`run.start`, `run.plan`, `step.start`, `step.end`, `service.end`,
   `service.skip`, `service.replaced`, `service.syncfail`, `service.archived`,
@@ -64,10 +89,11 @@ Run lifecycle
 2. Reap `trash/` (off the publish path); emit `run.start`; fold the projection;
    compute the plan; emit `run.plan`.
 3. For each planned service, while inside the window (unless `-ForceWindow`) and it
-   fits the time left (unless mandatory or `-ForceAllJobs`; see docs/scheduling.md):
+   fits the time left (unless mandatory or `-ForceAllJobs`; see [scheduling.md](scheduling.md)):
    - pre-flight free-space check against the last recorded size;
-   - apply the service's `env`; run each step via `Invoke-BackupStep` (timing,
-     retries, events), producing the artifact set into `wip/<service>/`;
+   - build the service's env (the scope chain), load the recipe (registering its
+     steps), then run each listed step via `Invoke-BackupStep` (timing, retries,
+     events), producing the artifact set into `wip/<service>/`;
    - after a failure, skip normal steps but still run `alwaysRun` steps (e.g.
      `start`) so the service is never left down, then move the partial to `trash/`;
    - on success, promote `wip → stage`, run the optional sync-archive step, then
@@ -80,11 +106,14 @@ Run lifecycle
 Planning
 ----------------------------------------------------------------
 
-`Get-BackupPlan` is a pure function of `(config, projection, time)`. It returns
-mandatory services first (in config order), then the rest (in config order).
-Because it is pure, `plan` has no side effects and the logic is unit-testable.
-Smarter tail selection (fitting estimated durations to the remaining window) can
-replace the ordering later; the projection already carries the data for it.
+`Get-BackupPlan` is a pure function of `(config, projection, overdue-by-service,
+time)`. It scores every enabled service — `overdue` (age / target interval, or the
+archiver's own coverage) plus a small size nudge — and returns them most-overdue
+first, with mandatory services forced to the front. The run loop then packs the
+window: it skips a service already covered for its period, runs what fits the time
+left, and guarantees at least one job per window so progress is never zero. Being
+pure, `plan` has no side effects and the scoring is unit-testable. See
+[scheduling.md](scheduling.md) for the score and the window-packing rules.
 
 
 Resource model
@@ -93,14 +122,16 @@ Resource model
 Each step lists named resources (e.g. `diskA`, `net-out`), each a lock with a
 capacity (default 1). Steps sharing a resource cannot overlap; steps on disjoint
 resources can. The current executor runs strictly sequentially; the declarations
-exist so a parallel executor can be added without touching any config.
+exist so a parallel executor can be added without touching any config. In the same
+way, a step's `timeoutSec` is recorded but not enforced — hard per-step timeouts
+are a later iteration.
 
 
 Adding a recipe or a service
 ----------------------------------------------------------------
 
-- Recipe: add `src/recipes/<name>.ps1` implementing the step contract, reading
-  its parameters from environment variables. Point a service's `script` at it and
-  supply the variables in the service's `env`.
+- Recipe: add `src/recipes/<name>.ps1` taking `param($Recipe)`; register its steps
+  with `$Recipe.AddStep` and read parameters from `$ctx` (the env scope chain).
+  Point a service's `script` at it and supply the variables in the service's `env`.
 - Bespoke: add `src/services/<name>.ps1` with the same contract when no reusable
   pattern fits. Oddballs are first-class — they just skip the shared recipe.

@@ -94,9 +94,10 @@ Copy `config.sample.json` to the config dir as `config.json` and edit it:
 - `window` — the time window (`HH:mm`), may wrap past midnight.
 - `services` — one entry per service. Set `mandatory: true` for the ones that
   must always run first. Point `script` at a recipe or a bespoke service script,
-  and pass that script's parameters in `env`. For the bundled recipe, see the
-  [docker-compose-cold recipe](recipe-docker-compose-cold.md). To ship each backup
-  somewhere durable and prune it over time, see [Archiving](archiving.md).
+  and pass that script's parameters in `env`. For the full set of service fields
+  see [Configuring a service](configuring-services.md), and for the bundled recipe
+  the [docker-compose-cold recipe](recipe-docker-compose-cold.md). To ship each
+  backup somewhere durable and prune it over time, see [Archiving](archiving.md).
 - `notify` — set `enabled: true` and your SMTP details; put the password in the
   file named by `passwordFile` (relative to the config dir), mode `0600`.
 

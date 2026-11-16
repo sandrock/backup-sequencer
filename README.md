@@ -79,23 +79,6 @@ What it does
   `pwsh` and whatever a given recipe's steps call.
 
 
-Layout
-----------------------------------------------------------------
-
-```
-src/
-  sequencer.ps1         entry point: plan | run | history | help
-  lib/BackupCommon.psm1 engine (events, projection, locking, planning, run)
-  recipes/              reusable step scripts (e.g. docker-compose-cold)
-  services/             bespoke per-service step scripts (same contract)
-tests/                  Pester tests + abstract fixtures
-docs/                   design and internals (archiving.md, scheduling.md)
-help/                   end-user documentation (install, schedule, notify)
-packages/               installer + systemd units
-config.sample.json      example config (placeholders)
-```
-
-
 Quick start
 ----------------------------------------------------------------
 
@@ -111,9 +94,49 @@ pwsh src/sequencer.ps1 plan -ConfigPath ./config.sample.json
 pwsh src/sequencer.ps1 run -ConfigPath ./config.sample.json -ForceWindow
 ```
 
-Installed (see `help/getting-started.md`), the same commands are `bseq plan`,
-`bseq run`, `bseq history`. `help/` covers install locations, scheduling, and
-notifications; `docs/` covers the internals and how to add a recipe or service.
+Installed (see [Getting started](help/getting-started.md)), the same commands are
+`bseq plan`, `bseq run`, `bseq history`.
+
+
+Documentation
+----------------------------------------------------------------
+
+User guides (`help/`):
+
+- [Getting started](help/getting-started.md) — install, configure, run, notify.
+- [Configuring a service](help/configuring-services.md) — wiring a service to a
+  recipe: `script`, `env`, `steps`, archiving, scheduling.
+- [docker-compose-cold recipe](help/recipe-docker-compose-cold.md) — the bundled
+  cold-backup recipe and its `DCC_*` parameters.
+- [Archiving](help/archiving.md) — synchronous vs asynchronous archiving,
+  `publishToReady`, and the env scope chain. Per-archiver:
+  [archive-copy](help/archiving-copy.md) · [archive-gfsy](help/archiving-gfsy.md) ·
+  [archive-restic](help/archiving-restic.md).
+
+Design and internals (`docs/`):
+
+- [Scheduling](docs/scheduling.md) — the fairness score and window packing.
+- [Spool and archiving model](docs/archiving.md) — `wip → stage → ready`, the
+  producer/consumer contract.
+- [Architecture and internals](docs/architecture.md) — engine structure, data
+  model, resource model.
+
+
+Layout
+----------------------------------------------------------------
+
+```
+src/
+  sequencer.ps1         entry point: plan | run | history | help
+  lib/BackupCommon.psm1 engine (events, projection, locking, planning, run)
+  recipes/              reusable step scripts (e.g. docker-compose-cold)
+  services/             bespoke per-service step scripts (same contract)
+tests/                  Pester tests + abstract fixtures
+docs/                   design and internals (archiving.md, scheduling.md)
+help/                   end-user documentation (install, schedule, notify)
+packages/               installer + systemd units
+config.sample.json      example config (placeholders)
+```
 
 
 License
