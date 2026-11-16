@@ -668,6 +668,9 @@ function Invoke-BackupRun {
                             if ($res -is [hashtable]) {
                                 if ($res.ContainsKey('tier') -and $res['tier']) { $props['tier'] = $res['tier'] }
                                 if ($res.ContainsKey('path') -and $res['path']) { $props['path'] = $res['path'] }
+                                # identity for path-less archivers (e.g. restic snapshot id)
+                                if ($res.ContainsKey('snapshot') -and $res['snapshot']) { $props['snapshot'] = $res['snapshot'] }
+                                if ($res.ContainsKey('repo') -and $res['repo']) { $props['repo'] = $res['repo'] }
                             }
                             Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.archived' -Props $props
                             # record any archives the recipe pruned (log-driven retention)
@@ -681,6 +684,7 @@ function Invoke-BackupRun {
                             }
                             $archMsg = "  $serviceName  archived"
                             if ($props.ContainsKey('path')) { $archMsg += " -> $($props['path'])" }
+                            elseif ($props.ContainsKey('snapshot')) { $archMsg += " -> snapshot $($props['snapshot'])" }
                             if ($prunedCount -gt 0) { $archMsg += "  (pruned $prunedCount)" }
                             Write-Information $archMsg
                         }

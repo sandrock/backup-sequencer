@@ -9,6 +9,12 @@ BeforeAll {
     $script:TestsDir = $PSScriptRoot
     $script:Work = Join-Path ([System.IO.Path]::GetTempPath()) ("bkseqtest-" + [guid]::NewGuid().ToString('n'))
     New-Item -ItemType Directory -Force -Path $script:Work | Out-Null
+
+    # a fake `restic` for archive-restic tests: prints a --json summary with a snapshot
+    # id, or exits non-zero when RESTIC_STUB_FAIL is set. POSIX shell (Linux/macOS only).
+    $script:resticStub = Join-Path $script:Work 'restic-stub.sh'
+    Set-Content -LiteralPath $script:resticStub -NoNewline -Value "#!/bin/sh`nif [ -n `"`$RESTIC_STUB_FAIL`" ]; then echo 'stub failure' >&2; exit 1; fi`necho '{`"message_type`":`"summary`",`"snapshot_id`":`"deadbeefcafe`"}'`nexit 0`n"
+    if (-not $IsWindows) { & chmod '+x' $script:resticStub }
 }
 
 AfterAll {
@@ -191,6 +197,18 @@ Describe 'coverage (archiver-computed overdue)' {
         (Get-ServiceOverdue -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev -At ([datetime]'2026-11-06T13:00:00+00:00')) | Should -BeLessThan 1
     }
 
+    It 'restic reports covered (<1) right after a snapshot, overdue (>=1) when stale' {
+        $ev = Join-Path $Work "ovr-$([guid]::NewGuid().ToString('n').Substring(0,6)).jsonl"
+        Add-Content -LiteralPath $ev -Value (@{ ts = '2026-11-06T10:00:00+00:00'; type = 'service.archived'; svc = 'app'; snapshot = 'abc'; repo = '/r' } | ConvertTo-Json -Compress)
+        $cfg = @'
+{ "window": { "open": "23:00", "close": "06:00" },
+  "services": { "app": { "enabled": true, "script": "fixtures/mock-service.ps1",
+    "syncArchive": { "script": "../src/recipes/archive-restic.ps1" }, "steps": [] } } }
+'@ | ConvertFrom-Json
+        (Get-ServiceOverdue -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev -At ([datetime]'2026-11-06T12:00:00+00:00')) | Should -BeLessThan 1
+        (Get-ServiceOverdue -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev -At ([datetime]'2026-11-08T12:00:00+00:00')) | Should -BeGreaterThan 1
+    }
+
     It 'returns null for a service with no archiver' {
         $ev = Join-Path $Work "ovn-$([guid]::NewGuid().ToString('n').Substring(0,6)).jsonl"
         $cfg = @'
@@ -333,6 +351,44 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         $endE[-1].status | Should -Be 'ok'
         # the dead-man's-switch report must still surface the archive failure
         (Format-RunReport -EventsPath $ev -RunId $runId) | Should -Match 'archive failed'
+    }
+
+    It 'archive-restic: snapshots via restic and logs the snapshot id (publishToReady=false)' -Skip:($IsWindows) {
+        $repoDir = Join-Path $Work "resticrepo-$n"
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "publishToReady": false,
+    "syncArchive": { "script": "../src/recipes/archive-restic.ps1",
+      "env": { "RESTIC_REPOSITORY": "__REPO__", "RESTIC_BIN": "__STUB__" } },
+    "steps": [ { "name": "dump", "resources": [] },
+               { "name": "start", "resources": [], "alwaysRun": true } ] } } }
+'@ -replace '__REPO__', ($repoDir -replace '\\', '/') -replace '__STUB__', ($script:resticStub -replace '\\', '/')) | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
+        $arch = @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archived' -and $_.svc -eq 'app' })
+        $arch.Count | Should -BeGreaterThan 0
+        $arch[-1].snapshot | Should -Be 'deadbeefcafe'
+        # the restic repo is the archive -> no local copy kept in ready/
+        (Test-Path (Join-Path $root 'ready/app')) | Should -BeFalse
+        (@(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'app' }))[-1].status | Should -Be 'ok'
+    }
+
+    It 'archive-restic: a restic failure retains nothing and fails the service (publishToReady=false)' -Skip:($IsWindows) {
+        $repoDir = Join-Path $Work "resticrepoF-$n"
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "publishToReady": false,
+    "syncArchive": { "script": "../src/recipes/archive-restic.ps1",
+      "env": { "RESTIC_REPOSITORY": "__REPO__", "RESTIC_BIN": "__STUB__", "RESTIC_STUB_FAIL": "1" } },
+    "steps": [ { "name": "dump", "resources": [] },
+               { "name": "start", "resources": [], "alwaysRun": true } ] } } }
+'@ -replace '__REPO__', ($repoDir -replace '\\', '/') -replace '__STUB__', ($script:resticStub -replace '\\', '/')) | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
+        @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.syncfail' -and $_.svc -eq 'app' }).Count | Should -BeGreaterThan 0
+        @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archived' -and $_.svc -eq 'app' }).Count | Should -Be 0
+        (Test-Path (Join-Path $root 'ready/app')) | Should -BeFalse
+        (@(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'app' }))[-1].status | Should -Be 'fail'
     }
 
     It 'archive-copy copies the set to dest (ARCHIVE_DEST from top-level) and logs service.archived' {
