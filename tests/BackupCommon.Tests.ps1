@@ -665,6 +665,27 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         (Test-Path (Join-Path $root 'ready/app')) | Should -BeFalse
     }
 
+    It 'coverage grace: a backup just under the period still runs (timer-jitter fix)' {
+        $dest = Join-Path $Work "covg-$n"
+        # a gfsy archive 1 second short of 24h ago: with no grace margin this reads as
+        # overdue ~0.99999 and is wrongly skipped as covered (the missed-nightly bug)
+        $arch = Join-Path (Join-Path (Join-Path $dest 'app') 'daily') 'seed'
+        New-Item -ItemType Directory -Force -Path $arch | Out-Null
+        Add-Content -LiteralPath $ev -Value (@{ ts = (Get-Date).AddSeconds(-86399).ToString('o'); type = 'service.archived'; svc = 'app'; tier = 'daily'; path = $arch } | ConvertTo-Json -Compress)
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "env": { "ARCHIVE_DEST": "__DEST__" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1" },
+    "steps": [ { "name": "dump", "resources": [] }, { "name": "start", "resources": [], "alwaysRun": true } ] } } }
+'@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -WarningAction SilentlyContinue -InformationAction SilentlyContinue | Out-Null
+        $events = Get-BackupEvents -EventsPath $ev
+        # not skipped as covered, and it actually produced a backup
+        @($events | Where-Object { $_.type -eq 'service.skip' -and $_.svc -eq 'app' -and $_.reason -eq 'covered' }).Count | Should -Be 0
+        ($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'app' } | Select-Object -Last 1).status | Should -Be 'ok'
+    }
+
     It 'archive-gfsy prune keeps newest-per-day, collapsing same-day duplicates' {
         $dest = Join-Path $Work "gfsy-sd-$n"
         $appDir = Join-Path $dest 'app'

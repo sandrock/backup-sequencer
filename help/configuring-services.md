@@ -118,7 +118,9 @@ what fits. `targetIntervalHours` sets a service's desired interval — set it pe
 service, or once at the top level as the default (else 24h). When a service has an
 archiver, coverage comes from the archiver's own interval instead
 (`ARCHIVE_MIN_INTERVAL_HOURS` / `ARCHIVE_DAILY_HOURS` / `RESTIC_MIN_INTERVAL_HOURS`),
-so an already-archived service is skipped. See [the scheduling model](../docs/scheduling.md).
+so an already-archived service is skipped. A small grace margin (top-level
+`coverageMargin`, default 2%) keeps a backup that is *just* under its period from
+being skipped by timer jitter. See [the scheduling model](../docs/scheduling.md).
 
 
 Resources and timeouts

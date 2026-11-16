@@ -57,13 +57,21 @@ yearly or weekly backup also covers the daily. `archive-copy` uses a flat
 Coverage (don't re-back-up)
 ----------------------------------------------------------------
 
-Before the fit check, a service whose `overdue < 1` is **covered** — it already has a
-fresh-enough backup for its period — and is skipped (`service.skip reason=covered`),
+Before the fit check, a service **comfortably** inside its period is **covered** — it
+already has a fresh-enough backup — and is skipped (`service.skip reason=covered`),
 producing no backup and no downtime. This is what stops multiple windows or extra
 triggers in one day from making many same-day copies (which, with count-based
 pruning, would erode the number of distinct backup *days* you keep). `-ForceAllJobs`
 overrides it. Pairs with the period-aware prune (see archiving.md): even a forced
 extra same-period run collapses to one kept archive per period.
+
+"Comfortably" means a **grace margin**: covered requires `overdue < 1 − margin`
+(default 2%, `coverageMargin` in config), not `overdue < 1`. Without it, a service on
+a ~24h timer is a razor-edge case — the timer fires at ~24h intervals, so a night
+that triggers even a second early lands `age` just under the period (`overdue ~0.999`)
+and the backup is wrongly skipped. The margin (≈29 min for a daily) absorbs timer
+jitter and the backup's own duration, so a roughly-due backup reliably runs; a genuine
+same-day re-trigger (well inside the period) still skips.
 
 
 Window packing (execution)
@@ -74,8 +82,8 @@ The run loop walks the scored plan. Before starting each service, with
 
 1. Past close → stop (`-ForceWindow` bypasses this; a job already running is never
    killed and may overrun).
-2. `overdue < 1` → **covered**, skip (`service.skip reason=covered`); `-ForceAllJobs`
-   overrides.
+2. `overdue < 1 − margin` → **covered**, skip (`service.skip reason=covered`);
+   `-ForceAllJobs` overrides.
 3. Mandatory, or `-ForceAllJobs` → run (no fit check).
 4. Estimate unknown (never run) → run optimistically — first backup, learns its
    duration for next time; it may overrun a lot (accepted).

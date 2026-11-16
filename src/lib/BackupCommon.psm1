@@ -511,6 +511,14 @@ function Invoke-BackupRun {
         $okCount = 0
         $failCount = 0
         $ranGuaranteed = $false   # has a non-mandatory job started this run? (fluid: >=1 per window)
+        # coverage grace: treat a service as covered only if it is comfortably inside its
+        # period, not right at the edge. A ~daily timer fires at ~24h intervals; with no
+        # slack, a night that triggers a hair early lands age just under the period
+        # (overdue ~0.999) and the backup is wrongly skipped. The margin (default 2%, ~29
+        # min for a daily) absorbs timer jitter + backup duration. Override via config.
+        $coverageMargin = 0.02
+        if (Test-HasProp $Config 'coverageMargin') { $coverageMargin = [double]$Config.coverageMargin }
+        $coverageThreshold = 1.0 - $coverageMargin
         foreach ($plannedJob in $plan) {
             # hard window gate: never START work past close (a running job may overrun)
             if (-not $ForceWindow -and -not (Test-WithinWindow -Open $Config.window.open -Close $Config.window.close)) {
@@ -526,9 +534,10 @@ function Invoke-BackupRun {
             $serviceName = $plannedJob.Service
 
             # coverage gate: skip a service already backed up for its period (the
-            # archiver judged overdue < 1 — e.g. a yearly/weekly also covers the daily).
-            # No backup produced, so no wasted downtime. -ForceAllJobs overrides.
-            if (-not $ForceAllJobs -and $plannedJob.Overdue -lt 1) {
+            # archiver judged overdue below the grace threshold — e.g. a yearly/weekly
+            # also covers the daily). No backup produced, so no wasted downtime.
+            # -ForceAllJobs overrides.
+            if (-not $ForceAllJobs -and $plannedJob.Overdue -lt $coverageThreshold) {
                 Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.skip' `
                     -Props @{ runId = $runId; svc = $serviceName; reason = 'covered'; overdue = [math]::Round([double]$plannedJob.Overdue, 3) }
                 Write-Information ("  {0}  covered (overdue x{1:N2}) - skipped" -f $serviceName, $plannedJob.Overdue)
