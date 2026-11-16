@@ -82,13 +82,14 @@ being sync-archived. The phase boundary is the coordination — no lock needed.
 Shipped archiver recipes
 ----------------------------------------------------------------
 
-Two archiver recipes ship with the tool; both implement the optional sync-archive
-step above, copying the completed set from `stage/<service>/` into a durable
-destination and pruning old copies. Both prune strictly by the event log — they
-only ever delete paths they themselves recorded as archived, so a foreign file in
-the destination is never at risk. Select one per service via `syncArchive.script`.
-`ARCHIVE_DEST` (the destination base; the service name is appended) comes from the
-top-level `archive` block or the step's own `env`.
+Three archiver recipes ship with the tool, all implementing the optional
+sync-archive step above against the completed set in `stage/<service>/`. Select one
+per service via `syncArchive.script`. The two on-disk copiers prune strictly by the
+event log — they only ever delete paths they themselves recorded as archived, so a
+foreign file in the destination is never at risk; their `ARCHIVE_DEST` (the
+destination base; the service name is appended) comes from the service's `env`,
+resolved along the scope chain `top-level env ← service env ← syncArchive.env`
+(see [the archiving overview](../help/archiving.md#environment)).
 
 - `archive-copy` — a flat history. Each run copies the set to
   `<ARCHIVE_DEST>/<service>/<runId>/` and keeps the newest `ARCHIVE_KEEP`
@@ -106,12 +107,22 @@ top-level `archive` block or the step's own `env`.
   only on the runs that land in it.
   It also tells the planner when a service is **covered**: `overdue < 1` if any tier
   was archived within the daily period (a yearly/weekly also covers the daily), so the
-  planner skips a service that already has a fresh backup — see docs/scheduling.md.
+  planner skips a service that already has a fresh backup — see
+  [the scheduling model](scheduling.md).
+- `archive-restic` — an off-box [restic](https://restic.net) repository: dedup,
+  encryption, and GFS retention handled by restic itself. Each run snapshots
+  `stage/<service>/` into the repo (`restic backup --tag <service> --host <host>`);
+  there is no on-disk copy, so pair it with `"publishToReady": false`. Retention
+  (`restic forget --prune`) runs **out of band** on its own schedule — the recipe
+  only ever adds snapshots. Coverage is a flat minimum interval
+  (`RESTIC_MIN_INTERVAL_HOURS`, default 24). See
+  [the restic archiver guide](../help/archiving-restic.md).
 
-Both name the copy by the run id, so an archive ties directly back to the run that
-produced it — and to its `service.archived` event. Routing, pruning, and coverage
-read the log, never directory names or mtimes: correct even under the sequencer's
-irregular, non-cron timing.
+The two copiers name the copy by the run id, and the restic recipe records the
+snapshot id, so an archive ties directly back to the run that produced it — and to
+its `service.archived` event. Routing, pruning, and coverage read the log, never
+directory names or mtimes: correct even under the sequencer's irregular, non-cron
+timing.
 
 
 The `ready/` contract
