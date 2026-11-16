@@ -65,6 +65,26 @@ $Recipe.AddStep('archive', {
     $ctx.State['Result'] = @{ path = $target; pruned = $prunedNow }
 })
 
+# preflight (before any downtime): the destination must be set and reachable — its
+# nearest existing ancestor must be a directory, so an unmounted/typo dest is caught
+# before the backup runs rather than after.
+$Recipe.SetValidate({
+    param($ctx)
+    $problems = @()
+    $dest = $ctx.EnvValue('ARCHIVE_DEST', '')
+    if (-not $dest) {
+        $problems += 'ARCHIVE_DEST not set'
+    }
+    else {
+        $anc = $dest
+        while ($anc -and -not (Test-Path -LiteralPath $anc)) { $anc = Split-Path -Parent $anc }
+        if (-not $anc -or -not (Test-Path -LiteralPath $anc -PathType Container)) {
+            $problems += "ARCHIVE_DEST unreachable (no existing parent dir): $dest"
+        }
+    }
+    return $problems
+})
+
 # overdue query (plan time): flat archiver has no tiers, so coverage is a simple
 # minimum interval — covered if the newest archive is younger than
 # ARCHIVE_MIN_INTERVAL_HOURS (default 24). overdue = newest age / that interval.

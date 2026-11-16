@@ -234,6 +234,77 @@ Describe 'step execution' {
     }
 }
 
+Describe 'preflight validation' {
+    BeforeEach {
+        $script:n = [guid]::NewGuid().ToString('n').Substring(0, 8)
+        $script:ev = Join-Path $Work "val-$n.jsonl"
+    }
+
+    It 'runs a recipe-registered SetValidate block (archiver prereq surfaces)' {
+        # archive-gfsy registers a SetValidate that requires ARCHIVE_DEST; leaving it
+        # unset proves the engine invokes the recipe's validate block.
+        $cfg = @'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "script": "fixtures/mock-service.ps1",
+    "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1" },
+    "steps": [ { "name": "dump" } ] } } }
+'@ | ConvertFrom-Json
+        (Get-ServiceValidationProblems -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev) -join "`n" | Should -Match 'ARCHIVE_DEST not set'
+    }
+
+    It 'flags a restic archiver whose password file is missing' -Skip:($IsWindows) {
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "script": "fixtures/mock-service.ps1",
+    "syncArchive": { "script": "../src/recipes/archive-restic.ps1",
+      "env": { "RESTIC_REPOSITORY": "/tmp/repo", "RESTIC_BIN": "__STUB__", "RESTIC_PASSWORD_FILE": "/no/such/secret.pwd" } },
+    "steps": [ { "name": "dump" } ] } } }
+'@ -replace '__STUB__', ($script:resticStub -replace '\\', '/')) | ConvertFrom-Json
+        (Get-ServiceValidationProblems -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev) -join "`n" | Should -Match 'PASSWORD_FILE missing'
+    }
+
+    It 'passes a well-configured restic archiver' -Skip:($IsWindows) {
+        $pwFile = Join-Path $Work "pw-$n"
+        Set-Content -LiteralPath $pwFile -Value 'secret'
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "script": "fixtures/mock-service.ps1",
+    "syncArchive": { "script": "../src/recipes/archive-restic.ps1",
+      "env": { "RESTIC_REPOSITORY": "/tmp/repo", "RESTIC_BIN": "__STUB__", "RESTIC_PASSWORD_FILE": "__PW__" } },
+    "steps": [ { "name": "dump" } ] } } }
+'@ -replace '__STUB__', ($script:resticStub -replace '\\', '/') -replace '__PW__', ($pwFile -replace '\\', '/')) | ConvertFrom-Json
+        (Get-ServiceValidationProblems -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev) | Should -BeNullOrEmpty
+    }
+
+    It 'flags an unregistered step name' {
+        $cfg = @'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "script": "fixtures/mock-service.ps1",
+    "steps": [ { "name": "nonexistent" } ] } } }
+'@ | ConvertFrom-Json
+        (Get-ServiceValidationProblems -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev) -join "`n" | Should -Match "does not register step 'nonexistent'"
+    }
+
+    It 'flags a missing archiver script' {
+        $cfg = @'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "script": "fixtures/mock-service.ps1",
+    "syncArchive": { "script": "recipes/does-not-exist.ps1" },
+    "steps": [ { "name": "dump" } ] } } }
+'@ | ConvertFrom-Json
+        (Get-ServiceValidationProblems -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev) -join "`n" | Should -Match 'archiver script not found'
+    }
+
+    It 'reports a recipe that throws at registration instead of crashing' {
+        $cfg = @'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "script": "fixtures/throwing-recipe.ps1",
+    "steps": [ { "name": "dump" } ] } } }
+'@ | ConvertFrom-Json
+        (Get-ServiceValidationProblems -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev) -join "`n" | Should -Match 'recipe failed to load'
+    }
+}
+
 Describe 'spool lifecycle (wip -> stage -> ready)' {
     BeforeEach {
         $script:n = [guid]::NewGuid().ToString('n').Substring(0, 8)
@@ -360,7 +431,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
   "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
     "publishToReady": false,
     "syncArchive": { "script": "../src/recipes/archive-restic.ps1",
-      "env": { "RESTIC_REPOSITORY": "__REPO__", "RESTIC_BIN": "__STUB__" } },
+      "env": { "RESTIC_REPOSITORY": "__REPO__", "RESTIC_BIN": "__STUB__", "RESTIC_PASSWORD": "test" } },
     "steps": [ { "name": "dump", "resources": [] },
                { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ -replace '__REPO__', ($repoDir -replace '\\', '/') -replace '__STUB__', ($script:resticStub -replace '\\', '/')) | ConvertFrom-Json
@@ -380,7 +451,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
   "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
     "publishToReady": false,
     "syncArchive": { "script": "../src/recipes/archive-restic.ps1",
-      "env": { "RESTIC_REPOSITORY": "__REPO__", "RESTIC_BIN": "__STUB__", "RESTIC_STUB_FAIL": "1" } },
+      "env": { "RESTIC_REPOSITORY": "__REPO__", "RESTIC_BIN": "__STUB__", "RESTIC_PASSWORD": "test", "RESTIC_STUB_FAIL": "1" } },
     "steps": [ { "name": "dump", "resources": [] },
                { "name": "start", "resources": [], "alwaysRun": true } ] } } }
 '@ -replace '__REPO__', ($repoDir -replace '\\', '/') -replace '__STUB__', ($script:resticStub -replace '\\', '/')) | ConvertFrom-Json
@@ -595,7 +666,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
 { "window": { "open": "00:00", "close": "23:59" },
   "services": { "app": { "enabled": true, "mandatory": true,
     "script": "../src/recipes/docker-compose-cold.ps1",
-    "env": { "DCC_COMPOSE_DIR": "__COMPOSE__", "DCC_DATA_DIRS": "__DATA1__;__DATA2__", "DCC_COMPOSE_EXCLUDES": "logs" },
+    "env": { "DCC_COMPOSE_DIR": "__COMPOSE__", "DCC_DATA_DIRS": "__DATA1__;__DATA2__", "DCC_COMPOSE_EXCLUDES": "logs", "DCC_COMPOSE_CMD": "tar" },
     "steps": [ { "name": "dump", "resources": [] } ] } } }
 '@ -replace '__COMPOSE__', ($composeDir -replace '\\', '/') `
             -replace '__DATA1__', ($innerData -replace '\\', '/') `
@@ -684,6 +755,35 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         # not skipped as covered, and it actually produced a backup
         @($events | Where-Object { $_.type -eq 'service.skip' -and $_.svc -eq 'app' -and $_.reason -eq 'covered' }).Count | Should -Be 0
         ($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'app' } | Select-Object -Last 1).status | Should -Be 'ok'
+    }
+
+    It 'preflight: an invalid service is skipped with no steps run (no downtime); others still run' -Skip:($IsWindows) {
+        $dest = Join-Path $Work "valrun-$n"
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": {
+    "bad":  { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+      "syncArchive": { "script": "../src/recipes/archive-restic.ps1",
+        "env": { "RESTIC_REPOSITORY": "/tmp/repo", "RESTIC_BIN": "__STUB__", "RESTIC_PASSWORD_FILE": "/no/such/secret.pwd" } },
+      "steps": [ { "name": "dump" }, { "name": "start", "alwaysRun": true } ] },
+    "good": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+      "publishToReady": true,
+      "syncArchive": { "script": "../src/recipes/archive-copy.ps1", "env": { "ARCHIVE_DEST": "__DEST__" } },
+      "steps": [ { "name": "dump" }, { "name": "start", "alwaysRun": true } ] }
+  } }
+'@ -replace '__STUB__', ($script:resticStub -replace '\\', '/') -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
+        $runId = Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -ForceAllJobs -WarningAction SilentlyContinue
+        $events = Get-BackupEvents -EventsPath $ev
+        # bad: flagged invalid, counted failed, and crucially NO step events (never taken down)
+        $badEnd = @($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'bad' })[-1]
+        $badEnd.status | Should -Be 'fail'
+        $badEnd.reason | Should -Be 'invalid'
+        @($events | Where-Object { ($_.type -eq 'step.start' -or $_.type -eq 'step.end') -and $_.svc -eq 'bad' }).Count | Should -Be 0
+        # good: ran and archived despite the other service being invalid
+        (@($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'good' })[-1]).status | Should -Be 'ok'
+        @($events | Where-Object { $_.type -eq 'service.archived' -and $_.svc -eq 'good' }).Count | Should -BeGreaterThan 0
+        # the report surfaces the invalid reason
+        (Format-RunReport -EventsPath $ev -RunId $runId) | Should -Match 'invalid:'
     }
 
     It 'archive-gfsy prune keeps newest-per-day, collapsing same-day duplicates' {

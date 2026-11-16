@@ -113,6 +113,36 @@ $Recipe.AddStep('dump', {
     # $ctx.AddArtifact(@{ name = $dataName; role = 'data'; command = "tar $($dataArgs -join ' ')"; cwd = $ctx.OutDir })
 })
 
+# preflight (before any downtime): the compose dir, every data dir, and the compose
+# command must exist — otherwise the backup would stop the service, then fail. This
+# runs before 'stop', so a misconfigured service is skipped without being taken down.
+$Recipe.SetValidate({
+    param($ctx)
+    $problems = @()
+    $composeDir = $ctx.EnvValue('DCC_COMPOSE_DIR', '')
+    if (-not $composeDir) {
+        $problems += 'DCC_COMPOSE_DIR not set'
+    }
+    elseif (-not (Test-Path -LiteralPath $composeDir -PathType Container)) {
+        $problems += "DCC_COMPOSE_DIR missing: $composeDir"
+    }
+
+    $dataSpec = $ctx.EnvValue('DCC_DATA_DIRS', $ctx.EnvValue('DCC_DATA_DIR', ''))
+    if ([string]::IsNullOrWhiteSpace($dataSpec)) {
+        $problems += 'no data dir configured (set DCC_DATA_DIRS)'
+    }
+    else {
+        foreach ($d in @($dataSpec.Split(';', [System.StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() })) {
+            if (-not (Test-Path -LiteralPath $d)) { $problems += "data dir missing: $d" }
+        }
+    }
+
+    $composeCmd = $ctx.EnvValue('DCC_COMPOSE_CMD', 'docker compose')
+    $exe = $composeCmd.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)[0]
+    if (-not (Get-Command $exe -ErrorAction SilentlyContinue)) { $problems += "compose command not found: $exe" }
+    return $problems
+})
+
 $Recipe.AddStep('start', {
     param($ctx)
     if ($ctx.State.ContainsKey('WasRunning') -and $ctx.State['WasRunning']) {

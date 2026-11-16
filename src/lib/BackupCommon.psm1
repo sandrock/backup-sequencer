@@ -16,9 +16,18 @@ class RecipeContext {
     [hashtable] $State = @{}   # shared across this recipe's steps (e.g. WasRunning)
     [hashtable] $Steps = @{}   # step name -> scriptblock(param($ctx))
     [scriptblock] $OverdueBlock # optional: archiver's plan-time overdue query (param($ctx) -> double)
+    [scriptblock] $ValidateBlock # optional: preflight prereq check (param($ctx) -> string[] of problems)
 
     [void] AddStep([string]$name, [scriptblock]$block) {
         $this.Steps[$name] = $block
+    }
+
+    # Recipes/archivers set this so the engine can preflight prerequisites (dirs
+    # exist, password files present, tools resolvable) BEFORE any step runs — a
+    # doomed archive must never cost a service its downtime. Returns a list of
+    # problem strings; empty / $null means OK.
+    [void] SetValidate([scriptblock]$block) {
+        $this.ValidateBlock = $block
     }
 
     # Archivers set this so the planner can ask "how overdue is this service under my
@@ -353,6 +362,99 @@ function Get-ServiceOverdue {
     try { return [double](& $arc.OverdueBlock $arc) } catch { return $null }
 }
 
+function Get-ServiceValidationProblems {
+    # Preflight a service: load its backup recipe and archiver (registration only),
+    # run structural checks + each recipe's ValidateBlock, and return the combined
+    # list of problem strings (empty = OK). Called before any step runs, so a broken
+    # config is caught before downtime; also backs the standalone `validate` command.
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][string]$Service,
+        [Parameter(Mandatory)][string]$BaseDir,
+        [Parameter(Mandatory)][string]$EventsPath,
+        [datetime]$At = (Get-Date)
+    )
+    $svc = $Config.services.$Service
+    $problems = @()
+
+    # --- backup recipe: structural checks + its own prereq block ---
+    if (-not (Test-HasProp $svc 'script') -or -not $svc.script) {
+        $problems += 'no recipe script configured'
+    }
+    else {
+        $scriptPath = Join-Path $BaseDir $svc.script
+        if (-not (Test-Path -LiteralPath $scriptPath)) {
+            $problems += "recipe script not found: $($svc.script)"
+        }
+        else {
+            $rc = [RecipeContext]::new()
+            $rc.Service = $Service
+            $rc.EventsPath = $EventsPath
+            $rc.Now = $At
+            # scope chain for the backup recipe: global config.env <- service.env
+            $rc.Env = Get-ScopedEnv -Sources @((Get-PropOrNull $Config 'env'), (Get-PropOrNull $svc 'env'))
+            $loaded = $true
+            try { & $scriptPath -Recipe $rc | Out-Null }   # registration only
+            catch { $problems += "recipe failed to load: $($_.Exception.Message)"; $loaded = $false }
+            if ($loaded) {
+                if (-not (Test-HasProp $svc 'steps') -or $null -eq $svc.steps) {
+                    $problems += 'no steps configured'
+                }
+                else {
+                    foreach ($stepDef in $svc.steps) {
+                        if (-not $rc.Steps.ContainsKey($stepDef.name)) {
+                            $problems += "recipe does not register step '$($stepDef.name)'"
+                        }
+                    }
+                }
+                if ($null -ne $rc.ValidateBlock) {
+                    try { $problems += @(& $rc.ValidateBlock $rc | Where-Object { $_ }) }
+                    catch { $problems += "recipe validation error: $($_.Exception.Message)" }
+                }
+            }
+        }
+    }
+
+    # --- archiver (optional): structural checks + its own prereq block ---
+    if (Test-HasProp $svc 'syncArchive') {
+        $sa = $svc.syncArchive
+        if (-not (Test-HasProp $sa 'script') -or -not $sa.script) {
+            $problems += 'syncArchive has no script'
+        }
+        else {
+            $saScript = Join-Path $BaseDir $sa.script
+            if (-not (Test-Path -LiteralPath $saScript)) {
+                $problems += "archiver script not found: $($sa.script)"
+            }
+            else {
+                $arc = [RecipeContext]::new()
+                $arc.Service = $Service
+                $arc.EventsPath = $EventsPath
+                $arc.Now = $At
+                # scope chain: global config.env <- service.env <- syncArchive.env
+                $arc.Env = Get-ScopedEnv -Sources @(
+                    (Get-PropOrNull $Config 'env'),
+                    (Get-PropOrNull $svc 'env'),
+                    (Get-PropOrNull $sa 'env'))
+                $saLoaded = $true
+                try { & $saScript -Recipe $arc | Out-Null }   # registration only
+                catch { $problems += "archiver failed to load: $($_.Exception.Message)"; $saLoaded = $false }
+                if ($saLoaded) {
+                    if (-not $arc.Steps.ContainsKey('archive')) {
+                        $problems += "archiver registers no 'archive' step"
+                    }
+                    if ($null -ne $arc.ValidateBlock) {
+                        try { $problems += @(& $arc.ValidateBlock $arc | Where-Object { $_ }) }
+                        catch { $problems += "archiver validation error: $($_.Exception.Message)" }
+                    }
+                }
+            }
+        }
+    }
+
+    return @($problems)
+}
+
 function Get-BackupPlan {
     # Pure: (config, projection, now) -> ALL enabled services, score-sorted.
     # Fluid scheduling — score = overdue + sizeNudge:
@@ -570,6 +672,19 @@ function Invoke-BackupRun {
             $svc = $Config.services.$serviceName
             $scriptPath = Join-Path $Paths.BaseDir $svc.script
 
+            # preflight: a doomed config (missing password file, unset ARCHIVE_DEST,
+            # unregistered step, …) must be caught BEFORE any step runs, so a broken
+            # archive never costs the service its downtime. Skip it (counted failed, so
+            # coverage keeps it overdue and it shows in the report); other services run.
+            $vp = @(Get-ServiceValidationProblems -Config $Config -Service $serviceName -BaseDir $Paths.BaseDir -EventsPath $Paths.EventsPath -At $planNow)
+            if ($vp.Count) {
+                $failCount++
+                Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
+                    -Props @{ runId = $runId; svc = $serviceName; status = 'fail'; reason = 'invalid'; problems = @($vp); bytes = 0 }
+                Write-Warning ("$serviceName INVALID: {0} - skipped (no backup taken)" -f ($vp -join '; '))
+                continue
+            }
+
             # pre-flight free-space check against the last recorded size (1.5x headroom)
             if ($projection.ContainsKey($serviceName) -and $projection[$serviceName].lastBytes -gt 0) {
                 $need = [long]($projection[$serviceName].lastBytes * 1.5)
@@ -785,6 +900,11 @@ function Format-RunReport {
         $mb = [math]::Round(($e.bytes / 1MB), 1)
         $lines += ("  {0,-24} {1,-5} {2} MB" -f $e.svc, $e.status.ToUpper(), $mb)
     }
+    # surface preflight-invalid services (skipped before any step, so no downtime)
+    foreach ($e in ($events | Where-Object { $_.type -eq 'service.end' -and (Test-HasProp $_ 'reason') -and $_.reason -eq 'invalid' })) {
+        $probs = if (Test-HasProp $e 'problems') { @($e.problems) } else { @('see events.jsonl') }
+        foreach ($p in $probs) { $lines += ("  ! {0,-22} invalid: {1}" -f $e.svc, $p) }
+    }
     # surface sync-archive failures even when the backup was still published (ok)
     foreach ($e in ($events | Where-Object { $_.type -eq 'service.syncfail' })) {
         $reason = if (Test-HasProp $e 'reason') { $e.reason } else { 'see events.jsonl' }
@@ -839,5 +959,5 @@ Export-ModuleMember -Function `
     Test-WithinWindow, Get-WindowLengthSeconds, Get-SecondsUntilClose, `
     Get-FreeSpaceBytes, Get-PathSizeBytes, Invoke-BackupStep, `
     Get-SpoolPaths, Move-ToTrash, Move-Phase, Clear-Trash, `
-    Get-ScopedEnv, Get-ServiceOverdue, `
+    Get-ScopedEnv, Get-ServiceOverdue, Get-ServiceValidationProblems, `
     Get-BackupPlan, Invoke-BackupRun, Format-RunReport, Send-BackupReport

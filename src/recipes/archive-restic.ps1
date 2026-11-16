@@ -98,6 +98,25 @@ $Recipe.AddStep('archive', {
     $ctx.State['Result'] = @{ snapshot = $snapshotId; repo = $repo; host = $resticHost }
 })
 
+# preflight (before any downtime): the repo, a password source, and the restic
+# binary must all be resolvable, or the snapshot is doomed. Catches the classic
+# "password file does not exist" that would otherwise fail only after the backup ran.
+$Recipe.SetValidate({
+    param($ctx)
+    $problems = @()
+    if (-not $ctx.EnvValue('RESTIC_REPOSITORY', '')) { $problems += 'RESTIC_REPOSITORY not set' }
+    $pf = $ctx.EnvValue('RESTIC_PASSWORD_FILE', '')
+    if ($pf) {
+        if (-not (Test-Path -LiteralPath $pf)) { $problems += "RESTIC_PASSWORD_FILE missing: $pf" }
+    }
+    elseif (-not $ctx.EnvValue('RESTIC_PASSWORD', '')) {
+        $problems += 'no repo password (set RESTIC_PASSWORD_FILE or RESTIC_PASSWORD)'
+    }
+    $bin = $ctx.EnvValue('RESTIC_BIN', 'restic')
+    if (-not (Get-Command $bin -ErrorAction SilentlyContinue)) { $problems += "restic not found: $bin" }
+    return $problems
+})
+
 # overdue query (plan time): restic retention is out of band, so coverage here is a
 # simple minimum interval — covered if the newest snapshot is younger than
 # RESTIC_MIN_INTERVAL_HOURS (default 24). overdue = newest age / that interval.

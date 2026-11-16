@@ -127,6 +127,26 @@ $Recipe.AddStep('archive', {
     $ctx.State['Result'] = @{ tier = $tier; path = $target; pruned = $prunedNow }
 })
 
+# preflight (before any downtime): the destination must be set and reachable — its
+# nearest existing ancestor must be a directory, so an unmounted/typo dest is caught
+# before the backup runs rather than after.
+$Recipe.SetValidate({
+    param($ctx)
+    $problems = @()
+    $dest = $ctx.EnvValue('ARCHIVE_DEST', '')
+    if (-not $dest) {
+        $problems += 'ARCHIVE_DEST not set'
+    }
+    else {
+        $anc = $dest
+        while ($anc -and -not (Test-Path -LiteralPath $anc)) { $anc = Split-Path -Parent $anc }
+        if (-not $anc -or -not (Test-Path -LiteralPath $anc -PathType Container)) {
+            $problems += "ARCHIVE_DEST unreachable (no existing parent dir): $dest"
+        }
+    }
+    return $problems
+})
+
 # overdue query (plan time): covered for the day if ANY tier was archived within the
 # daily period — a yearly/weekly backup also covers the daily. overdue = newest
 # archive age / daily period; >= 1 means due, < 1 means already covered.

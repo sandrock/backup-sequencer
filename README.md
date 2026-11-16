@@ -67,8 +67,10 @@ What it does
 
 - One nightly window, no overlapping runs (a single-instance lock) — in place of a
   pile of independent cron jobs.
-- Log-driven `plan` / `run` / `history`, plus an email report per run that doubles
-  as a dead-man's-switch (no mail means the run did not happen).
+- Log-driven `plan` / `validate` / `run` / `history`, plus an email report per run
+  that doubles as a dead-man's-switch (no mail means the run did not happen).
+- Preflight validation: a misconfigured service (missing password file, unreachable
+  destination, unknown step) is caught before any backup runs, never mid-downtime.
 - Fluid scheduling: fairness-ordered, window-packed, coverage-aware, with tiered
   (GFS) retention that keeps N distinct periods, not N recent copies.
 - Per-service failure isolation, with `alwaysRun` steps so a service is never left
@@ -89,13 +91,16 @@ pwsh -c "Invoke-Pester -Path ./tests"
 # dry-run a plan against a config (no side effects)
 pwsh src/sequencer.ps1 plan -ConfigPath ./config.sample.json
 
+# check config + prerequisites without running anything (exit 1 if any invalid)
+pwsh src/sequencer.ps1 validate -ConfigPath ./config.sample.json
+
 # execute; -ForceWindow runs outside the time window for a manual run,
 # -ForceAllJobs also ignores the fit/coverage checks (back up everything now)
 pwsh src/sequencer.ps1 run -ConfigPath ./config.sample.json -ForceWindow
 ```
 
 Installed (see [Getting started](help/getting-started.md)), the same commands are
-`bseq plan`, `bseq run`, `bseq history`.
+`bseq plan`, `bseq validate`, `bseq run`, `bseq history`.
 
 
 Documentation
@@ -127,7 +132,7 @@ Layout
 
 ```
 src/
-  sequencer.ps1         entry point: plan | run | history | help
+  sequencer.ps1         entry point: plan | validate | run | history | help
   lib/BackupCommon.psm1 engine (events, projection, locking, planning, run)
   recipes/              reusable step scripts (e.g. docker-compose-cold)
   services/             bespoke per-service step scripts (same contract)

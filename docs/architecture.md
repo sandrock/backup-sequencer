@@ -32,6 +32,7 @@ to register its steps:
 param($Recipe)
 $Recipe.AddStep('dump', { param($ctx) ... })   # register a step
 $Recipe.SetOverdue({ param($ctx) ... })        # optional: archiver coverage query
+$Recipe.SetValidate({ param($ctx) ... })       # optional: preflight prereq check
 ```
 
 The engine loads the script once per service (which only *registers* steps), then
@@ -54,6 +55,16 @@ The context carries everything a step needs:
 An archiver recipe additionally registers `SetOverdue` (its plan-time coverage
 query) and returns its result (tier / path / snapshot, pruned paths) via
 `$ctx.State['Result']`, which the engine records as `service.archived`.
+
+A recipe (backup or archiver) may also register `SetValidate`, returning a list of
+problem strings (empty = OK). The engine runs it — plus structural checks (recipe /
+archiver scripts resolve, every configured step is registered, the archiver has an
+`archive` step) — as a **preflight before any step runs**: a service that fails is
+skipped (`service.end status=fail reason=invalid`) without being taken down, so a
+doomed archive (missing password file, unreachable destination) never costs it its
+downtime. The same checks back the `validate` command, which runs nothing. Validation
+sits after the coverage/fit gates in a run, so it only vets services about to run;
+`validate` vets every enabled service.
 
 Env resolves along a scope chain, later overriding earlier: a backup recipe sees
 `config.env ← service.env`; an archiver also sees `← syncArchive.env`.

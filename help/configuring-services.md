@@ -123,6 +123,28 @@ so an already-archived service is skipped. A small grace margin (top-level
 being skipped by timer jitter. See [the scheduling model](../docs/scheduling.md).
 
 
+Checking your config
+----------------------------------------------------------------
+
+After editing `config.json`, dry-check it before the timer runs:
+
+```sh
+bseq validate
+```
+
+It prints `OK` or `INVALID` per enabled service, lists each problem (missing
+recipe/archiver script, an unregistered step name, an archiver with no `archive`
+step, and recipe prerequisites — a restic password file that does not exist, an
+unset or unreachable `ARCHIVE_DEST`, a missing compose/data dir), and exits non-zero
+if anything is wrong. It runs nothing.
+
+A run applies the same preflight automatically: a service that fails validation is
+skipped **before any step runs** — so a broken archive never stops the service for a
+backup it cannot keep — and reported as a failure, so coverage leaves it overdue and
+the next window retries it once the config is fixed. Run `validate` after any config
+change to catch a typo before the nightly timer does.
+
+
 Resources and timeouts
 ----------------------------------------------------------------
 

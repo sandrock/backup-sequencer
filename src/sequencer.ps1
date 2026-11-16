@@ -10,7 +10,7 @@
   JSON config and implemented by step scripts (recipes or bespoke). See docs/ for
   internals and help/ for usage.
 .PARAMETER Command
-  plan | run | history | help
+  plan | validate | run | history | help
 .PARAMETER ConfigPath
   Path to config.json. Defaults to the OS config dir (see help/).
 .PARAMETER ForceWindow
@@ -78,6 +78,7 @@ Usage:
 
 Commands:
   plan      Show the ordered plan for the current window (no side effects)
+  validate  Check each service's config and prerequisites; run nothing (exit 1 if any invalid)
   run       Execute the plan
   history   Show recent run summaries (newest first)
   help      This message
@@ -143,6 +144,27 @@ switch ($Command) {
             $report = Format-RunReport -EventsPath $Paths.EventsPath -RunId $runId
             Send-BackupReport -Notify $Config.notify -Subject "backup report $runId" `
                 -Body $report -BaseDir (Get-ConfigDir) | Out-Null
+        }
+    }
+    'validate' {
+        # dry preflight: check every enabled service's config + prerequisites, run nothing.
+        $anyProblem = $false
+        foreach ($name in $Config.services.PSObject.Properties.Name) {
+            if (-not ((Test-HasProp $Config.services.$name 'enabled') -and [bool]$Config.services.$name.enabled)) { continue }
+            $problems = @(Get-ServiceValidationProblems -Config $Config -Service $name -BaseDir $Paths.BaseDir -EventsPath $Paths.EventsPath)
+            if ($problems.Count) {
+                $anyProblem = $true
+                Write-Host ("  {0,-22} INVALID" -f $name)
+                foreach ($p in $problems) { Write-Host "      - $p" }
+            }
+            else {
+                Write-Host ("  {0,-22} OK" -f $name)
+            }
+        }
+        if ($anyProblem) {
+            Write-Host ''
+            Write-Host 'Validation found problems; fix the config before the next run.'
+            exit 1
         }
     }
     'history' {

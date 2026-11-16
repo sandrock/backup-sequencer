@@ -110,6 +110,7 @@ Run
 
 ```sh
 bseq plan                      # show the plan, no side effects
+bseq validate                  # check config + prerequisites, run nothing (exit 1 if invalid)
 bseq run                       # execute (respects the window + fluid scheduling)
 bseq run -ForceWindow          # run even outside the window
 bseq run -ForceWindow -ForceAllJobs   # run everything now, ignore window + fit check
