@@ -395,7 +395,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         $dest = Join-Path $Work "cloud-$n"
         $cfg = (@'
 { "window": { "open": "00:00", "close": "23:59" },
-  "archive": { "ARCHIVE_DEST": "__DEST__" },
+  "env": { "ARCHIVE_DEST": "__DEST__" },
   "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
     "publishToReady": true,
     "syncArchive": { "script": "../src/recipes/archive-copy.ps1", "env": { "ARCHIVE_KEEP": "3" } },
@@ -405,6 +405,23 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         $copies = @(Get-ChildItem -Path (Join-Path $dest 'app') -Directory -ErrorAction SilentlyContinue)
         $copies.Count | Should -Be 1
         (Test-Path (Join-Path $copies[0].FullName 'data.bin')) | Should -BeTrue
+        @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archived' -and $_.svc -eq 'app' }).Count | Should -BeGreaterThan 0
+    }
+
+    It 'service-level env feeds the archiver (unified env scope chain)' {
+        $dest = Join-Path $Work "svcenv-$n"
+        # ARCHIVE_DEST/ARCHIVE_KEEP live only in the service's own env, not in a
+        # top-level block nor in syncArchive.env -> the archiver must still see them
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "env": { "ARCHIVE_DEST": "__DEST__", "ARCHIVE_KEEP": "3" },
+    "publishToReady": true,
+    "syncArchive": { "script": "../src/recipes/archive-copy.ps1" },
+    "steps": [ { "name": "dump", "resources": [] }, { "name": "start", "resources": [], "alwaysRun": true } ] } } }
+'@ -replace '__DEST__', ($dest -replace '\\', '/')) | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
+        (Test-Path (Join-Path $dest 'app')) | Should -BeTrue
         @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.archived' -and $_.svc -eq 'app' }).Count | Should -BeGreaterThan 0
     }
 
@@ -637,7 +654,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         Add-Content -LiteralPath $ev -Value (@{ ts = (Get-Date).AddHours(-1).ToString('o'); type = 'service.archived'; svc = 'app'; tier = 'daily'; path = $arch } | ConvertTo-Json -Compress)
         $cfg = (@'
 { "window": { "open": "00:00", "close": "23:59" },
-  "archive": { "ARCHIVE_DEST": "__DEST__" },
+  "env": { "ARCHIVE_DEST": "__DEST__" },
   "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
     "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1" },
     "steps": [ { "name": "dump", "resources": [] }, { "name": "start", "resources": [], "alwaysRun": true } ] } } }

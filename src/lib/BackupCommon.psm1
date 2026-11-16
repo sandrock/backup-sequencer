@@ -302,17 +302,25 @@ function Invoke-BackupStep {
 
 # --- planning ---------------------------------------------------------------
 
-function Get-MergedArchiveEnv {
-    # top-level config.archive defaults, overridden by the service's syncArchive.env
-    param([Parameter(Mandatory)]$Config, $SyncArchive)
+function Get-ScopedEnv {
+    # Merge env maps along a scope chain, later sources overriding earlier ones, e.g.
+    # global config.env <- service.env <- syncArchive.env. Each source is an object
+    # whose properties are env vars (or $null to skip). Returns a pscustomobject.
+    param([object[]]$Sources)
     $envMap = [ordered]@{}
-    if ((Test-HasProp $Config 'archive') -and ($null -ne $Config.archive)) {
-        foreach ($prop in @($Config.archive.PSObject.Properties)) { $envMap[$prop.Name] = $prop.Value }
-    }
-    if ($SyncArchive -and (Test-HasProp $SyncArchive 'env') -and ($null -ne $SyncArchive.env)) {
-        foreach ($prop in @($SyncArchive.env.PSObject.Properties)) { $envMap[$prop.Name] = $prop.Value }
+    foreach ($src in $Sources) {
+        if ($null -ne $src) {
+            foreach ($prop in @($src.PSObject.Properties)) { $envMap[$prop.Name] = $prop.Value }
+        }
     }
     return [pscustomobject]$envMap
+}
+
+function Get-PropOrNull {
+    # StrictMode-safe property read: the value, or $null if the property is absent.
+    param($Object, [string]$Name)
+    if ($null -ne $Object -and (Test-HasProp $Object $Name)) { return $Object.$Name }
+    return $null
 }
 
 function Get-ServiceOverdue {
@@ -335,7 +343,11 @@ function Get-ServiceOverdue {
     $arc.Service = $Service
     $arc.EventsPath = $EventsPath
     $arc.Now = $At
-    $arc.Env = Get-MergedArchiveEnv -Config $Config -SyncArchive $syncArchive
+    # scope chain: global config.env <- service.env <- syncArchive.env
+    $arc.Env = Get-ScopedEnv -Sources @(
+        (Get-PropOrNull $Config 'env'),
+        (Get-PropOrNull $serviceConfig 'env'),
+        (Get-PropOrNull $syncArchive 'env'))
     & $scriptPath -Recipe $arc | Out-Null     # registration only
     if ($null -eq $arc.OverdueBlock) { return $null }
     try { return [double](& $arc.OverdueBlock $arc) } catch { return $null }
@@ -569,7 +581,8 @@ function Invoke-BackupRun {
             $rc = [RecipeContext]::new()
             $rc.Service = $serviceName
             $rc.OutDir = $wipDir
-            $rc.Env = if (Test-HasProp $svc 'env') { $svc.env } else { $null }
+            # scope chain for the backup recipe: global config.env <- service.env
+            $rc.Env = Get-ScopedEnv -Sources @((Get-PropOrNull $Config 'env'), (Get-PropOrNull $svc 'env'))
             $rc.EventsPath = $Paths.EventsPath
             $rc.RunId = $runId
             & $scriptPath -Recipe $rc | Out-Null   # registration only; don't let output taint the run
@@ -629,15 +642,11 @@ function Invoke-BackupRun {
                     $arc.OutDir = $stageDir
                     $arc.EventsPath = $Paths.EventsPath
                     $arc.RunId = $runId
-                    # archive env: top-level config.archive defaults, overridden per-service
-                    $archiveEnv = [ordered]@{}
-                    if ((Test-HasProp $Config 'archive') -and ($null -ne $Config.archive)) {
-                        foreach ($prop in @($Config.archive.PSObject.Properties)) { $archiveEnv[$prop.Name] = $prop.Value }
-                    }
-                    if ((Test-HasProp $sa 'env') -and ($null -ne $sa.env)) {
-                        foreach ($prop in @($sa.env.PSObject.Properties)) { $archiveEnv[$prop.Name] = $prop.Value }
-                    }
-                    $arc.Env = [pscustomobject]$archiveEnv
+                    # scope chain: global config.env <- service.env <- syncArchive.env
+                    $arc.Env = Get-ScopedEnv -Sources @(
+                        (Get-PropOrNull $Config 'env'),
+                        (Get-PropOrNull $svc 'env'),
+                        (Get-PropOrNull $sa 'env'))
                     & $saScript -Recipe $arc | Out-Null
                     if (-not $arc.Steps.ContainsKey('archive')) {
                         $syncFailed = $true
@@ -821,5 +830,5 @@ Export-ModuleMember -Function `
     Test-WithinWindow, Get-WindowLengthSeconds, Get-SecondsUntilClose, `
     Get-FreeSpaceBytes, Get-PathSizeBytes, Invoke-BackupStep, `
     Get-SpoolPaths, Move-ToTrash, Move-Phase, Clear-Trash, `
-    Get-MergedArchiveEnv, Get-ServiceOverdue, `
+    Get-ScopedEnv, Get-ServiceOverdue, `
     Get-BackupPlan, Invoke-BackupRun, Format-RunReport, Send-BackupReport
