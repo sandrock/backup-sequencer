@@ -299,7 +299,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'step.end' -and $_.step -eq 'sync-archive' -and $_.status -eq 'ok' }).Count | Should -BeGreaterThan 0
     }
 
-    It 'publishes to ready/ and flags syncfail when the sync step fails' {
+    It 'sync-only (publishToReady=false): a sync failure retains nothing and fails the service' {
         $cfg = @'
 { "window": { "open": "00:00", "close": "23:59" },
   "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
@@ -310,7 +310,29 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
 '@ | ConvertFrom-Json
         Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
         @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.syncfail' }).Count | Should -BeGreaterThan 0
+        # config honored: not force-published to a ready/ nobody consumes
+        (Test-Path (Join-Path $root 'ready/app')) | Should -BeFalse
+        # and nothing was archived -> the service is a failure, not a silent ok
+        $endE = @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'app' })
+        $endE[-1].status | Should -Be 'fail'
+    }
+
+    It 'publishToReady=true: a sync failure still publishes to ready/ and stays ok (archiver has it)' {
+        $cfg = @'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "publishToReady": true,
+    "syncArchive": { "script": "fixtures/mock-service.ps1", "env": { "MOCK_ARCHIVE_FAIL": "1" } },
+    "steps": [ { "name": "dump", "resources": [] },
+               { "name": "start", "resources": [], "alwaysRun": true } ] } } }
+'@ | ConvertFrom-Json
+        $runId = Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue
+        @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.syncfail' }).Count | Should -BeGreaterThan 0
         (Test-Path (Join-Path $root 'ready/app/data.bin')) | Should -BeTrue
+        $endE = @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'app' })
+        $endE[-1].status | Should -Be 'ok'
+        # the dead-man's-switch report must still surface the archive failure
+        (Format-RunReport -EventsPath $ev -RunId $runId) | Should -Match 'archive failed'
     }
 
     It 'archive-copy copies the set to dest (ARCHIVE_DEST from top-level) and logs service.archived' {

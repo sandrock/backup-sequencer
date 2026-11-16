@@ -621,7 +621,7 @@ function Invoke-BackupRun {
                     $reason = "recipe not found: $($sa.script)"
                     Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.syncfail' `
                         -Props @{ runId = $runId; svc = $serviceName; reason = $reason }
-                    Write-Warning "$serviceName sync-archive skipped: $reason (backup still published)"
+                    Write-Warning "$serviceName sync-archive skipped: $reason"
                 }
                 else {
                     $arc = [RecipeContext]::new()
@@ -659,7 +659,7 @@ function Invoke-BackupRun {
                             if (-not $reason) { $reason = 'see events.jsonl' }
                             Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.syncfail' `
                                 -Props @{ runId = $runId; svc = $serviceName; reason = $reason }
-                            Write-Warning "$serviceName sync-archive FAILED: $reason (backup still published)"
+                            Write-Warning "$serviceName sync-archive FAILED: $reason"
                         }
                         else {
                             # record the archive in the sequencer log (reported by the recipe)
@@ -688,10 +688,14 @@ function Invoke-BackupRun {
                 }
             }
 
-            # --- publish stage -> ready (or discard if sync-only and sync ok) ---
+            # --- publish stage -> ready (or discard if sync-only) ---
+            # publishToReady is honored as configured, even on sync-archive failure.
+            # Forcing it true on failure would be wrong: when it is false there is no
+            # consumer watching ready/, so a backup stranded there is never fetched. A
+            # failed archive writes no service.archived event, so coverage keeps the
+            # service overdue and the next window retries it (the recovery path).
             $publishToReady = $true
             if (Test-HasProp $svc 'publishToReady') { $publishToReady = [bool]$svc.publishToReady }
-            if ($syncFailed) { $publishToReady = $true }   # never lose a backup on sync failure
 
             if ($publishToReady) {
                 if (Test-Path -LiteralPath $readyDir) {
@@ -704,15 +708,26 @@ function Invoke-BackupRun {
                 Move-Phase -Src $stageDir -Dst $readyDir
             }
             else {
-                Move-ToTrash -Path $stageDir -TrashRoot $stg.Trash   # archived synchronously; drop local copy
+                Move-ToTrash -Path $stageDir -TrashRoot $stg.Trash   # archived synchronously, or nothing to keep; drop local copy
             }
 
-            $okCount++
-            Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
-                -Props @{ runId = $runId; svc = $serviceName; status = 'ok'; bytes = $bytes }
+            # A sync-archive failure with no local copy kept means nothing was archived
+            # and nothing retained: a service failure. With a copy in ready/, the async
+            # archiver still has the backup, so that case stays ok (syncfail reported).
             $mb = [math]::Round(($bytes / 1MB), 1)
-            $dest = if ($publishToReady) { "ready/$serviceName" } else { 'archived (sync); local copy dropped' }
-            Write-Information ("  {0}  OK  ({1} MB)  -> {2}" -f $serviceName, $mb, $dest)
+            if ($syncFailed -and -not $publishToReady) {
+                $failCount++
+                Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
+                    -Props @{ runId = $runId; svc = $serviceName; status = 'fail'; bytes = $bytes; error = 'sync-archive failed; nothing retained' }
+                Write-Warning ("  {0}  FAILED archive  ({1} MB)  -> nothing retained (retry next window)" -f $serviceName, $mb)
+            }
+            else {
+                $okCount++
+                Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
+                    -Props @{ runId = $runId; svc = $serviceName; status = 'ok'; bytes = $bytes }
+                $dest = if ($publishToReady) { "ready/$serviceName" } else { 'archived (sync); local copy dropped' }
+                Write-Information ("  {0}  OK  ({1} MB)  -> {2}" -f $serviceName, $mb, $dest)
+            }
             }
             catch {
                 $emsg = $_.Exception.Message
@@ -747,6 +762,11 @@ function Format-RunReport {
     foreach ($e in ($events | Where-Object { $_.type -eq 'service.end' })) {
         $mb = [math]::Round(($e.bytes / 1MB), 1)
         $lines += ("  {0,-24} {1,-5} {2} MB" -f $e.svc, $e.status.ToUpper(), $mb)
+    }
+    # surface sync-archive failures even when the backup was still published (ok)
+    foreach ($e in ($events | Where-Object { $_.type -eq 'service.syncfail' })) {
+        $reason = if (Test-HasProp $e 'reason') { $e.reason } else { 'see events.jsonl' }
+        $lines += ("  ! {0,-22} archive failed: {1}" -f $e.svc, $reason)
     }
     $end = $events | Where-Object { $_.type -eq 'run.end' } | Select-Object -First 1
     if ($end) {
