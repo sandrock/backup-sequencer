@@ -111,7 +111,8 @@ resolved along the scope chain `top-level env ← service env ← syncArchive.en
   [the scheduling model](scheduling.md).
 - `archive-restic` — an off-box [restic](https://restic.net) repository: dedup,
   encryption, and GFS retention handled by restic itself. Each run snapshots
-  `stage/<service>/` into the repo (`restic backup --tag <service> --host <host>`);
+  `stage/<service>/` into the repo (`restic backup . --tag <service> --host <host>`,
+  run from inside that dir so the set's files sit at the snapshot root);
   there is no on-disk copy, so pair it with `"publishToReady": false`. Retention
   (`restic forget --prune`) runs **out of band** on its own schedule — the recipe
   only ever adds snapshots. Coverage is a flat minimum interval

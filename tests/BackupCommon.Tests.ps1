@@ -11,9 +11,17 @@ BeforeAll {
     New-Item -ItemType Directory -Force -Path $script:Work | Out-Null
 
     # a fake `restic` for archive-restic tests: prints a --json summary with a snapshot
-    # id, or exits non-zero when RESTIC_STUB_FAIL is set. POSIX shell (Linux/macOS only).
+    # id, or exits non-zero when RESTIC_STUB_FAIL is set; when RESTIC_STUB_LOG is set it
+    # writes its working dir then its args (one per line) there. POSIX shell only.
     $script:resticStub = Join-Path $script:Work 'restic-stub.sh'
-    Set-Content -LiteralPath $script:resticStub -NoNewline -Value "#!/bin/sh`nif [ -n `"`$RESTIC_STUB_FAIL`" ]; then echo 'stub failure' >&2; exit 1; fi`necho '{`"message_type`":`"summary`",`"snapshot_id`":`"deadbeefcafe`"}'`nexit 0`n"
+    $stubBody = @'
+#!/bin/sh
+if [ -n "$RESTIC_STUB_LOG" ]; then { pwd; printf '%s\n' "$@"; } > "$RESTIC_STUB_LOG"; fi
+if [ -n "$RESTIC_STUB_FAIL" ]; then echo 'stub failure' >&2; exit 1; fi
+echo '{"message_type":"summary","snapshot_id":"deadbeefcafe"}'
+exit 0
+'@
+    Set-Content -LiteralPath $script:resticStub -NoNewline -Value ($stubBody -replace "`r", '')
     if (-not $IsWindows) { & chmod '+x' $script:resticStub }
 }
 
@@ -479,6 +487,33 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         # the restic repo is the archive -> no local copy kept in ready/
         (Test-Path (Join-Path $root 'ready/app')) | Should -BeFalse
         (@(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'app' }))[-1].status | Should -Be 'ok'
+    }
+
+    It 'archive-restic: backs up "." from inside the stage dir, with relative local paths pinned' -Skip:($IsWindows) {
+        $repoDir = Join-Path $Work "resticrepoR-$n"
+        $pwFile = Join-Path $Work "pwR-$n"
+        Set-Content -LiteralPath $pwFile -Value 'secret'
+        $log = Join-Path $Work "stublog-$n"
+        $here = (Get-Location).Path
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+    "publishToReady": false,
+    "syncArchive": { "script": "../src/recipes/archive-restic.ps1",
+      "env": { "RESTIC_REPOSITORY": "__REPO__", "RESTIC_BIN": "__STUB__", "RESTIC_PASSWORD_FILE": "__PW__", "RESTIC_STUB_LOG": "__LOG__" } },
+    "steps": [ { "name": "dump", "resources": [] } ] } } }
+'@ -replace '__REPO__', ([System.IO.Path]::GetRelativePath($here, $repoDir) -replace '\\', '/') `
+            -replace '__PW__', ([System.IO.Path]::GetRelativePath($here, $pwFile) -replace '\\', '/') `
+            -replace '__STUB__', ($script:resticStub -replace '\\', '/') -replace '__LOG__', ($log -replace '\\', '/')) | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
+
+        $lines = @(Get-Content -LiteralPath $log)
+        $lines[0] | Should -BeLike '*stage/app'          # cwd = the service's stage dir
+        $lines[1] | Should -Be 'backup'
+        $lines[2] | Should -Be '.'                       # stored flat, not under the spool path
+        $lines[[array]::IndexOf($lines, '-r') + 1] | Should -Be ([System.IO.Path]::GetFullPath($repoDir))
+        $lines[[array]::IndexOf($lines, '--password-file') + 1] | Should -Be ([System.IO.Path]::GetFullPath($pwFile))
+        (Get-Location).Path | Should -Be $here           # cwd restored after the archive step
     }
 
     It 'archive-restic: a restic failure retains nothing and fails the service (publishToReady=false)' -Skip:($IsWindows) {

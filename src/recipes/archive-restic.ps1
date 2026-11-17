@@ -7,8 +7,10 @@
 .DESCRIPTION
   An archiver recipe. The engine passes a RecipeContext and runs its 'archive'
   step against the completed set in $ctx.OutDir (the service's stage dir). It runs
-  `restic backup` so the repo stores only the night's changed blocks (dedup), then
-  reports the snapshot id back through $ctx.State.Result.
+  `restic backup .` from inside that dir, so the snapshot holds the set's files at
+  its root (a restore lands flat, not under the spool path); the repo stores only
+  the night's changed blocks (dedup). Reports the snapshot id back through
+  $ctx.State.Result.
 
   Retention (GFS) is NOT done here: `restic forget --prune` runs out of band on its
   own schedule (exclusive, off the backup window) — see help/archiving-restic.md.
@@ -49,8 +51,16 @@ $Recipe.AddStep('archive', {
     $compression = $ctx.EnvValue('RESTIC_COMPRESSION', '')
     $extraTags = @($ctx.EnvValue('RESTIC_TAGS', '') -split ';' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 
-    # snapshot the complete artifact set from the stage dir; dedup stores only the delta
-    $resticArgs = @('backup', $ctx.OutDir, '--json', '-r', $repo, '--host', $resticHost, '--tag', $ctx.Service)
+    # restic runs from inside the stage dir (see below): pin relative local paths first
+    if ($passwordFile) { $passwordFile = [System.IO.Path]::GetFullPath($passwordFile) }
+    if ($repo -notmatch '^[A-Za-z][A-Za-z0-9+.-]+:' -and -not [System.IO.Path]::IsPathRooted($repo)) {
+        $repo = [System.IO.Path]::GetFullPath($repo)   # a local path, not a backend URL (sftp:, rclone:, …)
+    }
+
+    # snapshot the complete artifact set from inside the stage dir as '.', so the
+    # snapshot holds the set's files at its root (flat restore) rather than the full
+    # spool path; dedup stores only the delta
+    $resticArgs = @('backup', '.', '--json', '-r', $repo, '--host', $resticHost, '--tag', $ctx.Service)
     foreach ($t in $extraTags) { $resticArgs += @('--tag', $t) }
     if ($passwordFile) { $resticArgs += @('--password-file', $passwordFile) }
     if ($compression) { $resticArgs += @('--compression', $compression) }
@@ -68,6 +78,7 @@ $Recipe.AddStep('archive', {
         }
     }
 
+    Push-Location -LiteralPath $ctx.OutDir
     try {
         $output = & $bin @resticArgs 2>&1
         $code = $LASTEXITCODE
@@ -76,6 +87,7 @@ $Recipe.AddStep('archive', {
         }
     }
     finally {
+        Pop-Location
         foreach ($k in $passed) {
             if ($null -eq $restore[$k]) { Remove-Item -Path "Env:$k" -ErrorAction SilentlyContinue }
             else { Set-Item -Path "Env:$k" -Value $restore[$k] }

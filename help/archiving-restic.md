@@ -105,8 +105,15 @@ recipe. Keep passwords in `secrets/` (mode 0600, never committed), not in
 Each run produces **one snapshot**, tagged with the service name and host:
 
 ```
-restic backup <stage>/<service> --tag <service> --host <host>
+cd <stage>/<service> && restic backup . --tag <service> --host <host>
 ```
+
+restic runs from **inside** the stage dir and backs up `.`, so the snapshot holds the
+set's files at its root (`/<service>_data.tar`, …) rather than under the spool path.
+The snapshot's recorded path is still the absolute stage dir, which restic uses to
+find the previous snapshot to compare against: if the spool moves, the next backup
+of each service re-reads its files once (nothing is stored twice — dedup still
+applies).
 
 Query a service's history by metadata, not by folder:
 `restic snapshots --tag example-app --host <host>`. The sequencer records the new
@@ -151,6 +158,14 @@ Restore
 restic -r <repo> snapshots --tag <service> --host <host>
 restic -r <repo> restore latest --tag <service> --host <host> --target /restore/<service>
 restic -r <repo> mount /mnt/browse     # or browse snapshots as files
+```
+
+The set's files land directly in the target (`/restore/<service>/<service>_data.tar`,
+…). Snapshots taken by versions before this layout hold the full stage path instead;
+restore just their folder to get the same flat result:
+
+```sh
+restic -r <repo> restore <id>:/var/spool/backup-sequencer/stage/<service> --target /restore/<service>
 ```
 
 Then run the service's own restore step (extract / import / verify). A restore
