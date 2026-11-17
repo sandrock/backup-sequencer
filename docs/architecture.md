@@ -14,7 +14,7 @@ Components
 ----------------------------------------------------------------
 
 - `src/sequencer.ps1` — thin entry point. Resolves config/state paths, loads the
-  config, dispatches `plan` / `run` / `history`, and (on `run`) renders + sends
+  config, dispatches `plan` / `run` / `status` / `show` / `history`, and (on `run`) renders + sends
   the report.
 - `src/lib/BackupCommon.psm1` — the engine. Pure-ish helpers plus the run loop.
 - `src/recipes/*.ps1` — reusable step scripts parameterised by environment.

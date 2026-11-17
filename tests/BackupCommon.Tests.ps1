@@ -350,6 +350,122 @@ Describe 'preflight validation' {
     }
 }
 
+Describe 'run status and detail (status / show / history)' {
+    BeforeAll {
+        # write raw events with fixed timestamps so elapsed times are deterministic
+        $script:addEv = {
+            param($path, [string]$ts, [string]$type, [hashtable]$props)
+            $o = [ordered]@{ ts = $ts; type = $type }
+            foreach ($k in $props.Keys) { $o[$k] = $props[$k] }
+            Add-Content -LiteralPath $path -Value ($o | ConvertTo-Json -Compress -Depth 5)
+        }
+        $script:t0 = [datetime]::new(2026, 11, 17, 15, 0, 0, [System.DateTimeKind]::Utc).ToLocalTime()
+        $script:iso = { param([int]$sec) $t0.AddSeconds($sec).ToString('yyyy-MM-ddTHH:mm:sszzz') }
+    }
+    BeforeEach {
+        $script:n = [guid]::NewGuid().ToString('n').Substring(0, 8)
+        $script:ev = Join-Path $Work "st-$n.jsonl"
+        $script:lock = Join-Path $Work "st-$n.lock"
+    }
+
+    It 'formats durations compactly and culture-independently' {
+        Format-Duration 7.5 | Should -Be '7.5s'
+        Format-Duration 42 | Should -Be '42s'
+        Format-Duration 302 | Should -Be '5m02s'
+        Format-Duration 3780 | Should -Be '1h03m'
+    }
+
+    It 'tells finished, running and interrupted runs apart' {
+        & $addEv $ev (& $iso 0) 'run.start' @{ runId = 'r-0001' }
+        & $addEv $ev (& $iso 5) 'run.end' @{ runId = 'r-0001'; summary = @{ ok = 1; failed = 0; planned = 1 } }
+        & $addEv $ev (& $iso 10) 'run.start' @{ runId = 'r-0002' }
+        & $addEv $ev (& $iso 20) 'run.start' @{ runId = 'r-0003' }
+        $events = @(Get-BackupEvents -EventsPath $ev)
+
+        Set-Content -LiteralPath $lock -Value $PID   # a live process holds the lock
+        $states = @(Get-RunStates -Events $events -LockPath $lock)
+        ($states | ForEach-Object { $_.State }) -join ',' | Should -Be 'finished,interrupted,running'
+        $states[2].Pid | Should -Be $PID
+
+        Remove-Item -LiteralPath $lock               # nobody holds it: the newest run died too
+        ((Get-RunStates -Events $events -LockPath $lock) | ForEach-Object { $_.State }) -join ',' | Should -Be 'finished,interrupted,interrupted'
+    }
+
+    It 'resolves a run by latest, full id or unique ending' {
+        $runs = @(
+            [pscustomobject]@{ RunId = '20261117-152140-332d' },
+            [pscustomobject]@{ RunId = '20261117-160000-a32d' },
+            [pscustomobject]@{ RunId = '20261117-170000-beef' })
+        (Resolve-RunRef -Runs $runs -Ref 'latest').RunId | Should -Be '20261117-170000-beef'
+        (Resolve-RunRef -Runs $runs -Ref '').RunId | Should -Be '20261117-170000-beef'
+        (Resolve-RunRef -Runs $runs -Ref '20261117-152140-332d').RunId | Should -Be '20261117-152140-332d'
+        (Resolve-RunRef -Runs $runs -Ref '332d').RunId | Should -Be '20261117-152140-332d'
+        { Resolve-RunRef -Runs $runs -Ref '32d' } | Should -Throw '*matches several runs*'
+        { Resolve-RunRef -Runs $runs -Ref 'zzzz' } | Should -Throw "*no run matches*"
+    }
+
+    It 'shows the step in progress, finished services and pending ones for a running run' {
+        & $addEv $ev (& $iso 0) 'run.start' @{ runId = 'r1' }
+        & $addEv $ev (& $iso 0) 'run.plan' @{ runId = 'r1'; plan = @('a', 'b', 'c') }
+        & $addEv $ev (& $iso 1) 'step.start' @{ runId = 'r1'; svc = 'a'; step = 'dump' }
+        & $addEv $ev (& $iso 4) 'step.end' @{ runId = 'r1'; svc = 'a'; step = 'dump'; status = 'ok'; durationSec = 3.1 }
+        & $addEv $ev (& $iso 5) 'service.archived' @{ runId = 'r1'; svc = 'a'; snapshot = 'deadbeefcafe0123' }
+        & $addEv $ev (& $iso 5) 'service.end' @{ runId = 'r1'; svc = 'a'; status = 'ok'; bytes = 7.2MB }
+        & $addEv $ev (& $iso 6) 'step.start' @{ runId = 'r1'; svc = 'b'; step = 'stop' }
+        & $addEv $ev (& $iso 55) 'step.end' @{ runId = 'r1'; svc = 'b'; step = 'stop'; status = 'ok'; durationSec = 49 }
+        & $addEv $ev (& $iso 60) 'step.start' @{ runId = 'r1'; svc = 'b'; step = 'hot-dump' }
+        Set-Content -LiteralPath $lock -Value $PID
+        $events = @(Get-BackupEvents -EventsPath $ev)
+        $run = (Get-RunStates -Events $events -LockPath $lock)[-1]
+        $detail = Get-RunDetail -Events $events -Run $run
+        $text = (Format-RunDetail -Detail $detail -Now $t0.AddSeconds(300)) -join "`n"
+
+        $text | Should -Match 'RUNNING  run r1 .*\(5m00s\)'
+        $text | Should -Match 'a\s+ok\s+7\.2 MB\s+snap deadbeef\s+dump 3\.1s'
+        $text | Should -Match 'b\s+> hot-dump \(4m00s\).*stop 49s'
+        $text | Should -Match 'c\s+pending'
+        (Format-RunHistoryLine -Detail $detail -Now $t0.AddSeconds(300)) | Should -Match 'r1  RUNNING \(5m00s\)  \[a:ok b:hot-dump\.\.\.\]'
+    }
+
+    It 'flags the step a dead run stopped in, and services it never reached' {
+        & $addEv $ev (& $iso 0) 'run.start' @{ runId = 'r1' }
+        & $addEv $ev (& $iso 0) 'run.plan' @{ runId = 'r1'; plan = @('a', 'b') }
+        & $addEv $ev (& $iso 1) 'step.start' @{ runId = 'r1'; svc = 'a'; step = 'dump' }
+        $events = @(Get-BackupEvents -EventsPath $ev)
+        $run = (Get-RunStates -Events $events -LockPath $lock)[-1]
+        $detail = Get-RunDetail -Events $events -Run $run
+        $text = (Format-RunDetail -Detail $detail) -join "`n"
+
+        $text | Should -Match 'INTERRUPTED  run r1'
+        $text | Should -Match 'a\s+! died in dump'
+        $text | Should -Match 'may have left it down'
+        $text | Should -Match 'b\s+not reached'
+        (Format-RunHistoryLine -Detail $detail) | Should -Match 'r1  INTERRUPTED  \[a:dump\.\.\.\]'
+    }
+
+    It 'shows skipped and invalid services of a finished run, with problems and archive failures' {
+        & $addEv $ev (& $iso 0) 'run.start' @{ runId = 'r1' }
+        & $addEv $ev (& $iso 0) 'service.skip' @{ runId = 'r1'; svc = 'a'; reason = 'covered' }
+        & $addEv $ev (& $iso 1) 'service.end' @{ runId = 'r1'; svc = 'b'; status = 'fail'; reason = 'invalid'; problems = @('hot dir missing: /x'); bytes = 0 }
+        & $addEv $ev (& $iso 2) 'step.start' @{ runId = 'r1'; svc = 'c'; step = 'sync-archive' }
+        & $addEv $ev (& $iso 3) 'step.end' @{ runId = 'r1'; svc = 'c'; step = 'sync-archive'; status = 'fail'; durationSec = 1 }
+        & $addEv $ev (& $iso 3) 'service.syncfail' @{ runId = 'r1'; svc = 'c'; reason = 'repo locked' }
+        & $addEv $ev (& $iso 3) 'service.end' @{ runId = 'r1'; svc = 'c'; status = 'fail'; bytes = 0; error = 'sync-archive failed; nothing retained' }
+        & $addEv $ev (& $iso 65) 'run.end' @{ runId = 'r1'; summary = @{ ok = 0; failed = 2; planned = 3 } }
+        $events = @(Get-BackupEvents -EventsPath $ev)
+        $detail = Get-RunDetail -Events $events -Run (Get-RunStates -Events $events -LockPath $lock)[-1]
+        $text = (Format-RunDetail -Detail $detail) -join "`n"
+
+        $text | Should -Match 'run r1 .* \(1m05s\)  ok=0 failed=2 planned=3'
+        $text | Should -Match 'a\s+skipped \(covered\)'
+        $text | Should -Match 'b\s+INVALID'
+        $text | Should -Match '- hot dir missing: /x'
+        $text | Should -Match 'c\s+FAIL.*sync-archive FAIL 1s'
+        $text | Should -Match '! archive failed: repo locked'
+        (Format-RunHistoryLine -Detail $detail) | Should -Match 'r1  ok=0 failed=2 planned=3  \[a:covered b:fail c:fail\]'
+    }
+}
+
 Describe 'spool lifecycle (wip -> stage -> ready)' {
     BeforeEach {
         $script:n = [guid]::NewGuid().ToString('n').Substring(0, 8)

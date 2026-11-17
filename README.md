@@ -67,7 +67,7 @@ What it does
 
 - One nightly window, no overlapping runs (a single-instance lock) — in place of a
   pile of independent cron jobs.
-- Log-driven `plan` / `validate` / `run` / `history`, plus an email report per run
+- Log-driven `plan` / `validate` / `run` / `status` / `show` / `history`, plus an email report per run
   that doubles as a dead-man's-switch (no mail means the run did not happen).
 - Preflight validation: a misconfigured service (missing password file, unreachable
   destination, unknown step) is caught before any backup runs, never mid-downtime.
@@ -102,6 +102,11 @@ pwsh src/sequencer.ps1 run -ConfigPath ./config.sample.json -ForceWindow
 Installed (see [Getting started](help/getting-started.md)), the same commands are
 `bseq plan`, `bseq validate`, `bseq run`, `bseq history`.
 
+Following a run: `bseq status` shows the run in progress (current step and elapsed
+time) or the last run when idle, and flags a run that died mid-step; `bseq show
+<run>` gives the per-service detail of any run (step durations, size, snapshot id),
+picked by `latest`, its full id, or any unique ending of the id (`bseq show 332d`).
+
 
 Documentation
 ----------------------------------------------------------------
@@ -109,6 +114,8 @@ Documentation
 User guides (`help/`):
 
 - [Getting started](help/getting-started.md) — install, configure, run, notify.
+- [Following runs](help/following-runs.md) — `status`, `show`, `history`: what is
+  running, what a run did, and what to do after an interrupted run.
 - [Configuring a service](help/configuring-services.md) — wiring a service to a
   recipe: `script`, `env`, `steps`, archiving, scheduling.
 - [docker-compose-cold recipe](help/recipe-docker-compose-cold.md) — the bundled
@@ -132,7 +139,7 @@ Layout
 
 ```
 src/
-  sequencer.ps1         entry point: plan | validate | run | history | help
+  sequencer.ps1         entry point: plan | validate | run | status | show | history | help
   lib/BackupCommon.psm1 engine (events, projection, locking, planning, run)
   recipes/              reusable step scripts (e.g. docker-compose-cold)
   services/             bespoke per-service step scripts (same contract)

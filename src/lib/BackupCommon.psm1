@@ -964,7 +964,234 @@ function Send-BackupReport {
     return $true
 }
 
+# --- run status / detail (status, show, history) ----------------------------
+
+function Format-Duration {
+    # compact, culture-independent duration: 7.5s, 42s, 5m02s, 1h03m
+    param([double]$Seconds)
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    if ($Seconds -lt 0) { $Seconds = 0 }
+    if ($Seconds -lt 10) { return [string]::Format($inv, '{0:0.#}s', $Seconds) }
+    $s = [long][math]::Round($Seconds)
+    if ($s -lt 60) { return "${s}s" }
+    if ($s -lt 3600) { return [string]::Format($inv, '{0}m{1:00}s', [math]::Floor($s / 60), $s % 60) }
+    return [string]::Format($inv, '{0}h{1:00}m', [math]::Floor($s / 3600), [math]::Floor(($s % 3600) / 60))
+}
+
+function Format-Size {
+    # compact, culture-independent byte size: 812 KB, 7.2 MB, 52.4 GB
+    param([double]$Bytes)
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    if ($Bytes -ge 1GB) { return [string]::Format($inv, '{0:0.0} GB', $Bytes / 1GB) }
+    if ($Bytes -ge 1MB) { return [string]::Format($inv, '{0:0.0} MB', $Bytes / 1MB) }
+    return [string]::Format($inv, '{0:0} KB', $Bytes / 1KB)
+}
+
+function Format-EventTime {
+    # ISO 8601 with offset, independent of the pwsh culture (events parse to [datetime])
+    param($Ts)
+    if ($null -eq $Ts -or "$Ts" -eq '') { return '?' }
+    try { return ([datetime]$Ts).ToString('yyyy-MM-ddTHH:mm:sszzz') } catch { return [string]$Ts }
+}
+
+function Get-LockHolder {
+    # pid of the live process holding the sequencer lock, or $null (no lock / stale lock)
+    param([string]$LockPath)
+    if (-not $LockPath -or -not (Test-Path -LiteralPath $LockPath)) { return $null }
+    $lockPid = Get-Content -LiteralPath $LockPath -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ("$lockPid" -match '^\d+$' -and (Get-Process -Id ([int]$lockPid) -ErrorAction SilentlyContinue)) {
+        return [int]$lockPid
+    }
+    return $null
+}
+
+function Get-RunStates {
+    # Every run in the log, oldest first, with its state:
+    #   finished    - run.end recorded
+    #   running     - the newest unfinished run, while a live process holds the lock
+    #   interrupted - unfinished and nobody holds the lock (crash, kill, reboot)
+    param(
+        [object[]]$Events = @(),
+        [string]$LockPath
+    )
+    $starts = @($Events | Where-Object { $_.type -eq 'run.start' })
+    $ends = @{}
+    foreach ($e in @($Events | Where-Object { $_.type -eq 'run.end' })) { $ends[[string]$e.runId] = $e }
+    $holder = Get-LockHolder -LockPath $LockPath
+    $out = @()
+    for ($i = 0; $i -lt $starts.Count; $i++) {
+        $s = $starts[$i]
+        $id = [string]$s.runId
+        $end = if ($ends.ContainsKey($id)) { $ends[$id] } else { $null }
+        $state = if ($end) { 'finished' } elseif ($i -eq $starts.Count - 1 -and $holder) { 'running' } else { 'interrupted' }
+        $out += [pscustomobject]@{
+            RunId   = $id
+            Start   = $s.ts
+            End     = if ($end) { $end.ts } else { $null }
+            State   = $state
+            Pid     = if ($state -eq 'running') { $holder } else { $null }
+            Summary = if ($end -and (Test-HasProp $end 'summary')) { $end.summary } else { $null }
+        }
+    }
+    return $out
+}
+
+function Resolve-RunRef {
+    # Pick one run by reference: 'latest' (or empty), a full run id, or any unique
+    # ending of one (e.g. '332d'). Throws when nothing or several runs match.
+    param(
+        [object[]]$Runs = @(),
+        [string]$Ref
+    )
+    if ($Runs.Count -eq 0) { throw 'no runs recorded yet' }
+    if (-not $Ref -or $Ref -eq 'latest') { return $Runs[-1] }
+    $exact = @($Runs | Where-Object { $_.RunId -eq $Ref })
+    if ($exact.Count -eq 1) { return $exact[0] }
+    $hits = @($Runs | Where-Object { $_.RunId.EndsWith($Ref, [System.StringComparison]::OrdinalIgnoreCase) })
+    if ($hits.Count -eq 1) { return $hits[0] }
+    if ($hits.Count -eq 0) { throw "no run matches '$Ref'" }
+    throw "'$Ref' matches several runs: $(($hits | ForEach-Object { $_.RunId }) -join ', ')"
+}
+
+function Get-RunDetail {
+    # Per-service view of one run, folded from its events: steps with durations, the
+    # step in progress (or the one a dead run stopped in), outcome, size, archive id.
+    param(
+        [object[]]$Events = @(),
+        [Parameter(Mandatory)]$Run
+    )
+    $runEvents = @($Events | Where-Object { (Test-HasProp $_ 'runId') -and [string]$_.runId -eq $Run.RunId })
+    $order = @()
+    $planEvent = $runEvents | Where-Object { $_.type -eq 'run.plan' } | Select-Object -First 1
+    if ($planEvent -and (Test-HasProp $planEvent 'plan')) { $order = @($planEvent.plan | ForEach-Object { [string]$_ }) }
+
+    $services = [ordered]@{}
+    $get = {
+        param($name)
+        if (-not $services.Contains($name)) {
+            $services[$name] = [pscustomobject]@{
+                Service = $name; Steps = [System.Collections.Generic.List[object]]::new(); Open = $null
+                Status = $null; Reason = $null; Problems = @(); Error = $null; Bytes = $null
+                Snapshot = $null; Tier = $null; SyncFail = $null
+            }
+        }
+        $services[$name]
+    }
+    foreach ($name in $order) { $null = & $get $name }
+
+    foreach ($e in $runEvents) {
+        if (-not (Test-HasProp $e 'svc')) { continue }
+        $svc = & $get ([string]$e.svc)
+        switch ($e.type) {
+            'step.start' { $svc.Open = [pscustomobject]@{ Step = [string]$e.step; Start = $e.ts } }
+            'step.end' {
+                $svc.Steps.Add([pscustomobject]@{ Step = [string]$e.step; Status = [string]$e.status; DurationSec = [double]$e.durationSec })
+                $svc.Open = $null
+            }
+            'service.skip' { $svc.Status = 'skipped'; $svc.Reason = [string]$e.reason }
+            'service.archived' {
+                if (Test-HasProp $e 'snapshot') { $svc.Snapshot = [string]$e.snapshot }
+                if (Test-HasProp $e 'tier') { $svc.Tier = [string]$e.tier }
+            }
+            'service.syncfail' { $svc.SyncFail = if (Test-HasProp $e 'reason') { [string]$e.reason } else { 'see events.jsonl' } }
+            'service.end' {
+                $svc.Status = [string]$e.status
+                if (Test-HasProp $e 'bytes') { $svc.Bytes = [double]$e.bytes }
+                if (Test-HasProp $e 'reason') { $svc.Reason = [string]$e.reason }
+                if (Test-HasProp $e 'problems') { $svc.Problems = @($e.problems) }
+                if (Test-HasProp $e 'error') { $svc.Error = [string]$e.error }
+            }
+        }
+    }
+    return [pscustomobject]@{ Run = $Run; Services = @($services.Values) }
+}
+
+function Format-RunDetail {
+    # Render Get-RunDetail as text lines (status / show). $Now drives elapsed times.
+    param(
+        [Parameter(Mandatory)]$Detail,
+        [datetime]$Now = (Get-Date),
+        [string]$Prefix = ''
+    )
+    $run = $Detail.Run
+    $since = { param($ts) Format-Duration (($Now - [datetime]$ts).TotalSeconds) }
+    $lines = @()
+    switch ($run.State) {
+        'running' {
+            $lines += ("{0}RUNNING  run {1}  since {2} ({3})  pid {4}" -f $Prefix, $run.RunId, (Format-EventTime $run.Start), (& $since $run.Start), $run.Pid)
+        }
+        'interrupted' {
+            $lines += ("{0}INTERRUPTED  run {1}  started {2}; no end recorded and no process holds the lock" -f $Prefix, $run.RunId, (Format-EventTime $run.Start))
+        }
+        default {
+            $dur = Format-Duration (([datetime]$run.End - [datetime]$run.Start).TotalSeconds)
+            $sum = if ($run.Summary) { "  ok={0} failed={1} planned={2}" -f $run.Summary.ok, $run.Summary.failed, $run.Summary.planned } else { '' }
+            $lines += ("{0}run {1}  {2} -> {3} ({4}){5}" -f $Prefix, $run.RunId, (Format-EventTime $run.Start), (Format-EventTime $run.End), $dur, $sum)
+        }
+    }
+
+    foreach ($s in $Detail.Services) {
+        $steps = (@($s.Steps | ForEach-Object {
+                    $mark = if ($_.Status -eq 'ok') { '' } else { ' ' + $_.Status.ToUpper() }
+                    "{0}{1} {2}" -f $_.Step, $mark, (Format-Duration $_.DurationSec)
+                }) -join ', ')
+        $size = if ($null -ne $s.Bytes -and $s.Bytes -gt 0) { Format-Size $s.Bytes } else { '' }
+        $archive = if ($s.Snapshot) { 'snap ' + $s.Snapshot.Substring(0, [math]::Min(8, $s.Snapshot.Length)) } elseif ($s.Tier) { $s.Tier } else { '' }
+        $note = $null
+
+        if ($s.Open) {
+            if ($run.State -eq 'running') {
+                $status = "> $($s.Open.Step) ($(& $since $s.Open.Start))"
+            }
+            else {
+                $status = "! died in $($s.Open.Step)"
+                $note = 'check this service: a backup stopped mid-step may have left it down'
+            }
+        }
+        elseif ($s.Status -eq 'skipped') { $status = "skipped ($($s.Reason))" }
+        elseif ($s.Status -eq 'fail' -and $s.Reason -eq 'invalid') { $status = 'INVALID' }
+        elseif ($s.Status -eq 'fail') { $status = 'FAIL' }
+        elseif ($s.Status) { $status = $s.Status }
+        elseif ($run.State -eq 'running') { $status = 'pending' }
+        else { $status = 'not reached' }
+
+        $lines += ("  {0,-22} {1,-20} {2,9}  {3,-14} {4}" -f $s.Service, $status, $size, $archive, $steps).TrimEnd()
+        foreach ($p in $s.Problems) { $lines += "      - $p" }
+        if ($s.Error) { $lines += "      ! $($s.Error)" }
+        if ($s.SyncFail) { $lines += "      ! archive failed: $($s.SyncFail)" }
+        if ($note) { $lines += "      ! $note" }
+    }
+    if ($Detail.Services.Count -eq 0) { $lines += '  (no services)' }
+    return $lines
+}
+
+function Format-RunHistoryLine {
+    # One history line per run: finished runs as before, plus RUNNING / INTERRUPTED.
+    param(
+        [Parameter(Mandatory)]$Detail,
+        [datetime]$Now = (Get-Date)
+    )
+    $run = $Detail.Run
+    $svcs = @($Detail.Services | ForEach-Object {
+            if ($_.Open) { "{0}:{1}..." -f $_.Service, $_.Open.Step }
+            elseif ($_.Status) { "{0}:{1}" -f $_.Service, $(if ($_.Status -eq 'skipped') { $_.Reason } else { $_.Status }) }
+        } | Where-Object { $_ })
+    $svcStr = if ($svcs.Count) { $svcs -join ' ' } else { '(nothing run)' }
+    switch ($run.State) {
+        'running' {
+            return ("{0}  {1}  RUNNING ({2})  [{3}]" -f (Format-EventTime $run.Start), $run.RunId, (Format-Duration (($Now - [datetime]$run.Start).TotalSeconds)), $svcStr)
+        }
+        'interrupted' { return ("{0}  {1}  INTERRUPTED  [{2}]" -f (Format-EventTime $run.Start), $run.RunId, $svcStr) }
+        default {
+            $sum = $run.Summary
+            return ("{0}  {1}  ok={2} failed={3} planned={4}  [{5}]" -f (Format-EventTime $run.End), $run.RunId, $sum.ok, $sum.failed, $sum.planned, $svcStr)
+        }
+    }
+}
+
 Export-ModuleMember -Function `
+    Format-Duration, Format-Size, Format-EventTime, Get-LockHolder, Get-RunStates, Resolve-RunRef, `
+    Get-RunDetail, Format-RunDetail, Format-RunHistoryLine, `
     New-RunId, Get-NowIso, Add-BackupEvent, Get-BackupEvents, Test-HasProp, `
     Get-ServiceProjection, Get-EstimatedServiceSeconds, Enter-SequencerLock, Exit-SequencerLock, `
     Test-WithinWindow, Get-WindowLengthSeconds, Get-SecondsUntilClose, `

@@ -10,7 +10,9 @@
   JSON config and implemented by step scripts (recipes or bespoke). See docs/ for
   internals and help/ for usage.
 .PARAMETER Command
-  plan | validate | run | history | help
+  plan | validate | run | status | show | history | help
+.PARAMETER RunRef
+  show: which run(s) - 'latest' (default), run ids, or any unique ending of one.
 .PARAMETER ConfigPath
   Path to config.json. Defaults to the OS config dir (see help/).
 .PARAMETER ForceWindow
@@ -23,11 +25,14 @@
   pwsh sequencer.ps1 plan
 .EXAMPLE
   pwsh sequencer.ps1 run -ConfigPath ./config.json -ForceWindow -ForceAllJobs
+.EXAMPLE
+  pwsh sequencer.ps1 show 332d
 #>
 
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)][string]$Command = 'help',
+    [Parameter(Position = 1, ValueFromRemainingArguments = $true)][string[]]$RunRef,
     [string]$ConfigPath,
     [switch]$ForceWindow,
     [switch]$ForceAllJobs,
@@ -74,13 +79,15 @@ function Show-Usage {
 backup sequencer
 
 Usage:
-  pwsh sequencer.ps1 <command> [-ConfigPath <path>] [-ForceWindow] [-ForceAllJobs] [-Limit <n>]
+  pwsh sequencer.ps1 <command> [<run>...] [-ConfigPath <path>] [-ForceWindow] [-ForceAllJobs] [-Limit <n>]
 
 Commands:
   plan      Show the ordered plan for the current window (no side effects)
   validate  Check each service's config and prerequisites; run nothing (exit 1 if any invalid)
   run       Execute the plan
-  history   Show recent run summaries (newest first)
+  status    The run in progress (step, elapsed), or the last run if idle
+  show      Detail of runs: show [latest | <run id> | <unique end of id>]...
+  history   Show recent run summaries (newest first, incl. running/interrupted)
   help      This message
 
 Config resolution (unless -ConfigPath is given):
@@ -113,6 +120,13 @@ $Paths = @{
     EventsPath = Join-Path $VarDir 'events.jsonl'
     LockPath   = Join-Path $VarDir 'sequencer.lock'
     SpoolRoot  = $SpoolRoot
+}
+
+# only 'show' takes positional arguments; anywhere else they're a typo (e.g. a
+# misspelled switch), so refuse rather than silently ignore them
+if ($RunRef -and $Command -ne 'show') {
+    Write-Host "Unexpected argument(s) for '$Command': $($RunRef -join ' ')"
+    exit 2
 }
 
 switch ($Command) {
@@ -167,17 +181,37 @@ switch ($Command) {
             exit 1
         }
     }
+    'status' {
+        $events = @(Get-BackupEvents -EventsPath $Paths.EventsPath)
+        $runs = @(Get-RunStates -Events $events -LockPath $Paths.LockPath)
+        if ($runs.Count -eq 0) { Write-Host 'idle  no runs recorded yet'; return }
+        $current = $runs[-1]
+        $prefix = if ($current.State -eq 'finished') { 'idle  last ' } else { '' }
+        Format-RunDetail -Detail (Get-RunDetail -Events $events -Run $current) -Prefix $prefix | ForEach-Object { Write-Host $_ }
+        # an older dead run is worth a mention even when the newest one is fine
+        foreach ($r in @($runs | Select-Object -SkipLast 1 | Where-Object { $_.State -eq 'interrupted' } | Select-Object -Last 3)) {
+            Write-Host ("note: run {0} ({1}) was interrupted - bseq show {0}" -f $r.RunId, (Format-EventTime $r.Start))
+        }
+    }
+    'show' {
+        $events = @(Get-BackupEvents -EventsPath $Paths.EventsPath)
+        $runs = @(Get-RunStates -Events $events -LockPath $Paths.LockPath)
+        $refs = if ($RunRef) { @($RunRef) } else { @('latest') }
+        $failed = $false
+        for ($i = 0; $i -lt $refs.Count; $i++) {
+            if ($i -gt 0) { Write-Host '' }
+            try { $run = Resolve-RunRef -Runs $runs -Ref $refs[$i] }
+            catch { Write-Host $_.Exception.Message; $failed = $true; continue }
+            Format-RunDetail -Detail (Get-RunDetail -Events $events -Run $run) | ForEach-Object { Write-Host $_ }
+        }
+        if ($failed) { exit 1 }
+    }
     'history' {
-        $events = Get-BackupEvents -EventsPath $Paths.EventsPath
-        $runEnds = @($events | Where-Object { $_.type -eq 'run.end' })
-        $recent = @($runEnds | Select-Object -Last $Limit)
-        [array]::Reverse($recent)
-        foreach ($r in $recent) {
-            $svcs = @($events |
-                    Where-Object { $_.type -eq 'service.end' -and (Test-HasProp $_ 'runId') -and $_.runId -eq $r.runId } |
-                    ForEach-Object { "{0}:{1}" -f $_.svc, $_.status })
-            $svcStr = if ($svcs.Count) { $svcs -join ' ' } else { '(nothing run)' }
-            Write-Host ("{0}  ok={1} failed={2} planned={3}  [{4}]" -f (Format-DisplayTime $r.ts), $r.summary.ok, $r.summary.failed, $r.summary.planned, $svcStr)
+        $events = @(Get-BackupEvents -EventsPath $Paths.EventsPath)
+        $runs = @(Get-RunStates -Events $events -LockPath $Paths.LockPath | Select-Object -Last $Limit)
+        [array]::Reverse($runs)
+        foreach ($r in $runs) {
+            Write-Host (Format-RunHistoryLine -Detail (Get-RunDetail -Events $events -Run $r))
         }
     }
     default {

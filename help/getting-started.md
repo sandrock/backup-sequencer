@@ -113,8 +113,10 @@ bseq plan                      # show the plan, no side effects
 bseq validate                  # check config + prerequisites, run nothing (exit 1 if invalid)
 bseq run                       # execute (respects the window + fluid scheduling)
 bseq run -ForceWindow          # run even outside the window
-bseq run -ForceWindow -ForceAllJobs   # run everything now, ignore window + fit check
-bseq history                   # recent runs, newest first
+bseq run -ForceWindow -ForceAllJobs   # run everything now, ignore window, fit and coverage
+bseq status                    # the run in progress (service, step, elapsed), or the last one
+bseq show <run>...             # per-service detail of runs (id, or any unique ending of it)
+bseq history                   # recent runs with their ids, newest first
 ```
 
 The plan is ordered by a score (most overdue first); within a window the run packs
@@ -122,6 +124,9 @@ what fits and defers the rest to a later run — see
 [the scheduling model](../docs/scheduling.md).
 
 Without installing (from a checkout), use `pwsh src/sequencer.ps1 <command>` instead.
+
+To follow a run while it works, or to dig into a past one, see
+[Following runs](following-runs.md).
 
 
 Schedule
