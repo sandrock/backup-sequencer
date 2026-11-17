@@ -196,7 +196,7 @@ switch ($Command) {
     'show' {
         $events = @(Get-BackupEvents -EventsPath $Paths.EventsPath)
         $runs = @(Get-RunStates -Events $events -LockPath $Paths.LockPath)
-        $refs = if ($RunRef) { @($RunRef) } else { @('latest') }
+        $refs = @(if ($RunRef) { $RunRef } else { 'latest' })   # @() outside: an if-expression unrolls a 1-item array
         $failed = $false
         for ($i = 0; $i -lt $refs.Count; $i++) {
             if ($i -gt 0) { Write-Host '' }
