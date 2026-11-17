@@ -18,6 +18,9 @@
     DCC_COMPOSE_ARCHIVE_NAME compose tar name   (default: '<service>_compose.tar')
     DCC_DATA_ARCHIVE_NAME    data tar name; legacy DCC_ARCHIVE_NAME accepted
                              (default: '<service>_data.tar')
+    DCC_HOT_DIRS             dir(s) copied by the 'hot-dump' step while the service
+                             runs; ';'-separated. Left out of the cold tars.  (optional)
+    DCC_HOT_ARCHIVE_NAME     hot tar name       (default: '<service>_hot.tar')
   The dump step writes two uncompressed tars into $ctx.OutDir: a compose archive
   (the compose dir, automatically excluding any DCC_DATA_DIRS that live inside it,
   plus DCC_COMPOSE_EXCLUDES) and a data archive (all DCC_DATA_DIRS, each stored
@@ -27,6 +30,14 @@
   Restart policy: 'start' only brings the service back up if it was running when
   'stop' ran (tracked in $ctx.State.WasRunning). A service already down at backup
   time stays down.
+
+  Hot dirs: when the config lists a 'hot-dump' step, the DCC_HOT_DIRS are left out
+  of the cold tars and archived by 'hot-dump' instead, without stopping the service
+  (for large write-once data such as build artifacts). A hot dir keeps the path it
+  would have had in the cold tar (relative to its data dir's or the compose dir's
+  parent), so extracting every tar into the same place restores the full tree.
+  Recommended order: stop, dump, start, hot-dump — the cold state is captured
+  first, so the hot copy is a superset of what it references.
 #>
 
 param($Recipe)
@@ -34,6 +45,47 @@ param($Recipe)
 if ($null -eq $Recipe) {
     Write-Host 'This is a sequencer recipe; it is loaded by the engine, not run directly.'
     return
+}
+
+# Shared by the steps and the validate block (functions defined here would be out of
+# scope when the engine later invokes a step). Maps each DCC_HOT_DIRS entry to where
+# it sits in the cold layout: Root (tar -C) + Member (path inside the tar), and which
+# cold tar it must be excluded from ('data', 'compose', or $null when standalone).
+$Recipe.State['DccHotPlan'] = {
+    param($ctx)
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    $split = { param($s) @($s.Split(';', [System.StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+    $full = { param($p) [System.IO.Path]::GetFullPath($p).TrimEnd($sep) }
+
+    $dataDirs = & $split $ctx.EnvValue('DCC_DATA_DIRS', $ctx.EnvValue('DCC_DATA_DIR', ''))
+    $composeDir = $ctx.EnvValue('DCC_COMPOSE_DIR', '')
+    $plan = @()
+    foreach ($h in (& $split $ctx.EnvValue('DCC_HOT_DIRS', ''))) {
+        $hFull = & $full $h
+        $entry = $null
+        foreach ($d in $dataDirs) {
+            $dFull = & $full $d
+            if ($hFull -eq $dFull -or $hFull.StartsWith($dFull + $sep, [System.StringComparison]::Ordinal)) {
+                $rel = $hFull.Substring($dFull.Length).TrimStart($sep) -replace '\\', '/'
+                $member = Split-Path -Leaf $dFull
+                if ($rel) { $member = "$member/$rel" }
+                $entry = @{ Path = $hFull; Root = (Split-Path -Parent $dFull); Member = $member; ExcludeFrom = 'data' }
+                break
+            }
+        }
+        if ($null -eq $entry -and $composeDir) {
+            $cFull = & $full $composeDir
+            if ($hFull.StartsWith($cFull + $sep, [System.StringComparison]::Ordinal)) {
+                $rel = $hFull.Substring($cFull.Length).TrimStart($sep) -replace '\\', '/'
+                $entry = @{ Path = $hFull; Root = (Split-Path -Parent $cFull); Member = "$(Split-Path -Leaf $cFull)/$rel"; ExcludeFrom = 'compose' }
+            }
+        }
+        if ($null -eq $entry) {
+            $entry = @{ Path = $hFull; Root = (Split-Path -Parent $hFull); Member = (Split-Path -Leaf $hFull); ExcludeFrom = $null }
+        }
+        $plan += $entry
+    }
+    return $plan   # unrolled; callers wrap in @()
 }
 
 $Recipe.AddStep('stop', {
@@ -74,6 +126,11 @@ $Recipe.AddStep('dump', {
 
     $sep = [System.IO.Path]::DirectorySeparatorChar
 
+    # hot dirs go to the 'hot-dump' tar instead — only when that step is configured,
+    # so a hot dir is never silently dropped from every archive
+    $hotPlan = @()
+    if ($ctx.ConfiguredSteps -contains 'hot-dump') { $hotPlan = @(& $ctx.State['DccHotPlan'] $ctx) }
+
     # --- compose archive: the compose dir, minus any data dir inside it, minus configured excludes ---
     $composeDir = $ctx.RequireEnv('DCC_COMPOSE_DIR')
     $composeName = $ctx.EnvValue('DCC_COMPOSE_ARCHIVE_NAME', "$($ctx.Service)_compose.tar")
@@ -96,6 +153,13 @@ $Recipe.AddStep('dump', {
     }
     $composeArgs = @('-C', $composeParent)
     foreach ($e in $excludes) { $composeArgs += "--exclude=$e" }
+    # hot-dir excludes are anchored (exact member path), unlike the ones above;
+    # GNU tar applies --anchored to the --exclude options that follow it
+    $hotCompose = @($hotPlan | Where-Object { $_.ExcludeFrom -eq 'compose' })
+    if ($hotCompose.Count -gt 0) {
+        $composeArgs += '--anchored'
+        foreach ($hp in $hotCompose) { $composeArgs += "--exclude=$($hp.Member)" }
+    }
     $composeArgs += @('-cf', $composeOut, $composeLeaf)
     & tar @composeArgs
     if ($LASTEXITCODE -ne 0) { throw "tar of compose dir '$composeDir' failed (exit $LASTEXITCODE)" }
@@ -105,12 +169,39 @@ $Recipe.AddStep('dump', {
     # --- data archive: all data dirs in one tar, each under its leaf (multi-volume via repeated -C) ---
     $dataName = $ctx.EnvValue('DCC_DATA_ARCHIVE_NAME', $ctx.EnvValue('DCC_ARCHIVE_NAME', "$($ctx.Service)_data.tar"))
     $dataOut = Join-Path $ctx.OutDir $dataName
-    $dataArgs = @('-cf', $dataOut)
+    $dataArgs = @()
+    $hotData = @($hotPlan | Where-Object { $_.ExcludeFrom -eq 'data' })
+    if ($hotData.Count -gt 0) {
+        $dataArgs += '--anchored'
+        foreach ($hp in $hotData) { $dataArgs += "--exclude=$($hp.Member)" }
+    }
+    $dataArgs += @('-cf', $dataOut)
     foreach ($d in $dataDirs) { $dataArgs += @('-C', (Split-Path -Parent $d), (Split-Path -Leaf $d)) }
     & tar @dataArgs
     if ($LASTEXITCODE -ne 0) { throw "tar of data dirs failed (exit $LASTEXITCODE)" }
     # manifest (later TODO):
     # $ctx.AddArtifact(@{ name = $dataName; role = 'data'; command = "tar $($dataArgs -join ' ')"; cwd = $ctx.OutDir })
+})
+
+# hot-dump: archive DCC_HOT_DIRS while the service runs (no stop). Files may change
+# under tar: GNU tar exit 1 ("file changed as we read it") is expected here and only
+# warned about; exit >= 2 is a real error.
+$Recipe.AddStep('hot-dump', {
+    param($ctx)
+    $plan = @(& $ctx.State['DccHotPlan'] $ctx)
+    if ($plan.Count -eq 0) { throw "'hot-dump' step configured but DCC_HOT_DIRS is empty" }
+    New-Item -ItemType Directory -Force -Path $ctx.OutDir | Out-Null
+
+    $hotName = $ctx.EnvValue('DCC_HOT_ARCHIVE_NAME', "$($ctx.Service)_hot.tar")
+    $hotArgs = @('-cf', (Join-Path $ctx.OutDir $hotName))
+    foreach ($hp in $plan) { $hotArgs += @('-C', $hp.Root, $hp.Member) }
+    & tar @hotArgs
+    if ($LASTEXITCODE -eq 1) {
+        Write-Warning "$($ctx.Service) hot-dump: some files changed while being read (expected for a live copy)"
+    }
+    elseif ($LASTEXITCODE -ne 0) {
+        throw "tar of hot dirs failed (exit $LASTEXITCODE)"
+    }
 })
 
 # preflight (before any downtime): the compose dir, every data dir, and the compose
@@ -140,6 +231,21 @@ $Recipe.SetValidate({
     $composeCmd = $ctx.EnvValue('DCC_COMPOSE_CMD', 'docker compose')
     $exe = $composeCmd.Split(' ', [System.StringSplitOptions]::RemoveEmptyEntries)[0]
     if (-not (Get-Command $exe -ErrorAction SilentlyContinue)) { $problems += "compose command not found: $exe" }
+
+    # hot dirs and the 'hot-dump' step go together: without the step the hot dirs fall
+    # back into the cold tars (longer downtime than intended); the step without hot
+    # dirs has nothing to do
+    $hotPlan = @(& $ctx.State['DccHotPlan'] $ctx)
+    $hasHotStep = $ctx.ConfiguredSteps -contains 'hot-dump'
+    if ($hotPlan.Count -gt 0 -and -not $hasHotStep) {
+        $problems += "DCC_HOT_DIRS set but no 'hot-dump' step configured (they would be copied cold, with the service down)"
+    }
+    if ($hasHotStep -and $hotPlan.Count -eq 0) {
+        $problems += "'hot-dump' step configured but DCC_HOT_DIRS is empty"
+    }
+    foreach ($hp in $hotPlan) {
+        if (-not (Test-Path -LiteralPath $hp.Path -PathType Container)) { $problems += "hot dir missing: $($hp.Path)" }
+    }
     return $problems
 })
 

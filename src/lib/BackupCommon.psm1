@@ -15,6 +15,7 @@ class RecipeContext {
     [datetime]  $Now          # reference time (run start, or plan time for the overdue query)
     [hashtable] $State = @{}   # shared across this recipe's steps (e.g. WasRunning)
     [hashtable] $Steps = @{}   # step name -> scriptblock(param($ctx))
+    [string[]]  $ConfiguredSteps = @()  # step names the service config lists (run order); lets a recipe adapt/validate
     [scriptblock] $OverdueBlock # optional: archiver's plan-time overdue query (param($ctx) -> double)
     [scriptblock] $ValidateBlock # optional: preflight prereq check (param($ctx) -> string[] of problems)
 
@@ -362,6 +363,14 @@ function Get-ServiceOverdue {
     try { return [double](& $arc.OverdueBlock $arc) } catch { return $null }
 }
 
+function Get-ConfiguredStepNames {
+    # the step names a service config lists, in order (empty when none)
+    param($Service)
+    $steps = Get-PropOrNull $Service 'steps'
+    if ($null -eq $steps) { return @() }
+    return @($steps | ForEach-Object { [string]$_.name })
+}
+
 function Get-ServiceValidationProblems {
     # Preflight a service: load its backup recipe and archiver (registration only),
     # run structural checks + each recipe's ValidateBlock, and return the combined
@@ -393,6 +402,7 @@ function Get-ServiceValidationProblems {
             $rc.Now = $At
             # scope chain for the backup recipe: global config.env <- service.env
             $rc.Env = Get-ScopedEnv -Sources @((Get-PropOrNull $Config 'env'), (Get-PropOrNull $svc 'env'))
+            $rc.ConfiguredSteps = Get-ConfiguredStepNames $svc
             $loaded = $true
             try { & $scriptPath -Recipe $rc | Out-Null }   # registration only
             catch { $problems += "recipe failed to load: $($_.Exception.Message)"; $loaded = $false }
@@ -709,6 +719,7 @@ function Invoke-BackupRun {
             $rc.Env = Get-ScopedEnv -Sources @((Get-PropOrNull $Config 'env'), (Get-PropOrNull $svc 'env'))
             $rc.EventsPath = $Paths.EventsPath
             $rc.RunId = $runId
+            $rc.ConfiguredSteps = Get-ConfiguredStepNames $svc
             & $scriptPath -Recipe $rc | Out-Null   # registration only; don't let output taint the run
 
             $failed = $false

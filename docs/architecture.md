@@ -51,6 +51,10 @@ The context carries everything a step needs:
   `start` only restarts what `stop` took down).
 - `$ctx.EventsPath` / `$ctx.ReadEvents()` — read-only access to the event log, for
   archivers that route / prune / compute coverage from it.
+- `$ctx.ConfiguredSteps` — the step names the service config lists, in run order
+  (backup recipe only). Lets a step adapt to its siblings and a validate block check
+  that steps meant to go together are configured together (e.g. `dump` leaves hot
+  dirs out only when `hot-dump` is listed).
 
 An archiver recipe additionally registers `SetOverdue` (its plan-time coverage
 query) and returns its result (tier / path / snapshot, pruned paths) via

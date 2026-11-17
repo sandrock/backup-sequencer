@@ -295,6 +295,43 @@ Describe 'preflight validation' {
         (Get-ServiceValidationProblems -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev) -join "`n" | Should -Match 'archiver script not found'
     }
 
+    Context 'docker-compose-cold hot dirs' {
+        BeforeEach {
+            $script:hb = Join-Path $Work "hval-$n"
+            $script:hc = Join-Path $hb 'app'
+            $script:hd = Join-Path $hb 'data'
+            New-Item -ItemType Directory -Force -Path $hc, (Join-Path $hd 'artifacts') | Out-Null
+            $script:mkCfg = {
+                param($hotDirs, $steps)
+                $o = [ordered]@{ window = @{ open = '00:00'; close = '23:59' }; services = @{ app = [ordered]@{
+                    enabled = $true; script = '../src/recipes/docker-compose-cold.ps1'
+                    env = @{ DCC_COMPOSE_DIR = $hc; DCC_DATA_DIRS = $hd; DCC_HOT_DIRS = $hotDirs; DCC_COMPOSE_CMD = 'tar' }
+                    steps = @($steps | ForEach-Object { @{ name = $_ } }) } } }
+                $o | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+            }
+        }
+
+        It 'accepts hot dirs together with a hot-dump step' {
+            $cfg = & $mkCfg (Join-Path $hd 'artifacts') @('stop', 'dump', 'start', 'hot-dump')
+            (Get-ServiceValidationProblems -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev) | Should -BeNullOrEmpty
+        }
+
+        It 'flags hot dirs without a hot-dump step' {
+            $cfg = & $mkCfg (Join-Path $hd 'artifacts') @('stop', 'dump', 'start')
+            (Get-ServiceValidationProblems -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev) -join "`n" | Should -Match "no 'hot-dump' step"
+        }
+
+        It 'flags a hot-dump step without hot dirs' {
+            $cfg = & $mkCfg '' @('stop', 'dump', 'start', 'hot-dump')
+            (Get-ServiceValidationProblems -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev) -join "`n" | Should -Match 'DCC_HOT_DIRS is empty'
+        }
+
+        It 'flags a missing hot dir' {
+            $cfg = & $mkCfg (Join-Path $hd 'nope') @('stop', 'dump', 'start', 'hot-dump')
+            (Get-ServiceValidationProblems -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev) -join "`n" | Should -Match 'hot dir missing'
+        }
+    }
+
     It 'reports a recipe that throws at registration instead of crashing' {
         $cfg = @'
 { "window": { "open": "00:00", "close": "23:59" },
@@ -687,6 +724,78 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         $dl = (& tar -tf (Join-Path $set 'app_data.tar')) -join "`n"
         $dl | Should -Match 'data/db.sqlite'
         $dl | Should -Match 'app-extra/blob.bin'
+    }
+
+    It 'docker-compose-cold hot-dump archives hot dirs live and keeps them out of the cold tars' {
+        $base = Join-Path $Work "hsvc-$n"
+        $composeDir = Join-Path $base 'app'
+        $hotCompose = Join-Path $composeDir 'hotcfg'            # hot dir inside the compose dir
+        $data = Join-Path (Join-Path $base 'vol') 'data'
+        $hotData = Join-Path $data 'system/artifacts'           # hot dir inside a data dir
+        $caches = Join-Path $data 'system/caches'
+        $other = Join-Path (Join-Path $base 'vol') 'other'
+        $nested = Join-Path $other 'data/system/artifacts'      # same relative name elsewhere: must stay cold
+        $standalone = Join-Path (Join-Path $base 'elsewhere') 'standalone'   # hot dir outside everything
+        foreach ($d in $composeDir, $hotCompose, $hotData, $caches, $nested, $standalone) {
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+        }
+        Set-Content -LiteralPath (Join-Path $composeDir 'docker-compose.yml') -Value 'services: {}'
+        Set-Content -LiteralPath (Join-Path $hotCompose 'x.cfg') -Value 'HOTCFG'
+        Set-Content -LiteralPath (Join-Path $hotData 'a.bin') -Value 'ARTIFACT'
+        Set-Content -LiteralPath (Join-Path $caches 'c.bin') -Value 'CACHE'
+        Set-Content -LiteralPath (Join-Path $nested 'n.bin') -Value 'NESTED'
+        Set-Content -LiteralPath (Join-Path $standalone 's.bin') -Value 'STANDALONE'
+
+        $u = { param($p) $p -replace '\\', '/' }
+        $cfg = (@'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true,
+    "script": "../src/recipes/docker-compose-cold.ps1",
+    "env": { "DCC_COMPOSE_DIR": "__COMPOSE__", "DCC_DATA_DIRS": "__DATA__;__OTHER__",
+             "DCC_HOT_DIRS": "__HOT1__;__HOT2__;__HOT3__", "DCC_COMPOSE_CMD": "tar" },
+    "steps": [ { "name": "dump", "resources": [] }, { "name": "hot-dump", "resources": [] } ] } } }
+'@ -replace '__COMPOSE__', (& $u $composeDir) -replace '__DATA__', (& $u $data) -replace '__OTHER__', (& $u $other) `
+            -replace '__HOT1__', (& $u $hotData) -replace '__HOT2__', (& $u $hotCompose) -replace '__HOT3__', (& $u $standalone)) | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
+
+        $set = Join-Path $root 'ready/app'
+        $cl = (& tar -tf (Join-Path $set 'app_compose.tar')) -join "`n"
+        $dl = (& tar -tf (Join-Path $set 'app_data.tar')) -join "`n"
+        $hl = (& tar -tf (Join-Path $set 'app_hot.tar')) -join "`n"
+
+        $cl | Should -Match 'app/docker-compose.yml'
+        $cl | Should -Not -Match 'app/hotcfg'
+        $dl | Should -Match '(?m)^data/system/caches/c.bin$'
+        $dl | Should -Not -Match '(?m)^data/system/artifacts'
+        $dl | Should -Match '(?m)^other/data/system/artifacts/n.bin$'   # anchored exclude: untouched
+        # hot tar keeps the cold-layout path, so extracting all tars rebuilds the tree
+        $hl | Should -Match '(?m)^data/system/artifacts/a.bin$'
+        $hl | Should -Match '(?m)^app/hotcfg/x.cfg$'
+        $hl | Should -Match '(?m)^standalone/s.bin$'
+    }
+
+    It 'docker-compose-cold keeps hot dirs in the cold tar when no hot-dump step is configured' {
+        $base = Join-Path $Work "hsvc2-$n"
+        $composeDir = Join-Path $base 'app'
+        $data = Join-Path $base 'data'
+        $hot = Join-Path $data 'artifacts'
+        foreach ($d in $composeDir, $hot) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+        Set-Content -LiteralPath (Join-Path $composeDir 'docker-compose.yml') -Value 'services: {}'
+        Set-Content -LiteralPath (Join-Path $hot 'a.bin') -Value 'ARTIFACT'
+        $svc = (@'
+{ "script": "../src/recipes/docker-compose-cold.ps1",
+  "env": { "DCC_COMPOSE_DIR": "__COMPOSE__", "DCC_DATA_DIRS": "__DATA__", "DCC_HOT_DIRS": "__HOT__", "DCC_COMPOSE_CMD": "tar" },
+  "steps": [ { "name": "dump", "resources": [] } ] }
+'@ -replace '__COMPOSE__', ($composeDir -replace '\\', '/') -replace '__DATA__', ($data -replace '\\', '/') -replace '__HOT__', ($hot -replace '\\', '/')) | ConvertFrom-Json
+        # drive the recipe directly: the engine's preflight would (rightly) refuse this config
+        $rc = & (Get-Module BackupCommon) { [RecipeContext]::new() }   # class lives in the module scope
+        $rc.Service = 'app'
+        $rc.OutDir = Join-Path $base 'out'
+        $rc.Env = $svc.env
+        $rc.ConfiguredSteps = @('dump')
+        & (Join-Path $TestsDir $svc.script) -Recipe $rc | Out-Null
+        & $rc.Steps['dump'] $rc
+        ((& tar -tf (Join-Path $rc.OutDir 'app_data.tar')) -join "`n") | Should -Match 'data/artifacts/a.bin'
     }
 
     It 'runs the guaranteed first job but defers a second that will not fit' {

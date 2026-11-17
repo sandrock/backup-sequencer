@@ -19,6 +19,9 @@ Three steps, run while the service is down:
 List the steps you want in the service's `steps` array. Give `start`
 `"alwaysRun": true` so the stack comes back even if `dump` failed.
 
+An optional fourth step, `hot-dump`, archives large write-once dirs while the
+service runs, to shorten the downtime — see [Hot dirs](#hot-dirs-shorter-downtime).
+
 
 What it archives
 ----------------------------------------------------------------
@@ -51,6 +54,8 @@ Set these in the service's `env`:
 | `DCC_COMPOSE_ARCHIVE_NAME` | no | `<service>_compose.tar` | compose tar file name |
 | `DCC_DATA_DIRS` | yes | — | data dir(s) to archive; `;`-separated, may span volumes |
 | `DCC_DATA_ARCHIVE_NAME` | no | `<service>_data.tar` | data tar file name |
+| `DCC_HOT_DIRS` | no | — | dir(s) archived live by the `hot-dump` step instead of the cold tars; `;`-separated (see below) |
+| `DCC_HOT_ARCHIVE_NAME` | no | `<service>_hot.tar` | hot tar file name |
 
 The legacy single-dir `DCC_DATA_DIR` and the old `DCC_ARCHIVE_NAME` are still
 accepted as fallbacks.
@@ -80,6 +85,48 @@ and it rides in the data tar; leave it under the compose dir (and out of
 `DCC_DATA_DIRS`) and it rides in the compose tar.
 
 
+Hot dirs (shorter downtime)
+----------------------------------------------------------------
+
+Some services hold a lot of data that is written once and never modified — build
+artifacts, uploaded packages. Copying it cold makes the downtime as long as the
+copy. List such dirs in `DCC_HOT_DIRS` and add the `hot-dump` step: they are left
+out of the cold tars and archived **while the service runs**, into
+`<service>_hot.tar`.
+
+```json
+"env": {
+  "DCC_COMPOSE_DIR": "/srv/ci",
+  "DCC_DATA_DIRS": "/mnt/vol2/ci/data;/mnt/vol2/ci/pgdata",
+  "DCC_HOT_DIRS": "/mnt/vol2/ci/data/system/artifacts"
+},
+"steps": [
+  { "name": "stop",     "resources": [] },
+  { "name": "dump",     "resources": ["diskA"] },
+  { "name": "start",    "resources": [], "alwaysRun": true },
+  { "name": "hot-dump", "resources": ["diskA"] }
+]
+```
+
+- **Order: put `hot-dump` after `start`.** The cold state (database, config) is
+  captured first and the live copy after it, so everything the database refers to
+  is in the backup — at worst a few files newer than it, which the application
+  ignores or cleans up. Placed before `stop`, a file written between the two copies
+  would be referenced by the database but missing from the backup.
+- **Files changing during the copy are expected.** If tar reports "file changed as
+  we read it", the step logs a warning and succeeds; any other tar error fails it.
+  Only use hot dirs for data that is safe to copy live (write-once files) — never
+  for a database's files.
+- **Same layout as the cold tars.** A hot dir keeps the path it would have had in
+  the cold tar (`data/system/artifacts/…`), so extracting every tar into the same
+  place restores the whole tree.
+- A hot dir may sit inside a data dir, inside the compose dir, or anywhere else.
+- `validate` refuses `DCC_HOT_DIRS` without a `hot-dump` step (the dirs would be
+  copied cold, defeating the purpose) and a `hot-dump` step without `DCC_HOT_DIRS`.
+  If the step is absent anyway, the hot dirs stay in the cold tars — they are never
+  silently dropped.
+
+
 Restoring
 ----------------------------------------------------------------
 
@@ -101,6 +148,14 @@ move each leaf back to its parent:
 tar -C /tmp/restore -xf vaultwarden_data.tar
 mv /tmp/restore/data           /srv/vaultwarden/data
 mv /tmp/restore/vaultwarden-ssl /mnt/vol2/vaultwarden-ssl
+```
+
+A hot tar, if any, uses the same layout as the tar its dirs were left out of —
+extract it into the same place, after that tar:
+
+```sh
+tar -C /mnt/vol2/ci -xf ci_data.tar
+tar -C /mnt/vol2/ci -xf ci_hot.tar               # fills in data/system/artifacts/…
 ```
 
 Then bring it back up:
