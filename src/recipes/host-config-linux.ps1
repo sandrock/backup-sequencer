@@ -189,31 +189,45 @@ $Recipe.AddStep('dump', {
         }
         $cmd = Get-Command $f.Exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
         if (-not $cmd) { $skipped += "$($f.Name): $($f.Exe) not installed"; continue }
-        $outFile = Join-Path $factsDir "$($f.Name).txt"
-        $errFile = Join-Path $factsDir "$($f.Name).stderr"
-        $spArgs = @{ FilePath = $cmd.Source; RedirectStandardOutput = $outFile; RedirectStandardError = $errFile; NoNewWindow = $true; PassThru = $true }
-        if ($f.Args.Count -gt 0) { $spArgs.ArgumentList = $f.Args }
+        # Own Process + ReadToEndAsync, not Start-Process -RedirectStandardOutput: the
+        # latter's event-driven reader can write to its file after pwsh closed it, and
+        # that ObjectDisposedException on a thread-pool thread kills the whole run
+        # (seen on vulcain, 2026-11-17). Task exceptions stay inside the Task.
+        $psi = [System.Diagnostics.ProcessStartInfo]::new($cmd.Source)
+        foreach ($a in $f.Args) { $psi.ArgumentList.Add([string]$a) }
+        $psi.UseShellExecute = $false
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.RedirectStandardInput = $true   # closed below: a command never waits on input
         $status = $null
+        $out = ''
+        $err = ''
+        $p = $null
         try {
-            $p = Start-Process @spArgs
-            $null = $p.Handle   # keep the handle so ExitCode is readable after exit
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $p.StandardInput.Close()
+            $outTask = $p.StandardOutput.ReadToEndAsync()
+            $errTask = $p.StandardError.ReadToEndAsync()
             if ($p.WaitForExit($timeoutMs)) {
-                $p.WaitForExit()   # flush redirected output
+                $p.WaitForExit()
                 if ($p.ExitCode -ne 0) { $status = "exit $($p.ExitCode)" }
             }
             else {
                 try { $p.Kill($true) } catch { }
                 $status = "timed out after $($ctx.State['HclFactTimeoutSec'])s"
             }
+            # pipes close once the process (tree) is gone; don't wait forever on a stray child
+            $null = [System.Threading.Tasks.Task]::WaitAll(@($outTask, $errTask), 5000)
+            if ($outTask.IsCompletedSuccessfully) { $out = $outTask.Result }
+            if ($errTask.IsCompletedSuccessfully) { $err = $errTask.Result }
         }
-        catch { $status = "could not start: $($_.Exception.Message)" }
+        catch { $status = "could not run: $($_.Exception.Message)" }
+        finally { if ($p) { $p.Dispose() } }
         if ($status) {
             $failed += $f.Name
-            $err = ''
-            if (Test-Path -LiteralPath $errFile) { $err = Get-Content -LiteralPath $errFile -Raw }
-            Add-Content -LiteralPath $outFile -Value "`n--- $($f.Exe) $($f.Args -join ' '): $status ---`n$err"
+            $out += "`n--- $($f.Exe) $($f.Args -join ' '): $status ---`n$err"
         }
-        Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+        [System.IO.File]::WriteAllText((Join-Path $factsDir "$($f.Name).txt"), $out)
     }
     if ($skipped.Count -gt 0) { Set-Content -LiteralPath (Join-Path $factsDir '_skipped.txt') -Value $skipped }
     if ($failed.Count -gt 0) {
