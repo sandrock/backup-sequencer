@@ -120,6 +120,8 @@ User guides (`help/`):
   recipe: `script`, `env`, `steps`, archiving, scheduling.
 - [docker-compose-cold recipe](help/recipe-docker-compose-cold.md) — the bundled
   cold-backup recipe and its `DCC_*` parameters.
+- [host-config-linux recipe](help/recipe-host-config-linux.md) — the host's own
+  configuration (`/etc`, crontabs, `/root`) plus rebuild facts; secrets left out.
 - [Archiving](help/archiving.md) — synchronous vs asynchronous archiving,
   `publishToReady`, and the env scope chain. Per-archiver:
   [archive-copy](help/archiving-copy.md) · [archive-gfsy](help/archiving-gfsy.md) ·
@@ -141,7 +143,7 @@ Layout
 src/
   sequencer.ps1         entry point: plan | validate | run | status | show | history | help
   lib/BackupCommon.psm1 engine (events, projection, locking, planning, run)
-  recipes/              reusable step scripts (e.g. docker-compose-cold)
+  recipes/              reusable step scripts (e.g. docker-compose-cold, host-config-linux)
   services/             bespoke per-service step scripts (same contract)
 tests/                  Pester tests + abstract fixtures
 docs/                   design and internals (archiving.md, scheduling.md)
