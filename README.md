@@ -6,6 +6,12 @@ per-service backups inside one nightly window, driven entirely by an append-only
 event log, and stays out of the way of *how* each service is backed up or *where*
 the result is shipped.
 
+> **Note on authorship.** Most of this code, its tests and its documentation were
+> written by an AI assistant (Anthropic's Claude, through Claude Code), directed,
+> reviewed and tested by the maintainer. Each generated file says so on its first
+> line. Read it, test it on your own setup and keep your old backups until you
+> trust it, as you would with any backup tool.
+
 
 Why
 ----------------------------------------------------------------
