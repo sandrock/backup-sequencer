@@ -39,7 +39,7 @@ Choices
 ### One line per event, fixed columns
 
 ```
-runid(4)  [time(8)]  service(18)  step(12)  event(6)  dur(6)  detail
+runid(4)  [time(8)]  service(18)  step(12)  event(6)  status(4)  dur(6)  detail
 ```
 
 Every line is self-contained (requirements 3, 5): the hierarchy run → service →
@@ -76,7 +76,7 @@ line was rejected: 25 characters of mostly repeated text.
 ### End lines carry everything
 
 The end line is the one a reader scans, so it repeats the start time:
-`ok  53m28s  from 23:01:34` (`from 11-18 23:58:11` when the start was another
+`end  ok  53m28s  from 23:01:34` (`from 11-18 23:58:11` when the start was another
 day). With interleaved parallel steps the start line may be far above; the end
 line must be readable alone (requirement 1).
 
@@ -85,28 +85,50 @@ fits the 6-character column. Estimates (`begin`, `plan`) use the coarser
 one-unit `Format-DurationUnit` (`55m`, `1.5h`): they are guesses, precision
 would mislead.
 
-### Event words, uppercase for attention
+### Event and status: two columns
 
-A small fixed vocabulary (`start`, `ok`, `begin`, `skip`, `retry`, `info`,
-`closed`, `end`) in lowercase, and uppercase for what needs a human (`FAIL`,
-`WARN`, `SKIP` for an abnormal skip such as a full spool). Uppercase stands out
-without colour, so it works in the journal and in mail. Words, not symbols:
-`grep FAIL` is obvious, `grep '!'` is not.
+The event says what happens, the status how it went. A first version had one
+column holding both (`start`, then `ok` or `FAIL` instead of `end`): an outcome
+replaced the event, so `FAIL` read as an action name, and once the engine got
+actions of its own (moving into trash, deleting) a `FAIL` line no longer said
+which action failed.
+
+- Events, lowercase, a small fixed vocabulary: `begin`, `end`, `skip`, `retry`,
+  `msg`, `closed`. One pair, `begin` / `end`, for the run, a service and a step
+  alike: the step column (`-` or a name) tells the level. Not `start` / `stop`:
+  those are natural step names (the docker-compose recipe has both), and
+  `start  start` or `stop  end` on one line read as nonsense.
+- Statuses: blank, `ok`, `FAIL`, `WARN`. Uppercase is for what needs a human: it
+  stands out without colour, so it works in the journal and in mail, and
+  `grep -E 'FAIL|WARN'` finds every line to look at. Words, not symbols.
+- An error message in the detail always starts with `! `, after the
+  `from HH:mm:ss` reference on a step end line: the eye finds it at the same
+  place on every failed line.
+
+The event log follows the same rule: an event that closes an action carries
+`status` (`ok` / `fail`) and, when it failed, `error` (one line). `step.end`,
+`service.end` and `run.end` do. Older events with their own shape
+(`service.syncfail` with `reason`) are still read as they are.
+
+The words above are display only: the event log keeps its own types
+(`step.start`, `step.end`, ...), so renaming a run-output word never touches it.
+The log itself is append-only and never rewritten: a field or an event type is
+only ever added, and if a shape has to change, readers accept both forms.
 
 ### Recipe messages are tagged, tool output is not
 
 A step's PowerShell `Write-Warning` / `Write-Information` / `Write-Host` are
-captured by `Invoke-BackupStep` and re-emitted as `WARN` / `info` lines with the
+captured by `Invoke-BackupStep` and re-emitted as `msg` lines (status `WARN` for a warning) with the
 service and step columns. The capture forces those preferences on inside the
 step's own scope, so a caller silencing its streams never makes a step's warnings
 vanish. Other output objects of a step are dropped, as before.
 
 Warnings are also stored on the step's `step.end` event (`warnings`, at most 20,
 500 characters each), so `show` and the email report can list them after the
-fact; `info` lines are narration only and are not stored.
+fact; other `msg` lines are narration only and are not stored.
 
 Native tool output (docker compose, tar) is NOT captured: it goes straight to
-stdout/stderr, untagged, between its step's `start` and `ok` lines. Capturing it
+stdout/stderr, untagged, between its step's `begin` and `end` lines. Capturing it
 (to a per-step file, shown on failure) was considered and deferred — keep it
 simple, see how it reads in practice. What is done: the run sets `NO_COLOR=1`,
 `COMPOSE_ANSI=never` and `COMPOSE_PROGRESS=plain` (restored afterwards), so

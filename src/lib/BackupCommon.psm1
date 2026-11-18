@@ -299,7 +299,7 @@ function Invoke-BackupStep {
             -Props @{ runId = $RunId; svc = $Service; step = $Step; attempt = $attempt }
         $startedAt = Get-Date
         $startDetail = if ($attempt -gt 0) { "attempt $($attempt + 1)/$($Retries + 1)" } else { '' }
-        Write-RunLine -RunId $RunId -Service $Service -Step $Step -Event 'start' -Detail $startDetail
+        Write-RunLine -RunId $RunId -Service $Service -Step $Step -Event 'begin' -Detail $startDetail
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $status = 'ok'
         $errMsg = $null
@@ -312,10 +312,10 @@ function Invoke-BackupStep {
             & { $WarningPreference = 'Continue'; $InformationPreference = 'Continue'; & $Action } 3>&1 6>&1 | ForEach-Object {
                 if ($_ -is [System.Management.Automation.WarningRecord]) {
                     $warnings.Add($_.Message)
-                    Write-RunLine -RunId $RunId -Service $Service -Step $Step -Event 'WARN' -Detail $_.Message
+                    Write-RunLine -RunId $RunId -Service $Service -Step $Step -Event 'msg' -Status 'WARN' -Detail $_.Message
                 }
                 elseif ($_ -is [System.Management.Automation.InformationRecord]) {
-                    Write-RunLine -RunId $RunId -Service $Service -Step $Step -Event 'info' -Detail ([string]$_.MessageData)
+                    Write-RunLine -RunId $RunId -Service $Service -Step $Step -Event 'msg' -Detail ([string]$_.MessageData)
                 }
             }
         }
@@ -325,8 +325,8 @@ function Invoke-BackupStep {
         }
         $sw.Stop()
         $endDetail = 'from ' + (Format-StartRef -Start $startedAt)
-        if ($errMsg) { $endDetail += "  $errMsg" }
-        Write-RunLine -RunId $RunId -Service $Service -Step $Step -Event $(if ($status -eq 'ok') { 'ok' } else { 'FAIL' }) `
+        if ($errMsg) { $endDetail += "  ! $errMsg" }
+        Write-RunLine -RunId $RunId -Service $Service -Step $Step -Event 'end' -Status $(if ($status -eq 'ok') { 'ok' } else { 'FAIL' }) `
             -Seconds $sw.Elapsed.TotalSeconds -Detail $endDetail
         $props = @{
             runId = $RunId; svc = $Service; step = $Step; status = $status
@@ -631,7 +631,7 @@ function Invoke-BackupRun {
     )
     Reset-RunOutput
     if (-not (Enter-SequencerLock -LockPath $Paths.LockPath)) {
-        Write-RunLine -RunId '' -Event 'SKIP' -Detail ("another run is in progress (pid {0}); exiting" -f (Get-LockHolder -LockPath $Paths.LockPath))
+        Write-RunLine -RunId '' -Event 'skip' -Status 'WARN' -Detail ("another run is in progress (pid {0}); exiting" -f (Get-LockHolder -LockPath $Paths.LockPath))
         return
     }
     # ask tools for plain output: no colours, no redrawn progress (one line per change)
@@ -651,7 +651,7 @@ function Invoke-BackupRun {
             -Props @{ runId = $runId; window = "$($Config.window.open)-$($Config.window.close)" }
         $startDetail = "$runId  window $($Config.window.open)-$($Config.window.close)"
         if ($ForceAllJobs) { $startDetail += '  forced: window + all jobs' } elseif ($ForceWindow) { $startDetail += '  forced: window' }
-        Write-RunLine -RunId $runId -Event 'start' -Detail $startDetail
+        Write-RunLine -RunId $runId -Event 'begin' -Detail $startDetail
 
         $projection = Get-ServiceProjection -EventsPath $Paths.EventsPath
         # ask each service's archiver how overdue it is (it knows its own coverage)
@@ -741,9 +741,9 @@ function Invoke-BackupRun {
             if ($vp.Count) {
                 $failCount++
                 Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
-                    -Props @{ runId = $runId; svc = $serviceName; status = 'fail'; reason = 'invalid'; problems = @($vp); bytes = 0 }
-                Write-RunLine -RunId $runId -Service $serviceName -Event 'FAIL' -Seconds $svcClock.Elapsed.TotalSeconds `
-                    -Detail ("invalid, no step run: {0}" -f ($vp -join '; '))
+                    -Props @{ runId = $runId; svc = $serviceName; status = 'fail'; reason = 'invalid'; error = 'invalid config'; problems = @($vp); bytes = 0 }
+                Write-RunLine -RunId $runId -Service $serviceName -Event 'end' -Status 'FAIL' -Seconds $svcClock.Elapsed.TotalSeconds `
+                    -Detail ("! invalid, no step run: {0}" -f ($vp -join '; '))
                 continue
             }
 
@@ -754,7 +754,7 @@ function Invoke-BackupRun {
                 if ($free -lt $need) {
                     Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.skip' `
                         -Props @{ runId = $runId; svc = $serviceName; reason = 'insufficient-space'; needBytes = $need; freeBytes = $free }
-                    Write-RunLine -RunId $runId -Service $serviceName -Event 'SKIP' `
+                    Write-RunLine -RunId $runId -Service $serviceName -Event 'skip' -Status 'WARN' `
                         -Detail ("insufficient space in the spool (need {0}, free {1})" -f (Format-Size $need), (Format-Size $free))
                     continue
                 }
@@ -776,6 +776,7 @@ function Invoke-BackupRun {
             & $scriptPath -Recipe $rc | Out-Null   # registration only; don't let output taint the run
 
             $failed = $false
+            $failedStep = $null
             foreach ($stepDef in $svc.steps) {
                 $stepName = $stepDef.name
                 $always = (Test-HasProp $stepDef 'alwaysRun') -and $stepDef.alwaysRun
@@ -794,6 +795,7 @@ function Invoke-BackupRun {
                 }
                 $r = Invoke-BackupStep -EventsPath $Paths.EventsPath -RunId $runId `
                     -Service $serviceName -Step $stepName -Action $action -Retries $retries
+                if ($r -ne 'ok' -and -not $failedStep) { $failedStep = $stepName }
                 if ($r -ne 'ok' -and -not $always) { $failed = $true }
             }
 
@@ -801,9 +803,9 @@ function Invoke-BackupRun {
                 Move-ToTrash -Path $wipDir -TrashRoot $stg.Trash   # discard the partial dump
                 $failCount++
                 Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
-                    -Props @{ runId = $runId; svc = $serviceName; status = 'fail'; bytes = 0 }
-                Write-RunLine -RunId $runId -Service $serviceName -Event 'FAIL' -Seconds $svcClock.Elapsed.TotalSeconds `
-                    -Detail 'a step failed; partial dump discarded'
+                    -Props @{ runId = $runId; svc = $serviceName; status = 'fail'; bytes = 0; error = "step $failedStep failed" }
+                Write-RunLine -RunId $runId -Service $serviceName -Event 'end' -Status 'FAIL' -Seconds $svcClock.Elapsed.TotalSeconds `
+                    -Detail "! step $failedStep failed; partial dump discarded"
                 continue
             }
 
@@ -824,7 +826,7 @@ function Invoke-BackupRun {
                     $reason = "recipe not found: $($sa.script)"
                     Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.syncfail' `
                         -Props @{ runId = $runId; svc = $serviceName; reason = $reason }
-                    Write-RunLine -RunId $runId -Service $serviceName -Step 'sync-archive' -Event 'FAIL' -Detail $reason
+                    Write-RunLine -RunId $runId -Service $serviceName -Step 'sync-archive' -Event 'end' -Status 'FAIL' -Detail "! $reason"
                 }
                 else {
                     $arc = [RecipeContext]::new()
@@ -843,7 +845,7 @@ function Invoke-BackupRun {
                         $reason = "recipe did not register an 'archive' step"
                         Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.syncfail' `
                             -Props @{ runId = $runId; svc = $serviceName; reason = $reason }
-                        Write-RunLine -RunId $runId -Service $serviceName -Step 'sync-archive' -Event 'FAIL' -Detail $reason
+                        Write-RunLine -RunId $runId -Service $serviceName -Step 'sync-archive' -Event 'end' -Status 'FAIL' -Detail "! $reason"
                     }
                     else {
                         $archiveBlock = $arc.Steps['archive']
@@ -906,7 +908,7 @@ function Invoke-BackupRun {
                     Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.replaced' `
                         -Props @{ runId = $runId; svc = $serviceName; reason = 'previous-unarchived' }
                     Move-ToTrash -Path $readyDir -TrashRoot $stg.Trash
-                    Write-RunLine -RunId $runId -Service $serviceName -Event 'WARN' -Detail 'replaced the previous backup in ready/, never taken by the archiver (archiver behind)'
+                    Write-RunLine -RunId $runId -Service $serviceName -Event 'msg' -Status 'WARN' -Detail 'replaced the previous backup in ready/, never taken by the archiver (archiver behind)'
                 }
                 Move-Phase -Src $stageDir -Dst $readyDir
             }
@@ -922,8 +924,8 @@ function Invoke-BackupRun {
                 $failCount++
                 Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
                     -Props @{ runId = $runId; svc = $serviceName; status = 'fail'; bytes = $bytes; error = 'sync-archive failed; nothing retained' }
-                Write-RunLine -RunId $runId -Service $serviceName -Event 'FAIL' -Seconds $svcClock.Elapsed.TotalSeconds `
-                    -Detail "$sizeText  archive failed, nothing retained (retried next window)"
+                Write-RunLine -RunId $runId -Service $serviceName -Event 'end' -Status 'FAIL' -Seconds $svcClock.Elapsed.TotalSeconds `
+                    -Detail "$sizeText  ! archive failed, nothing retained (retried next window)"
             }
             else {
                 $okCount++
@@ -933,7 +935,7 @@ function Invoke-BackupRun {
                 if ($archNote) { $notes += $archNote }
                 if ($syncFailed) { $notes += 'archive failed' }
                 $notes += $(if ($publishToReady) { "kept in ready/$serviceName" } else { 'local copy dropped' })
-                Write-RunLine -RunId $runId -Service $serviceName -Event 'ok' -Seconds $svcClock.Elapsed.TotalSeconds `
+                Write-RunLine -RunId $runId -Service $serviceName -Event 'end' -Status 'ok' -Seconds $svcClock.Elapsed.TotalSeconds `
                     -Detail ("{0}  {1}" -f $sizeText, ($notes -join ', '))
             }
             }
@@ -942,14 +944,14 @@ function Invoke-BackupRun {
                 $failCount++
                 Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
                     -Props @{ runId = $runId; svc = $serviceName; status = 'fail'; bytes = 0; error = $emsg }
-                Write-RunLine -RunId $runId -Service $serviceName -Event 'FAIL' -Seconds $svcClock.Elapsed.TotalSeconds -Detail $emsg
+                Write-RunLine -RunId $runId -Service $serviceName -Event 'end' -Status 'FAIL' -Seconds $svcClock.Elapsed.TotalSeconds -Detail "! $emsg"
                 try { Move-ToTrash -Path $wipDir -TrashRoot $stg.Trash; Move-ToTrash -Path $stageDir -TrashRoot $stg.Trash } catch { }
             }
         }
 
         Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'run.end' `
-            -Props @{ runId = $runId; summary = @{ ok = $okCount; failed = $failCount; planned = $plan.Count } }
-        Write-RunLine -RunId $runId -Event 'end' -Seconds $runClock.Elapsed.TotalSeconds `
+            -Props @{ runId = $runId; status = $(if ($failCount -gt 0) { 'fail' } else { 'ok' }); summary = @{ ok = $okCount; failed = $failCount; planned = $plan.Count } }
+        Write-RunLine -RunId $runId -Event 'end' -Status $(if ($failCount -gt 0) { 'FAIL' } else { 'ok' }) -Seconds $runClock.Elapsed.TotalSeconds `
             -Detail ("{0} ok, {1} failed, {2} planned" -f $okCount, $failCount, $plan.Count)
         return $runId
     }
@@ -1059,7 +1061,8 @@ function Format-DurationUnit {
 function Format-RunLine {
     # One run-output line: fixed columns, no indentation, every line self-contained
     # (run, service, step) so parallel jobs stay readable.
-    #   runid(4)  [time(8)]  service(18)  step(12)  event(6)  dur(6)  detail
+    #   runid(4)  [time(8)]  service(18)  step(12)  event(6)  status(4)  dur(6)  detail
+    # event = what happens (start, end, msg, ...); status = outcome (ok, FAIL, WARN).
     # $Time = $null drops the time column (journald stamps lines itself).
     param(
         [string]$RunId,
@@ -1067,6 +1070,7 @@ function Format-RunLine {
         [string]$Service = 'run',
         [string]$Step = '-',
         [string]$Event = '',
+        [string]$Status = '',
         [string]$Duration = '',
         [string]$Detail = ''
     )
@@ -1078,7 +1082,7 @@ function Format-RunLine {
     $id = if ($RunId) { $RunId.Substring([math]::Max(0, $RunId.Length - 4)) } else { '----' }
     $parts = @(& $fit $id 4)
     if ($null -ne $Time) { $parts += ([datetime]$Time).ToString('HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture) }
-    $parts += @((& $fit $Service 18), (& $fit $Step 12), (& $fit $Event 6), (& $fit $Duration 6), $Detail)
+    $parts += @((& $fit $Service 18), (& $fit $Step 12), (& $fit $Event 6), (& $fit $Status 4), (& $fit $Duration 6), $Detail)
     return ($parts -join '  ').TrimEnd()
 }
 
@@ -1105,6 +1109,7 @@ function Write-RunLine {
         [string]$Service = 'run',
         [string]$Step = '-',
         [Parameter(Mandatory)][string]$Event,
+        [ValidateSet('', 'ok', 'FAIL', 'WARN')][string]$Status = '',
         [double]$Seconds = -1,          # duration column; negative = none
         [string]$Detail = ''
     )
@@ -1118,7 +1123,7 @@ function Write-RunLine {
         $time = $now
     }
     $dur = if ($Seconds -ge 0) { Format-Duration $Seconds } else { '' }
-    Write-Information (Format-RunLine -RunId $RunId -Time $time -Service $Service -Step $Step -Event $Event -Duration $dur -Detail $Detail)
+    Write-Information (Format-RunLine -RunId $RunId -Time $time -Service $Service -Step $Step -Event $Event -Status $Status -Duration $dur -Detail $Detail)
 }
 
 function Format-Size {

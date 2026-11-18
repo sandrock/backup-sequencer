@@ -17,14 +17,16 @@ BeforeAll {
     }
 
     function Split-RunLine {
-        # journal-mode line (no time column) -> service / step / event / detail by column
+        # journal-mode line (no time column) -> service / step / event / status / detail by column
         param([string]$Line)
+        $col = { param($from, $w) if ($Line.Length -gt $from) { $Line.Substring($from, [math]::Min($w, $Line.Length - $from)).Trim() } else { '' } }
         [pscustomobject]@{
             Id      = $Line.Substring(0, 4)
-            Service = $Line.Substring(6, 18).Trim()
-            Step    = $Line.Substring(26, 12).Trim()
-            Event   = $Line.Substring(40, [math]::Min(6, $Line.Length - 40)).Trim()
-            Detail  = if ($Line.Length -gt 56) { $Line.Substring(56) } else { '' }
+            Service = & $col 6 18
+            Step    = & $col 26 12
+            Event   = & $col 40 6
+            Status  = & $col 48 4
+            Detail  = if ($Line.Length -gt 62) { $Line.Substring(62) } else { '' }
         }
     }
 }
@@ -36,18 +38,25 @@ AfterAll {
 Describe 'run line format' {
     It 'lays out fixed columns, run id first, then time' {
         $t = [datetime]::new(2026, 11, 18, 23, 1, 9)
-        Format-RunLine -RunId '20261118-230108-c583' -Time $t -Service 'teamcity' -Step 'dump' -Event 'ok' -Duration '53m28s' -Detail 'from 23:01:34' |
-            Should -Be 'c583  23:01:09  teamcity            dump          ok      53m28s  from 23:01:34'
+        Format-RunLine -RunId '20261118-230108-c583' -Time $t -Service 'forgejo' -Step 'dump' -Event 'end' -Status 'ok' -Duration '53m28s' -Detail 'from 23:01:34' |
+            Should -Be 'c583  23:01:09  forgejo             dump          end     ok    53m28s  from 23:01:34'
+    }
+
+    It 'puts the outcome in its own column, after the event' {
+        Format-RunLine -RunId 'r-c583' -Service 'forgejo' -Step 'dump' -Event 'end' -Status 'FAIL' -Duration '1m46s' -Detail 'from 23:01:24  ! tar exited with code 2' |
+            Should -Be 'c583  forgejo             dump          end     FAIL  1m46s   from 23:01:24  ! tar exited with code 2'
+        Format-RunLine -RunId 'r-c583' -Service 'forgejo' -Step 'dump' -Event 'msg' -Status 'WARN' -Detail 'file changed' |
+            Should -Be 'c583  forgejo             dump          msg     WARN          file changed'
     }
 
     It 'drops the time column when no time is given (journald)' {
-        Format-RunLine -RunId '20261118-230108-c583' -Service 'teamcity' -Step 'dump' -Event 'start' |
-            Should -Be 'c583  teamcity            dump          start'
+        Format-RunLine -RunId '20261118-230108-c583' -Service 'forgejo' -Step 'dump' -Event 'begin' |
+            Should -Be 'c583  forgejo             dump          begin'
     }
 
     It 'defaults to the run-level service and step' {
-        Format-RunLine -RunId 'x-c583' -Event 'end' -Duration '5.2s' -Detail '1 ok' |
-            Should -Be 'c583  run                 -             end     5.2s    1 ok'
+        Format-RunLine -RunId 'x-c583' -Event 'end' -Status 'ok' -Duration '5.2s' -Detail '1 ok' |
+            Should -Be 'c583  run                 -             end     ok    5.2s    1 ok'
     }
 
     It 'truncates long names with ~ and keeps columns aligned' {
@@ -58,8 +67,8 @@ Describe 'run line format' {
     }
 
     It 'marks a line with no run as ----' {
-        Format-RunLine -RunId '' -Event 'SKIP' -Detail 'another run is in progress' |
-            Should -Be '----  run                 -             SKIP            another run is in progress'
+        Format-RunLine -RunId '' -Event 'skip' -Status 'WARN' -Detail 'another run is in progress' |
+            Should -Be '----  run                 -             skip    WARN          another run is in progress'
     }
 
     It 'gives the start reference with the date only when it was another day' {
@@ -83,14 +92,14 @@ Describe 'run narration' {
 '@ | ConvertFrom-Json
         $lines = @(Get-RunLines $cfg $paths -Journal)
         $rows = @($lines | ForEach-Object { Split-RunLine $_ })
-        $seq = @($rows | ForEach-Object { "{0}|{1}|{2}" -f $_.Service, $_.Step, $_.Event })
+        $seq = @($rows | ForEach-Object { "{0}|{1}|{2}|{3}" -f $_.Service, $_.Step, $_.Event, $_.Status })
         $seq | Should -Be @(
-            'run|-|start', 'app|-|begin',
-            'app|dump|start', 'app|dump|ok',
-            'app|chatty|start', 'app|chatty|WARN', 'app|chatty|info', 'app|chatty|info', 'app|chatty|ok',
-            'app|-|ok', 'run|-|end')
-        ($rows | Where-Object { $_.Event -eq 'WARN' }).Detail | Should -Be 'chatty warning'
-        @($rows | Where-Object { $_.Event -eq 'info' }).Detail | Should -Be @('chatty info', 'chatty host')
+            'run|-|begin|', 'app|-|begin|',
+            'app|dump|begin|', 'app|dump|end|ok',
+            'app|chatty|begin|', 'app|chatty|msg|WARN', 'app|chatty|msg|', 'app|chatty|msg|', 'app|chatty|end|ok',
+            'app|-|end|ok', 'run|-|end|ok')
+        ($rows | Where-Object { $_.Status -eq 'WARN' }).Detail | Should -Be 'chatty warning'
+        @($rows | Where-Object { $_.Event -eq 'msg' -and -not $_.Status }).Detail | Should -Be @('chatty info', 'chatty host')
         $rows[3].Detail | Should -Match '^from \d\d:\d\d:\d\d$'          # end line repeats the start
         $rows[-2].Detail | Should -Match 'kept in ready/app'
         $rows[-1].Detail | Should -Be '1 ok, 0 failed, 1 planned'
@@ -121,14 +130,22 @@ Describe 'run narration' {
       "steps": [ {"name":"dump"}, {"name":"boom"}, {"name":"start", "alwaysRun": true} ] } } }
 '@ | ConvertFrom-Json
         $rows = @(Get-RunLines $cfg $paths -Journal | ForEach-Object { Split-RunLine $_ })
-        $seq = @($rows | ForEach-Object { "{0}|{1}|{2}" -f $_.Service, $_.Step, $_.Event })
+        $seq = @($rows | ForEach-Object { "{0}|{1}|{2}|{3}" -f $_.Service, $_.Step, $_.Event, $_.Status })
         $seq | Should -Be @(
-            'run|-|start', 'app|-|begin',
-            'app|dump|start', 'app|dump|ok',
-            'app|boom|start', 'app|boom|FAIL',
-            'app|start|start', 'app|start|ok',
-            'app|-|FAIL', 'run|-|end')
-        ($rows | Where-Object { $_.Step -eq 'boom' -and $_.Event -eq 'FAIL' }).Detail | Should -Match 'simulated failure'
+            'run|-|begin|', 'app|-|begin|',
+            'app|dump|begin|', 'app|dump|end|ok',
+            'app|boom|begin|', 'app|boom|end|FAIL',
+            'app|start|begin|', 'app|start|end|ok',
+            'app|-|end|FAIL', 'run|-|end|FAIL')
+        # the error sits after the start reference, behind its marker
+        ($rows | Where-Object { $_.Step -eq 'boom' -and $_.Status -eq 'FAIL' }).Detail | Should -Match '^from \d\d:\d\d:\d\d  ! simulated failure$'
+        ($rows | Where-Object { $_.Service -eq 'app' -and $_.Step -eq '-' -and $_.Status -eq 'FAIL' }).Detail | Should -Be '! step boom failed; partial dump discarded'
+        # the event log carries the same: status + error on the closing events
+        $evs = @(Get-BackupEvents -EventsPath $paths.EventsPath)
+        $svcEnd = @($evs | Where-Object { $_.type -eq 'service.end' })[0]
+        $svcEnd.status | Should -Be 'fail'
+        $svcEnd.error | Should -Be 'step boom failed'
+        @($evs | Where-Object { $_.type -eq 'run.end' })[0].status | Should -Be 'fail'
     }
 
     It 'shows a covered service as a skip line' {

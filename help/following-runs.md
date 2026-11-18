@@ -21,37 +21,51 @@ steps of different services interleave.
 
 ```
 2026-11-18 ----------------------------------------------------------------------
-c583  23:01:09  run                 -             start           20261118-230108-c583  window 23:00-06:00
-c583  23:01:09  photos              -             skip            covered (x0.70)
-c583  23:01:10  wiki                -             begin           est 55m
-c583  23:01:10  wiki                stop          start
+c583  23:01:09  run                 -             begin                 20261118-230108-c583  window 23:00-06:00
+c583  23:01:09  photos              -             skip                  covered (x0.70)
+c583  23:01:10  wiki                -             begin                 est 55m
+c583  23:01:10  wiki                stop          begin
  Container wiki-app-1  Stopping
  Container wiki-app-1  Stopped
-c583  23:01:34  wiki                stop          ok      24s     from 23:01:10
-c583  23:01:34  wiki                dump          start
-c583  23:55:02  wiki                dump          ok      53m28s  from 23:01:34
-c583  23:58:11  wiki                hot-dump      WARN            wiki hot-dump: some files changed while being read
-c583  00:41:52  wiki                -             ok      1h41m   51.5 GB  snap a5090c0f, local copy dropped
-c583  00:43:10  run                 -             end     1h42m   1 ok, 0 failed, 6 planned
+c583  23:01:34  wiki                stop          end     ok    24s     from 23:01:10
+c583  23:01:34  wiki                dump          begin
+c583  23:55:02  wiki                dump          end     ok    53m28s  from 23:01:34
+c583  23:58:11  wiki                hot-dump      msg     WARN          wiki hot-dump: some files changed while being read
+2026-11-19 ----------------------------------------------------------------------
+c583  00:41:52  wiki                -             end     ok    1h41m   51.5 GB  snap a5090c0f, local copy dropped
+c583  00:41:53  chat                -             begin                 est 4m
+c583  00:41:53  chat                dump          begin
+c583  00:42:20  chat                dump          end     FAIL  27s     from 00:41:53  ! pg_dump exited with code 1
+c583  00:42:20  chat                start         begin
+c583  00:42:31  chat                start         end     ok    11s     from 00:42:20
+c583  00:42:31  chat                -             end     FAIL  38s     ! step dump failed; partial dump discarded
+c583  00:43:10  run                 -             end     FAIL  1h42m   1 ok, 1 failed, 7 planned
 ```
 
 Columns: the last 4 characters of the run id, the time, the service (`run` for the
-run itself), the step (`-` for a service- or run-level line), the event, the
-duration, then free text. Names longer than the column are cut with `~`.
+run itself), the step (`-` for a service- or run-level line), the event, its
+status, the duration, then free text. Names longer than the column are cut with
+`~`. An error message always starts with `!`; on a step's `end` line it follows
+the step's start time.
 
 | Event | Meaning |
 |---|---|
-| `start` / `end` | a step starts; the run starts or ends |
-| `ok` / `FAIL` | a step or a whole service ended; the duration and `from <start time>` follow |
-| `begin` | a service starts, with its estimated duration (`?` when never backed up) |
-| `skip` | a service is not run: `covered` (already backed up for its period) or `deferred` (won't fit the time left) |
-| `SKIP` | a service is not run for a reason that needs attention (spool out of space) |
+| `begin` / `end` | a step, a service or the run begins / ends; a service's `begin` gives its estimated duration (`?` when never backed up), an `end` line repeats the start time (`from ...`) |
+| `skip` | a service is not run: `covered` (already backed up for its period), `deferred` (won't fit the time left), or out of spool space |
 | `retry` | a failed step is tried again |
-| `WARN` / `info` | a message from the recipe during that step |
+| `msg` | a message from the recipe during that step, or from the engine about the service |
 | `closed` | the window closed: remaining services wait for the next run |
 
-Uppercase events need attention. Output from the tools a step calls (docker
-compose, tar) passes through as is, between that step's `start` and `ok` lines;
+| Status | Meaning |
+|---|---|
+| `ok` | the step, service or run succeeded |
+| `FAIL` | it failed; the reason follows `!` |
+| `WARN` | needs attention (a recipe warning, a full spool, another run already in progress) |
+| (blank) | nothing to report |
+
+Uppercase statuses need attention: `grep -E 'FAIL|WARN'` finds them all. A run ends
+`FAIL` when any service failed. Output from the tools a step calls (docker
+compose, tar) passes through as is, between that step's `begin` and `end` lines;
 bseq asks them for plain output (no colours, no redrawn progress).
 
 Under systemd the output goes to the journal, which stamps each line itself, so
