@@ -112,19 +112,27 @@ $Recipe.AddStep('archive', {
     foreach ($a in ($tierArchives | Sort-Object ts)) { $newestByPeriod[$a.periodKey] = $a }  # last wins = newest
     $keepPeriods = @($newestByPeriod.Keys | Sort-Object { $newestByPeriod[$_].ts } -Descending | Select-Object -First $keep)
 
+    # measured then deleted; a failed delete is not reported as pruned, so the archive
+    # stays live in the log and the next run tries again
     $prunedNow = @()
+    $pruneFailed = @()
     foreach ($a in $tierArchives) {
         if ($a.isNew) { continue }   # never prune the copy just made
         $keepThis = ($keepPeriods -contains $a.periodKey) -and ($newestByPeriod[$a.periodKey].path -eq $a.path)
         if (-not $keepThis) {
-            if (Test-Path -LiteralPath $a.path) {
-                Remove-Item -LiteralPath $a.path -Recurse -Force -ErrorAction SilentlyContinue
+            $r = $ctx.RemoveTree($a.path)
+            if ($r.Ok) {
+                $prunedNow += @{ path = [string]$a.path; bytes = $r.Bytes; files = $r.Files }
+                Write-Information ("pruned {0} ({1}, {2} files)" -f $a.path, $ctx.SizeText($r.Bytes), $r.Files)
             }
-            $prunedNow += $a.path
+            else {
+                $pruneFailed += @{ path = [string]$a.path; error = $r.Error }
+                Write-Warning ("prune failed, kept for next run: {0}: {1}" -f $a.path, $r.Error)
+            }
         }
     }
 
-    $ctx.State['Result'] = @{ tier = $tier; path = $target; pruned = $prunedNow }
+    $ctx.State['Result'] = @{ tier = $tier; path = $target; pruned = $prunedNow; pruneFailed = $pruneFailed }
 })
 
 # preflight (before any downtime): the destination must be set and reachable — its

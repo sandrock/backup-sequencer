@@ -87,13 +87,18 @@ Two files, single-writer each:
 - `events.jsonl` — engine-owned, append-only. One typed line per event
   (`run.begin`, `run.plan`, `service.begin`, `step.begin`, `step.end`,
   `service.end`, `service.skip`, `service.replaced`, `service.syncfail`,
-  `service.archived`, `service.archive-pruned`, `run.windowclosed`, `run.end`).
+  `service.archived`, `service.archive-pruned`, `service.archive-prunefail`,
+  `trash.move`, `trash.delete`, `run.windowclosed`, `run.end`).
   Crash-safe and the single source of truth — e.g. archivers route and prune by
   `service.archived` / `service.archive-pruned` rather than by directory names.
   Anything the run output tells that a reader may need later is in an event:
   `run.begin` has `forced` (`none` / `window` / `all`), `service.begin` the
   estimate (`estSec`, -1 when unknown) and `mandatory`, `service.end` where the
-  copy is (`kept`: `ready` / `dropped`). Events that close an action carry
+  copy is (`kept`: `ready` / `dropped`). Every deletion is an event: `trash.move`
+  {svc, reason, trashName}, `trash.delete` {trashName, bytes, files, durationSec,
+  and svc/reason/fromRun from its move}, `service.archive-pruned` {path, bytes,
+  files}, `service.archive-prunefail` {path, error}; a stale lock removed is
+  `staleLockPid` on `run.begin`. Events that close an action carry
   `status` and, when it failed, `error` (see [run-output.md](run-output.md)).
   Fields and types are only ever added; the log is never rewritten.
 
@@ -130,7 +135,8 @@ Run lifecycle
 ----------------------------------------------------------------
 
 1. Take the single-instance lock (a second run exits immediately).
-2. Reap `trash/` (off the publish path); emit `run.begin`; fold the projection;
+2. Emit `run.begin`; empty `trash/` (off the publish path, each item logged);
+   fold the projection;
    compute the plan; emit `run.plan`.
 3. For each planned service, while inside the window (unless `-ForceWindow`) and it
    fits the time left (unless mandatory or `-ForceAllJobs`; see [scheduling.md](scheduling.md)):

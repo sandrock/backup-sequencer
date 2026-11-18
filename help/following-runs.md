@@ -43,7 +43,8 @@ c583  00:43:10  run                 -             end     FAIL  1h42m   1 ok, 1 
 ```
 
 Columns: the last 4 characters of the run id, the time, the service (`run` for the
-run itself), the step (`-` for a service- or run-level line), the event, its
+run itself), the step (`-` for a service- or run-level line, `[trash]` / `[delete]`
+for the engine's own deletions, see below), the event, its
 status, the duration, then free text. Names longer than the column are cut with
 `~`. An error message always starts with `!`; on a step's `end` line it follows
 the step's start time.
@@ -55,6 +56,7 @@ the step's start time.
 | `retry` | a failed step is tried again |
 | `msg` | a message from the recipe during that step, or from the engine about the service |
 | `closed` | the window closed: remaining services wait for the next run |
+| `done` | an engine action with no begin line: `[trash]` or `[delete]` |
 
 | Status | Meaning |
 |---|---|
@@ -67,6 +69,34 @@ Uppercase statuses need attention: `grep -E 'FAIL|WARN'` finds them all. A run e
 `FAIL` when any service failed. Output from the tools a step calls (docker
 compose, tar) passes through as is, between that step's `begin` and `end` lines;
 bseq asks them for plain output (no colours, no redrawn progress).
+
+### Deletions
+
+Nothing is deleted silently. A backup dir that is no longer needed is first moved
+into the spool's `trash/` (instant), and deleted at the start of the next run:
+
+```
+c583  run                 -             begin                 20261118-230108-c583  window 19:00-06:00
+c583  forgejo             [delete]      done    ok    12s     47.0 GB, 12345 files  local-copy-dropped, run a558
+c583  run                 [delete]      done    ok    1.0s    120.4 MB, 80 files  no record: wip-3f2a9c1b77e0
+c583  bookstack           [delete]      done    FAIL  0.1s    ! bookstack-1a2b3c4d5e6f: Access to the path is denied; kept, retried next run
+c583  grafana             [trash]       done    ok            wip leftover (interrupted run?) -> trash/wip-9c0e11aa2b3c
+c583  keycloak            sync-archive  msg                   pruned /srv/archive/keycloak/20261104-230012-77aa (1.2 GB, 34 files)
+c583  keycloak            sync-archive  msg     WARN          prune failed, kept for next run: /srv/archive/keycloak/20261103-230009-12cd: Directory not empty
+c583  run                 -             end     ok    39m58s  5 ok, 0 failed, 5 planned  freed 47.1 GB (2 items), 1 trash item kept
+```
+
+- `[delete]`: an item of `trash/` deleted, with its size, why it was there and
+  which run put it there (`no record` for items older than this logging).
+  A failed delete leaves the item in `trash/`; the next run tries again.
+- `[trash]`: a dir moved into `trash/`, shown only when unusual: a leftover from
+  an interrupted run, the partial dump of a failed backup, a backup in `ready/`
+  replaced before the archiver took it, cleanup after an error. The routine drop
+  of the local copy once archived is recorded in the event log, not printed.
+- Archive prunes (`archive-copy`, `archive-gfsy`) print what they delete, with its
+  size. A prune that fails is a warning: the service stays `ok`, the old archive
+  stays recorded as live, and the next run prunes it again.
+- A lock left by a run that died is removed with a `WARN` line naming its pid.
 
 Under systemd the output goes to the journal, which stamps each line itself, so
 bseq drops its own time column and date lines there:
@@ -191,6 +221,23 @@ step, and the engine's (a backup replaced in `ready/`, a spool out of space):
 
 The email report lists the same warnings, one line each. A step keeps at most 20
 of them in the event log, each cut to 500 characters.
+
+What the run deleted comes last, in one block; a `moved to trash:` line under a
+service lists its unusual moves (see Deletions above):
+
+```
+  grafana                FAIL                                  dump FAIL 1m46s
+      ! step dump failed; partial dump discarded
+      moved to trash: failed-dump
+  deletions              freed 47.1 GB in 2 items, pruned 1 archive (1.2 GB); 2 failed
+      delete  forgejo            47.0 GB   12345 files  local-copy-dropped, run a558
+      delete  (no record)       120.4 MB      80 files  no record: wip-3f2a9c1b77e0
+    ! delete  bookstack        kept: bookstack-1a2b3c4d5e6f: Access to the path is denied
+      prune   keycloak            1.2 GB      34 files  /srv/archive/keycloak/20261104-230012-77aa
+    ! prune   keycloak         kept: /srv/archive/keycloak/20261103-230009-12cd: Directory not empty
+```
+
+The email gives the totals line and one `!` line per item it could not delete.
 
 
 Permissions

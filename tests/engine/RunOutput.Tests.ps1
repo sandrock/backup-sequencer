@@ -3,32 +3,6 @@
 
 BeforeAll {
     . (Join-Path $PSScriptRoot '../TestHelpers.ps1')
-
-    function Get-RunLines {
-        # run the engine, return its narration lines (Information stream) as strings
-        param($Config, $Paths, [switch]$Journal)
-        $saved = $env:JOURNAL_STREAM
-        $env:JOURNAL_STREAM = if ($Journal) { '8:1234' } else { $null }
-        try {
-            $out = Invoke-BackupRun -Config $Config -Paths $Paths -ForceWindow -InformationAction Continue -WarningAction SilentlyContinue 6>&1
-            return @($out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData })
-        }
-        finally { $env:JOURNAL_STREAM = $saved }
-    }
-
-    function Split-RunLine {
-        # journal-mode line (no time column) -> service / step / event / status / detail by column
-        param([string]$Line)
-        $col = { param($from, $w) if ($Line.Length -gt $from) { $Line.Substring($from, [math]::Min($w, $Line.Length - $from)).Trim() } else { '' } }
-        [pscustomobject]@{
-            Id      = $Line.Substring(0, 4)
-            Service = & $col 6 18
-            Step    = & $col 26 12
-            Event   = & $col 40 6
-            Status  = & $col 48 4
-            Detail  = if ($Line.Length -gt 62) { $Line.Substring(62) } else { '' }
-        }
-    }
 }
 
 AfterAll {
@@ -136,7 +110,9 @@ Describe 'run narration' {
             'app|dump|begin|', 'app|dump|end|ok',
             'app|boom|begin|', 'app|boom|end|FAIL',
             'app|start|begin|', 'app|start|end|ok',
+            'app|[trash]|done|ok',
             'app|-|end|FAIL', 'run|-|end|FAIL')
+        ($rows | Where-Object { $_.Step -eq '[trash]' }).Detail | Should -Match '^partial dump of a failed backup -> trash/app-[0-9a-f]{12}$'
         # the error sits after the start reference, behind its marker
         ($rows | Where-Object { $_.Step -eq 'boom' -and $_.Status -eq 'FAIL' }).Detail | Should -Match '^from \d\d:\d\d:\d\d  ! simulated failure$'
         ($rows | Where-Object { $_.Service -eq 'app' -and $_.Step -eq '-' -and $_.Status -eq 'FAIL' }).Detail | Should -Be '! step boom failed; partial dump discarded'

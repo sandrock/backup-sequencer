@@ -156,6 +156,11 @@ keeps every delete O(1) on the path that matters and lets the actual freeing
 happen when there is slack. The reaper only ever removes things already moved to
 `trash/`, never a live `ready/` set.
 
+Both halves are logged: each move is a `trash.move` event (service, reason, trash
+name) and each deletion a `trash.delete` event (size, file count, and the move it
+came from), so a deletion can always be traced back to the run and service that
+dropped it. A delete that fails leaves the item in `trash/` for the next run.
+
 
 The replace-while-fetching race
 ----------------------------------------------------------------

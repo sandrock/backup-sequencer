@@ -41,7 +41,8 @@ retention is per period, extra same-period runs collapse to one kept archive, so
 they can never erode how many distinct days / weeks / years you retain. Like the
 routing, pruning reads the recorded timestamps and paths from the log, never
 directory names — and only ever deletes paths the recipe itself recorded, so
-foreign files are safe.
+foreign files are safe. Each deletion is printed with its size; one that fails
+stays recorded as live and is pruned again on the next run (a warning).
 
 
 Configuration

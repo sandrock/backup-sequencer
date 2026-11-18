@@ -94,7 +94,7 @@ actions of its own (moving into trash, deleting) a `FAIL` line no longer said
 which action failed.
 
 - Events, lowercase, a small fixed vocabulary: `begin`, `end`, `skip`, `retry`,
-  `msg`, `closed`. One pair, `begin` / `end`, for the run, a service and a step
+  `msg`, `closed`, and `done` for an engine action with no begin line. One pair, `begin` / `end`, for the run, a service and a step
   alike: the step column (`-` or a name) tells the level. Not `start` / `stop`:
   those are natural step names (the docker-compose recipe has both), and
   `start  start` or `stop  end` on one line read as nonsense.
@@ -114,6 +114,17 @@ The words above are display only: the event log keeps its own types
 (`step.begin`, `step.end`, ...), so renaming a run-output word never touches it.
 The log itself is append-only and never rewritten: a field or an event type is
 only ever added, and if a shape has to change, readers accept both forms.
+
+### Engine actions in brackets
+
+What the engine does itself, as opposed to a recipe step, carries the action in
+brackets in the step column: `[trash]` (a dir moved into the spool's `trash/`) and
+`[delete]` (an item of `trash/` deleted). Two names, because they are two actions
+with different consequences when they fail: after a failed move the data is still
+in place; after a failed delete it sits in `trash/` and takes space until the next
+run. No step name is reserved: a recipe may call a step `delete`, and its lines
+stay distinct. Routine moves (the local copy dropped once archived) are not
+printed; every move and delete is an event (`trash.move`, `trash.delete`).
 
 ### Recipe messages are tagged, tool output is not
 

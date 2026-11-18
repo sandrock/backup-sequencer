@@ -21,7 +21,9 @@ Each run copies the complete artifact set into a directory named by the run id:
 <ARCHIVE_DEST>/<service>/<runId>/<artifacts>
 ```
 
-Then it prunes that service to the newest `ARCHIVE_KEEP` copies. Naming each copy
+Then it prunes that service to the newest `ARCHIVE_KEEP` copies, printing each
+path it deletes with its size. A copy it fails to delete stays recorded as live and
+is pruned again on the next run (a warning, not a failure). Naming each copy
 by the run id ties an archive directly back to the run that produced it (and to its
 `service.archived` event).
 

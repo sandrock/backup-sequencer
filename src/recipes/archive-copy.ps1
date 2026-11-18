@@ -51,18 +51,26 @@ $Recipe.AddStep('archive', {
                 $_.PSObject.Properties['path'] -and ($prunedPaths -notcontains $_.path)
             } |
             Sort-Object { [datetime]$_.ts })   # oldest first
+    # measured then deleted; a failed delete is not reported as pruned, so the archive
+    # stays live in the log and the next run tries again
     $prunedNow = @()
+    $pruneFailed = @()
     $over = ($live.Count + 1) - $keep           # +1 for the copy just made (not yet logged)
     if ($over -gt 0) {
         foreach ($old in (@($live) | Select-Object -First $over)) {
-            if (Test-Path -LiteralPath $old.path) {
-                Remove-Item -LiteralPath $old.path -Recurse -Force -ErrorAction SilentlyContinue
+            $r = $ctx.RemoveTree($old.path)
+            if ($r.Ok) {
+                $prunedNow += @{ path = [string]$old.path; bytes = $r.Bytes; files = $r.Files }
+                Write-Information ("pruned {0} ({1}, {2} files)" -f $old.path, $ctx.SizeText($r.Bytes), $r.Files)
             }
-            $prunedNow += $old.path
+            else {
+                $pruneFailed += @{ path = [string]$old.path; error = $r.Error }
+                Write-Warning ("prune failed, kept for next run: {0}: {1}" -f $old.path, $r.Error)
+            }
         }
     }
 
-    $ctx.State['Result'] = @{ path = $target; pruned = $prunedNow }
+    $ctx.State['Result'] = @{ path = $target; pruned = $prunedNow; pruneFailed = $pruneFailed }
 })
 
 # preflight (before any downtime): the destination must be set and reachable — its
