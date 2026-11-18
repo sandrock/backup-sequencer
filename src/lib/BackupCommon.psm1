@@ -668,7 +668,7 @@ function Invoke-BackupRun {
                 if (-not $fitsInWindow -and $ranGuaranteed) {
                     Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.skip' `
                         -Props @{ runId = $runId; svc = $serviceName; reason = 'deferred'; estSec = [int]$estimatedSeconds; remainingSec = [int]$remainingSeconds }
-                    Write-Information ("  {0}  deferred (est {1}s, {2}s left in window)" -f $serviceName, [int]$estimatedSeconds, [int]$remainingSeconds)
+                    Write-Information ("  {0}  deferred (est {1}, {2} left in window)" -f $serviceName, (Format-DurationUnit $estimatedSeconds), (Format-DurationUnit $remainingSeconds))
                     continue
                 }
                 $ranGuaranteed = $true
@@ -978,6 +978,17 @@ function Format-Duration {
     return [string]::Format($inv, '{0}h{1:00}m', [math]::Floor($s / 3600), [math]::Floor(($s % 3600) / 60))
 }
 
+function Format-DurationUnit {
+    # one readable unit, for estimates: <1s, 38s, 55m, 1.2h ('?' for a negative = unknown)
+    param([double]$Seconds)
+    $inv = [System.Globalization.CultureInfo]::InvariantCulture
+    if ($Seconds -lt 0) { return '?' }
+    if ($Seconds -lt 0.5) { return '<1s' }
+    if ($Seconds -lt 90) { return [string]::Format($inv, '{0:0}s', $Seconds) }
+    if ($Seconds -lt 90 * 60) { return [string]::Format($inv, '{0:0}m', $Seconds / 60) }
+    return [string]::Format($inv, '{0:0.0}h', $Seconds / 3600)
+}
+
 function Format-Size {
     # compact, culture-independent byte size: 812 KB, 7.2 MB, 52.4 GB
     param([double]$Bytes)
@@ -1190,7 +1201,7 @@ function Format-RunHistoryLine {
 }
 
 Export-ModuleMember -Function `
-    Format-Duration, Format-Size, Format-EventTime, Get-LockHolder, Get-RunStates, Resolve-RunRef, `
+    Format-Duration, Format-DurationUnit, Format-Size, Format-EventTime, Get-LockHolder, Get-RunStates, Resolve-RunRef, `
     Get-RunDetail, Format-RunDetail, Format-RunHistoryLine, `
     New-RunId, Get-NowIso, Add-BackupEvent, Get-BackupEvents, Test-HasProp, `
     Get-ServiceProjection, Get-EstimatedServiceSeconds, Enter-SequencerLock, Exit-SequencerLock, `

@@ -74,7 +74,7 @@ Describe 'CLI with no runs yet' {
     It 'plan lists a never-run service as new' {
         $r = Invoke-Cli $empty @('plan')
         $r.Exit | Should -Be 0
-        $r.Out | Should -Match '(?m)^\s+\*?\s*app\s+est=.*overdue=new'
+        $r.Out | Should -Match '(?m)^\s+\*?\s*app\s+est=\s+\?\s+overdue=new'   # unknown estimate, not 0s
     }
 
     It 'refuses an unexpected positional argument' {
@@ -131,6 +131,11 @@ Describe 'CLI after runs' {
         $lines.Count | Should -Be 2
         $lines[0] | Should -Match ([regex]::Escape($runIds[1]))
         $lines[1] | Should -Match ([regex]::Escape($runIds[0]))
+    }
+
+    It 'plan shows a measured estimate in one unit' {
+        $r = Invoke-Cli $ran @('plan')
+        $r.Out | Should -Match '(?m)^\s+\*?\s*app\s+est=\s+(<1|\d+)s\s+overdue='   # measured: never '?'
     }
 
     It 'status shows the last run when idle' {

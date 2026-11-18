@@ -34,6 +34,20 @@ Describe 'run status and detail (status / show / history)' {
         Format-Duration 3780 | Should -Be '1h03m'
     }
 
+    It 'formats estimates in one readable unit' {
+        Format-DurationUnit -1 | Should -Be '?'
+        Format-DurationUnit 0 | Should -Be '<1s'
+        Format-DurationUnit 0.4 | Should -Be '<1s'
+        Format-DurationUnit 0.6 | Should -Be '1s'
+        Format-DurationUnit 15 | Should -Be '15s'
+        Format-DurationUnit 89 | Should -Be '89s'
+        Format-DurationUnit 90 | Should -Be '2m'
+        Format-DurationUnit 3317 | Should -Be '55m'
+        Format-DurationUnit 5399 | Should -Be '90m'
+        Format-DurationUnit 5400 | Should -Be '1.5h'
+        Format-DurationUnit 25000 | Should -Be '6.9h'
+    }
+
     It 'tells finished, running and interrupted runs apart' {
         & $addEv $ev (& $iso 0) 'run.start' @{ runId = 'r-0001' }
         & $addEv $ev (& $iso 5) 'run.end' @{ runId = 'r-0001'; summary = @{ ok = 1; failed = 0; planned = 1 } }

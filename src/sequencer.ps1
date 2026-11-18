@@ -147,8 +147,10 @@ switch ($Command) {
             $lastSuccess = Format-DisplayTime $plannedJob.LastSuccess
             $overdue = if ($plannedJob.Overdue -ge 1e6) { 'new' } else { ('x{0:N1}' -f $plannedJob.Overdue) }
             $covered = if ($plannedJob.Overdue -lt 1) { ' covered' } else { '' }
-            Write-Host ("  {0} {1,-22} est={2,6:N0}s  overdue={3,-5}  score={4,7:N2}  last={5}{6}" -f `
-                    $flag, $plannedJob.Service, $plannedJob.EstimatedSeconds, $overdue, $plannedJob.Score, $lastSuccess, $covered)
+            # never backed up with nothing measured: unknown, not "0s"
+            $est = if (-not $plannedJob.LastSuccess -and $plannedJob.EstimatedSeconds -le 0) { '?' } else { Format-DurationUnit $plannedJob.EstimatedSeconds }
+            Write-Host ("  {0} {1,-22} est={2,5}  overdue={3,-5}  score={4,7:N2}  last={5}{6}" -f `
+                    $flag, $plannedJob.Service, $est, $overdue, $plannedJob.Score, $lastSuccess, $covered)
         }
     }
     'run' {
