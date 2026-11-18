@@ -91,6 +91,20 @@ Describe 'CLI with no runs yet' {
     }
 }
 
+Describe 'CLI run under journald' {
+    It 'prints no date line and no time column (journald stamps lines itself)' {
+        $e = New-CliEnv -Name 'journal' -Services @{ app = $mockSvc }
+        $saved = $env:JOURNAL_STREAM
+        $env:JOURNAL_STREAM = '8:1234'
+        try { $r = Invoke-Cli $e @('run', '-ForceWindow') }
+        finally { $env:JOURNAL_STREAM = $saved }
+        $r.Out | Should -Match '(?m)^[0-9a-f]{4}  run {17}-\s+start'
+        $r.Out | Should -Match '(?m)^[0-9a-f]{4}  app {17}-\s+ok'
+        $r.Out | Should -Not -Match '(?m)^\d{4}-\d\d-\d\d -'
+        $r.Out | Should -Not -Match '(?m)^[0-9a-f]{4}  \d\d:\d\d:\d\d'
+    }
+}
+
 Describe 'CLI validate' {
     It 'exits 0 when every service is valid' {
         $e = New-CliEnv -Name 'valid' -Services @{ app = $mockSvc }
@@ -121,7 +135,7 @@ Describe 'CLI after runs' {
 
     It 'run -ForceWindow backs the service up' {
         $run1.Exit | Should -Be 0
-        $run1.Out | Should -Match 'app\s+OK'
+        $run1.Out | Should -Match '(?m)^[0-9a-f]{4}  \d\d:\d\d:\d\d  app\s+-\s+ok\s'
         $runIds.Count | Should -Be 2
     }
 

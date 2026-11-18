@@ -136,6 +136,8 @@ User guides (`help/`):
 Design and internals (`docs/`):
 
 - [Scheduling](docs/scheduling.md) — the fairness score and window packing.
+- [Run output](docs/run-output.md) — why the run prints flat, fixed-column,
+  self-contained lines.
 - [Spool and archiving model](docs/archiving.md) — `wip → stage → ready`, the
   producer/consumer contract.
 - [Architecture and internals](docs/architecture.md) — engine structure, data

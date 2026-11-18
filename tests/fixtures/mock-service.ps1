@@ -17,6 +17,20 @@ $Recipe.AddStep('dump', {
 
 $Recipe.AddStep('boom', { param($ctx) throw 'simulated failure' })
 
+$Recipe.AddStep('chatty', {
+    param($ctx)
+    # talks on every stream a recipe may use (run output must tag warnings + info)
+    Write-Warning 'chatty warning'
+    Write-Information 'chatty info'
+    Write-Host 'chatty host'
+    'chatty output object'
+})
+
+$Recipe.AddStep('envcheck', {
+    param($ctx)
+    Write-Information "tool env: NO_COLOR=$env:NO_COLOR COMPOSE_ANSI=$env:COMPOSE_ANSI COMPOSE_PROGRESS=$env:COMPOSE_PROGRESS"
+})
+
 $Recipe.AddStep('start', { param($ctx) })   # recovery no-op
 
 $Recipe.AddStep('archive', {

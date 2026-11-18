@@ -12,6 +12,56 @@ bseq history                # recent runs, newest first (-Limit <n>, default 20)
 ```
 
 
+Live run output
+----------------------------------------------------------------
+
+`bseq run` prints one line per event, in fixed columns, with no indentation: every
+line names its run, service and step, so it stays readable in the journal and when
+steps of different services interleave.
+
+```
+2026-11-18 ----------------------------------------------------------------------
+c583  23:01:09  run                 -             start           20261118-230108-c583  window 23:00-06:00
+c583  23:01:09  photos              -             skip            covered (x0.70)
+c583  23:01:10  wiki                -             begin           est 55m
+c583  23:01:10  wiki                stop          start
+ Container wiki-app-1  Stopping
+ Container wiki-app-1  Stopped
+c583  23:01:34  wiki                stop          ok      24s     from 23:01:10
+c583  23:01:34  wiki                dump          start
+c583  23:55:02  wiki                dump          ok      53m28s  from 23:01:34
+c583  23:58:11  wiki                hot-dump      WARN            wiki hot-dump: some files changed while being read
+c583  00:41:52  wiki                -             ok      1h41m   51.5 GB  snap a5090c0f, local copy dropped
+c583  00:43:10  run                 -             end     1h42m   1 ok, 0 failed, 6 planned
+```
+
+Columns: the last 4 characters of the run id, the time, the service (`run` for the
+run itself), the step (`-` for a service- or run-level line), the event, the
+duration, then free text. Names longer than the column are cut with `~`.
+
+| Event | Meaning |
+|---|---|
+| `start` / `end` | a step starts; the run starts or ends |
+| `ok` / `FAIL` | a step or a whole service ended; the duration and `from <start time>` follow |
+| `begin` | a service starts, with its estimated duration (`?` when never backed up) |
+| `skip` | a service is not run: `covered` (already backed up for its period) or `deferred` (won't fit the time left) |
+| `SKIP` | a service is not run for a reason that needs attention (spool out of space) |
+| `retry` | a failed step is tried again |
+| `WARN` / `info` | a message from the recipe during that step |
+| `closed` | the window closed: remaining services wait for the next run |
+
+Uppercase events need attention. Output from the tools a step calls (docker
+compose, tar) passes through as is, between that step's `start` and `ok` lines;
+bseq asks them for plain output (no colours, no redrawn progress).
+
+Under systemd the output goes to the journal, which stamps each line itself, so
+bseq drops its own time column and date lines there:
+
+```sh
+journalctl -u backup-sequencer --since today
+```
+
+
 bseq status
 ----------------------------------------------------------------
 
