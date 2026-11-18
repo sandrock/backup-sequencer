@@ -151,7 +151,8 @@ src/
   lib/BackupCommon.psm1 engine (events, projection, locking, planning, run)
   recipes/              reusable step scripts (e.g. docker-compose-cold, host-config-linux)
   services/             bespoke per-service step scripts (same contract)
-tests/                  Pester tests + abstract fixtures
+tests/                  Pester tests: engine/, recipes/ (one file per recipe), cli/,
+                        shared setup in TestHelpers.ps1, abstract fixtures/
 docs/                   design and internals (archiving.md, scheduling.md)
 help/                   end-user documentation (install, schedule, notify)
 packages/               installer + systemd units
