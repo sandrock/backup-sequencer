@@ -114,11 +114,11 @@ Scheduling
 ----------------------------------------------------------------
 
 The sequencer plans each window by a fairness score (most overdue first) and packs
-what fits. `targetIntervalHours` sets a service's desired interval — set it per
-service, or once at the top level as the default (else 24h). When a service has an
-archiver, coverage comes from the archiver's own interval instead
-(`ARCHIVE_MIN_INTERVAL_HOURS` / `ARCHIVE_DAILY_HOURS` / `RESTIC_MIN_INTERVAL_HOURS`),
-so an already-archived service is skipped. A small grace margin (top-level
+what fits. `targetIntervalHours` sets how often a service is backed up — set it per
+service (e.g. `72` for a big one every three days), or once at the top level as the
+default (else 24h). A service backed up recently enough is skipped (`covered`): for
+a service with an archiver, "backed up" means archived (a backup whose archive
+failed doesn't count, so it is retried); with gfsy, an archive of any tier counts. A small grace margin (top-level
 `coverageMargin`, default 2%) keeps a backup that is *just* under its period from
 being skipped by timer jitter. See [the scheduling model](../docs/scheduling.md).
 

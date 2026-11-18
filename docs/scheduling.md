@@ -23,10 +23,12 @@ The score
 ----------------------------------------------------------------
 
 `Get-BackupPlan` returns *all* enabled services, sorted by a score computed per
-service from the projection (last-success time + estimated duration):
+service from the projection (last backup time + estimated duration):
 
 ```
-age       = now - lastSuccess          # never-run -> treated as very overdue
+age       = now - lastCovered          # last service.archived when the service has an
+                                        # archiver, else last ok service.end;
+                                        # never -> treated as very overdue
 est       = sum of last step durations # never-run -> unknown (0)
 target    = desired interval           # <service>.targetIntervalHours, else
                                         # <config>.targetIntervalHours, else 24h
@@ -46,12 +48,14 @@ score     = overdue + sizeNudge        # sort descending
 - Mandatory services are forced to the front (still score-ordered among themselves)
   and bypass the fit check below — for a must-run-every-window service.
 
-The generic `overdue = age/target` is a fallback. When a service has an archiver,
-**the archive recipe computes `overdue` instead** (via `SetOverdue`) — only it knows
-its retention periods and cross-tier coverage. `archive-gfsy` reports the service
-covered (`overdue < 1`) if *any* tier was archived within the daily period, so a
-yearly or weekly backup also covers the daily. `archive-copy` uses a flat
-`ARCHIVE_MIN_INTERVAL_HOURS`.
+The engine computes `overdue` for every service, from the log, with one interval:
+`targetIntervalHours`. For a service with an archiver, the reference is its last
+archive (`service.archived`, of any tier: with gfsy a yearly or weekly also covers
+the day); a backup whose archive failed does not count, so it is retried. An
+earlier design let each archiver answer through a hook (`SetOverdue`); the three
+bundled archivers all computed exactly this, under three different interval
+variables, and `targetIntervalHours` was silently ignored for them. The hook is
+kept but not called, for an archiver whose truth would not be in the log.
 
 
 Coverage (don't re-back-up)
@@ -78,8 +82,7 @@ the timer fires at a local time, so across a spring DST change only 23 real hour
 separate two nightly runs (ages are measured in UTC, see
 [architecture.md](architecture.md#time)), and 2% of a day would skip that night's
 backup (added, not the larger of the two: 23h/24h sits exactly on `1 − 1h/24h`,
-and jitter would tip it). The archiver states its period (`PeriodSec`) for this; without an archiver,
-the target interval is used.
+and jitter would tip it). The period is the service's `targetIntervalHours`.
 
 
 Window packing (execution)

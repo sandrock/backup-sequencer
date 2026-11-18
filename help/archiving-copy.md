@@ -72,7 +72,6 @@ own `env`.
 |---|---|---|
 | `ARCHIVE_DEST` | *(required)* | Destination base dir; the service name is appended. |
 | `ARCHIVE_KEEP` | `3` | How many copies to keep. |
-| `ARCHIVE_MIN_INTERVAL_HOURS` | `24` | Coverage interval for the overdue query (below). |
 
 
 Pruning (log-driven)
@@ -88,10 +87,9 @@ sequencer's irregular, non-cron timing.
 Coverage (don't re-back-up)
 ----------------------------------------------------------------
 
-The recipe reports *overdue* to the planner: a service whose newest copy is younger
-than `ARCHIVE_MIN_INTERVAL_HOURS` (default 24) is **covered** and skipped that
-window — no dump, no downtime. A flat archiver has no tiers, so this is a simple
-minimum interval. See [the scheduling model](../docs/scheduling.md).
+A service whose newest copy is younger than its `targetIntervalHours` (default 24,
+set on the service) is **covered** and skipped that window — no dump, no downtime.
+The engine reads that from the event log. See [the scheduling model](../docs/scheduling.md).
 
 
 Restore

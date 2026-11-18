@@ -27,7 +27,6 @@
     RESTIC_COMPRESSION       restic compression mode (e.g. max); feed uncompressed input.
     RESTIC_HOST              snapshot host tag (default: this machine's hostname).
     RESTIC_TAGS              extra tags, ';'-separated (the service name is always a tag).
-    RESTIC_MIN_INTERVAL_HOURS coverage interval for the overdue query (default 24).
     RESTIC_BIN               restic executable (default: restic; overridable for tests).
   Any other RESTIC_* in the env is passed through to the restic process, so backend
   credentials/options work without recipe changes.
@@ -129,20 +128,3 @@ $Recipe.SetValidate({
     return $problems
 })
 
-# overdue query (plan time): restic retention is out of band, so coverage here is a
-# simple minimum interval — covered if the newest snapshot is younger than
-# RESTIC_MIN_INTERVAL_HOURS (default 24). overdue = newest age / that interval.
-$Recipe.SetOverdue({
-    param($ctx)
-    $minHours = [double]($ctx.EnvValue('RESTIC_MIN_INTERVAL_HOURS', '24'))
-    if ($minHours -le 0) { $minHours = 24 }
-    $mine = @($ctx.ReadEvents() | Where-Object {
-            $_.type -eq 'service.archived' -and $_.svc -eq $ctx.Service -and $_.PSObject.Properties['ts']
-        })
-    $ctx.State['PeriodSec'] = $minHours * 3600.0   # lets the engine size its coverage tolerance
-    if (-not $mine) { return 1e6 }   # never archived -> very overdue
-    $newest = ($mine | Sort-Object { [datetime]$_.ts } | Select-Object -Last 1)
-    $ageSeconds = ($ctx.Now.ToUniversalTime() - ([datetime]$newest.ts).ToUniversalTime()).TotalSeconds
-    if ($ageSeconds -lt 0) { $ageSeconds = 0 }
-    return $ageSeconds / ($minHours * 3600.0)
-})

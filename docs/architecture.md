@@ -31,7 +31,7 @@ to register its steps:
 ```
 param($Recipe)
 $Recipe.AddStep('dump', { param($ctx) ... })   # register a step
-$Recipe.SetOverdue({ param($ctx) ... })        # optional: archiver coverage query
+$Recipe.SetOverdue({ param($ctx) ... })        # kept, not called for now (coverage is the engine's)
 $Recipe.SetValidate({ param($ctx) ... })       # optional: preflight prereq check
 ```
 
@@ -56,8 +56,7 @@ The context carries everything a step needs:
   that steps meant to go together are configured together (e.g. `dump` leaves hot
   dirs out only when `hot-dump` is listed).
 
-An archiver recipe additionally registers `SetOverdue` (its plan-time coverage
-query) and returns its result (tier / path / snapshot, pruned paths) via
+An archiver recipe returns its result (tier / path / snapshot, pruned paths) via
 `$ctx.State['Result']`, which the engine records as `service.archived`.
 
 A recipe (backup or archiver) may also register `SetValidate`, returning a list of

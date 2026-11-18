@@ -94,7 +94,6 @@ Environment:
 | `RESTIC_COMPRESSION` | — | `max` / `auto` / `off`. Feed uncompressed input and use `max`. |
 | `RESTIC_HOST` | — | Snapshot host tag. Defaults to the machine's hostname. |
 | `RESTIC_TAGS` | — | Extra tags, `;`-separated. The service name is always a tag. |
-| `RESTIC_MIN_INTERVAL_HOURS` | — | Coverage interval for the overdue query (default 24). |
 | `RESTIC_BIN` | — | restic executable (default `restic`). |
 
 Any other `RESTIC_*` (and backend variables restic reads from the environment) is
@@ -144,9 +143,9 @@ backup mid-window.
 Coverage (don't re-snapshot)
 ----------------------------------------------------------------
 
-The recipe reports *overdue* to the planner from the event log: a service whose
-newest snapshot is younger than `RESTIC_MIN_INTERVAL_HOURS` (default 24) is
-**covered** and skipped that window — no dump, no downtime. A failed snapshot
+A service whose newest snapshot is younger than its `targetIntervalHours`
+(default 24, set on the service) is **covered** and skipped that window — no dump,
+no downtime. The engine reads that from the event log. A failed snapshot
 writes no `service.archived` event, so the service stays overdue and the next
 window retries it automatically. See [the scheduling model](../docs/scheduling.md).
 

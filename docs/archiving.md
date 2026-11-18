@@ -115,8 +115,8 @@ resolved along the scope chain `top-level env ← service env ← syncArchive.en
   run from inside that dir so the set's files sit at the snapshot root);
   there is no on-disk copy, so pair it with `"publishToReady": false`. Retention
   (`restic forget --prune`) runs **out of band** on its own schedule — the recipe
-  only ever adds snapshots. Coverage is a flat minimum interval
-  (`RESTIC_MIN_INTERVAL_HOURS`, default 24). See
+  only ever adds snapshots. Coverage is the engine's, from the log (the
+  service's `targetIntervalHours`). See
   [the restic archiver guide](../help/archiving-restic.md).
 
 The two copiers name the copy by the run id, and the restic recipe records the

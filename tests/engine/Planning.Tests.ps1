@@ -100,50 +100,66 @@ Describe 'window math' {
     }
 }
 
-Describe 'coverage (archiver-computed overdue)' {
-    It 'gfsy reports covered (<1) right after an archive, overdue (>=1) when stale' {
-        $ev = Join-Path $Work "ov-$([guid]::NewGuid().ToString('n').Substring(0,6)).jsonl"
-        Add-Content -LiteralPath $ev -Value (@{ ts = '2026-11-06T10:00:00+00:00'; type = 'service.archived'; svc = 'app'; tier = 'daily'; path = '/x' } | ConvertTo-Json -Compress)
-        $cfg = @'
-{ "window": { "open": "23:00", "close": "06:00" },
-  "services": { "app": { "enabled": true, "script": "fixtures/mock-service.ps1",
-    "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1" }, "steps": [] } } }
-'@ | ConvertFrom-Json
-        # 2h after the archive -> covered
-        (Get-ServiceOverdue -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev -At ([datetime]'2026-11-06T12:00:00+00:00')) | Should -BeLessThan 1
-        # 2 days after -> due
-        (Get-ServiceOverdue -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev -At ([datetime]'2026-11-08T12:00:00+00:00')) | Should -BeGreaterThan 1
+Describe 'coverage (from the event log, one interval per service)' {
+    BeforeAll {
+        # the plan entry of 'app' at $At, from raw events
+        $script:planOf = {
+            param([string]$Services, [object[]]$Events, [datetime]$At)
+            $ev = Join-Path $Work "cov-$([guid]::NewGuid().ToString('n').Substring(0,6)).jsonl"
+            foreach ($e in $Events) { Add-Content -LiteralPath $ev -Value ($e | ConvertTo-Json -Compress) }
+            $cfg = ('{ "window": { "open": "23:00", "close": "06:00" }, "services": { "app": ' + $Services + ' } }') | ConvertFrom-Json
+            $proj = Get-ServiceProjection -EventsPath $ev
+            @(Get-BackupPlan -Config $cfg -Projection $proj -At $At)[0]
+        }
+        $script:withArchiver = '{ "enabled": true, "script": "fixtures/mock-service.ps1", "syncArchive": { "script": "../src/recipes/archive-restic.ps1" }, "steps": [] }'
+        $script:noArchiver = '{ "enabled": true, "script": "fixtures/mock-service.ps1", "steps": [] }'
+        $script:t0 = [datetime]::new(2026, 11, 6, 10, 0, 0, [System.DateTimeKind]::Utc)
+        $script:threshold = { param($job) Get-CoverageThreshold -Margin 0.02 -PeriodSeconds $job.PeriodSeconds }
     }
 
-    It 'gfsy: a yearly within the daily period also covers the daily' {
-        $ev = Join-Path $Work "ovy-$([guid]::NewGuid().ToString('n').Substring(0,6)).jsonl"
-        Add-Content -LiteralPath $ev -Value (@{ ts = '2026-11-06T10:00:00+00:00'; type = 'service.archived'; svc = 'app'; tier = 'yearly'; path = '/x' } | ConvertTo-Json -Compress)
-        $cfg = @'
-{ "window": { "open": "23:00", "close": "06:00" },
-  "services": { "app": { "enabled": true, "script": "fixtures/mock-service.ps1",
-    "syncArchive": { "script": "../src/recipes/archive-gfsy.ps1" }, "steps": [] } } }
-'@ | ConvertFrom-Json
-        (Get-ServiceOverdue -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev -At ([datetime]'2026-11-06T13:00:00+00:00')) | Should -BeLessThan 1
+    It 'counts the last archive for a service with an archiver: covered after, due when stale' {
+        $events = @(@{ ts = $t0.ToString('o'); type = 'service.archived'; svc = 'app'; snapshot = 'abc' })
+        $job = & $planOf $withArchiver $events $t0.AddHours(2)
+        $job.Overdue | Should -BeLessThan (& $threshold $job)
+        $job.LastCovered | Should -Be $t0
+        $job = & $planOf $withArchiver $events $t0.AddDays(2)
+        $job.Overdue | Should -BeGreaterThan 1
     }
 
-    It 'restic reports covered (<1) right after a snapshot, overdue (>=1) when stale' {
-        $ev = Join-Path $Work "ovr-$([guid]::NewGuid().ToString('n').Substring(0,6)).jsonl"
-        Add-Content -LiteralPath $ev -Value (@{ ts = '2026-11-06T10:00:00+00:00'; type = 'service.archived'; svc = 'app'; snapshot = 'abc'; repo = '/r' } | ConvertTo-Json -Compress)
-        $cfg = @'
-{ "window": { "open": "23:00", "close": "06:00" },
-  "services": { "app": { "enabled": true, "script": "fixtures/mock-service.ps1",
-    "syncArchive": { "script": "../src/recipes/archive-restic.ps1" }, "steps": [] } } }
-'@ | ConvertFrom-Json
-        (Get-ServiceOverdue -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev -At ([datetime]'2026-11-06T12:00:00+00:00')) | Should -BeLessThan 1
-        (Get-ServiceOverdue -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev -At ([datetime]'2026-11-08T12:00:00+00:00')) | Should -BeGreaterThan 1
+    It 'any archive counts, whatever its tier (a yearly covers the day)' {
+        $events = @(@{ ts = $t0.ToString('o'); type = 'service.archived'; svc = 'app'; tier = 'yearly'; path = '/x' })
+        $job = & $planOf $withArchiver $events $t0.AddHours(3)
+        $job.Overdue | Should -BeLessThan (& $threshold $job)
     }
 
-    It 'returns null for a service with no archiver' {
-        $ev = Join-Path $Work "ovn-$([guid]::NewGuid().ToString('n').Substring(0,6)).jsonl"
-        $cfg = @'
-{ "window": { "open": "23:00", "close": "06:00" },
-  "services": { "app": { "enabled": true, "script": "fixtures/mock-service.ps1", "steps": [] } } }
-'@ | ConvertFrom-Json
-        (Get-ServiceOverdue -Config $cfg -Service 'app' -BaseDir $TestsDir -EventsPath $ev) | Should -BeNullOrEmpty
+    It 'does not count a backup whose archive failed: it is retried' {
+        $events = @(
+            @{ ts = $t0.AddDays(-3).ToString('o'); type = 'service.archived'; svc = 'app'; snapshot = 'old' },
+            @{ ts = $t0.ToString('o'); type = 'service.end'; svc = 'app'; status = 'ok'; bytes = 10 })   # backed up, not archived
+        $job = & $planOf $withArchiver $events $t0.AddHours(2)
+        $job.Overdue | Should -BeGreaterThan 1
+    }
+
+    It 'counts the last successful backup for a service without an archiver' {
+        $events = @(@{ ts = $t0.ToString('o'); type = 'service.end'; svc = 'app'; status = 'ok'; bytes = 10 })
+        $job = & $planOf $noArchiver $events $t0.AddHours(2)
+        $job.Overdue | Should -BeLessThan (& $threshold $job)
+        $job.LastCovered | Should -Be $t0
+    }
+
+    It 'uses targetIntervalHours for a service with an archiver too' {
+        $svc = '{ "enabled": true, "targetIntervalHours": 72, "script": "fixtures/mock-service.ps1", "syncArchive": { "script": "../src/recipes/archive-restic.ps1" }, "steps": [] }'
+        $events = @(@{ ts = $t0.ToString('o'); type = 'service.archived'; svc = 'app'; snapshot = 'abc' })
+        $job = & $planOf $svc $events $t0.AddHours(48)
+        $job.PeriodSeconds | Should -Be (72 * 3600)
+        $job.Overdue | Should -BeLessThan (& $threshold $job)        # 2 days: covered
+        $job = & $planOf $svc $events $t0.AddHours(72)
+        $job.Overdue | Should -BeGreaterThan (& $threshold $job)     # 3 days: due
+    }
+
+    It 'puts a never-archived service first' {
+        $job = & $planOf $withArchiver @(@{ ts = $t0.ToString('o'); type = 'service.end'; svc = 'app'; status = 'ok'; bytes = 10 }) $t0
+        $job.Overdue | Should -Be 1e6
+        $job.LastCovered | Should -BeNullOrEmpty
     }
 }

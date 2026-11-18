@@ -15,15 +15,13 @@
   newest archive of each of the last N PERIODS (not the N most recent copies), so
   extra same-period runs can never erode day/week/year coverage. Log-driven, by the
   recorded ts/path — never by dir names.
-  It also answers an overdue query for the planner (SetOverdue): the service is
-  covered for the day if ANY tier was archived within the daily period (a yearly or
-  weekly backup also covers the daily), so the planner can skip a covered service.
+  Coverage is the engine's: any archive of the service, whatever its tier, counts
+  for the service's targetIntervalHours (a yearly or weekly also covers the day).
   Env (via $ctx):
     ARCHIVE_DEST         (required) destination base dir; the service name is appended.
     ARCHIVE_KEEP_DAILY   (default 2) daily periods to keep.
     ARCHIVE_KEEP_WEEKLY  (default 2) weekly periods to keep.
     ARCHIVE_KEEP_YEARLY  (default 2) yearly periods to keep.
-    ARCHIVE_DAILY_HOURS  (default 24) the daily coverage period, for the overdue query.
   Layout: <ARCHIVE_DEST>/<service>/<tier>/<runId>/<artifacts>
   Reports { tier, path, pruned } back through $ctx.State.Result so the engine
   can log the tier on service.archived and record each pruned path.
@@ -155,20 +153,3 @@ $Recipe.SetValidate({
     return $problems
 })
 
-# overdue query (plan time): covered for the day if ANY tier was archived within the
-# daily period — a yearly/weekly backup also covers the daily. overdue = newest
-# archive age / daily period; >= 1 means due, < 1 means already covered.
-$Recipe.SetOverdue({
-    param($ctx)
-    $dailyHours = [double]($ctx.EnvValue('ARCHIVE_DAILY_HOURS', '24'))
-    if ($dailyHours -le 0) { $dailyHours = 24 }
-    $mine = @($ctx.ReadEvents() | Where-Object {
-            $_.type -eq 'service.archived' -and $_.svc -eq $ctx.Service -and $_.PSObject.Properties['ts']
-        })
-    $ctx.State['PeriodSec'] = $dailyHours * 3600.0   # lets the engine size its coverage tolerance
-    if (-not $mine) { return 1e6 }   # never archived -> very overdue
-    $newest = ($mine | Sort-Object { [datetime]$_.ts } | Select-Object -Last 1)
-    $ageSeconds = ($ctx.Now.ToUniversalTime() - ([datetime]$newest.ts).ToUniversalTime()).TotalSeconds
-    if ($ageSeconds -lt 0) { $ageSeconds = 0 }
-    return $ageSeconds / ($dailyHours * 3600.0)
-})

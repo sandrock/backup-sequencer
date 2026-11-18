@@ -80,15 +80,8 @@ Describe 'coverage tolerance' {
         $job.Overdue | Should -BeLessThan (Get-CoverageThreshold -Margin 0.02 -PeriodSeconds $job.PeriodSeconds)
     }
 
-    It 'takes the period from the archiver' {
-        $info = @{}
-        $cfg = @'
-{ "window": { "open": "00:00", "close": "23:59" },
-  "services": { "app": { "enabled": true, "script": "fixtures/mock-service.ps1",
-    "syncArchive": { "script": "../src/recipes/archive-copy.ps1", "env": { "ARCHIVE_DEST": "/nonexistent", "ARCHIVE_MIN_INTERVAL_HOURS": "48" } },
-    "steps": [] } } }
-'@ | ConvertFrom-Json
-        $null = Get-ServiceOverdue -Config $cfg -Service 'app' -BaseDir (Join-Path $RepoDir 'tests') -EventsPath (Join-Path $Work 'time-none.jsonl') -Info $info
-        $info['PeriodSec'] | Should -Be (48 * 3600)
+    It 'sizes the tolerance on the service''s own interval' {
+        $cfg = '{ "window": { "open": "00:00", "close": "23:59" }, "services": { "app": { "enabled": true, "targetIntervalHours": 48 } } }' | ConvertFrom-Json
+        @(Get-BackupPlan -Config $cfg -At ([datetime]::UtcNow))[0].PeriodSeconds | Should -Be (48 * 3600)
     }
 }

@@ -92,16 +92,14 @@ setting `ARCHIVE_DEST` in its own `env`.
 | `ARCHIVE_KEEP_DAILY` | `2` | Daily periods to keep. |
 | `ARCHIVE_KEEP_WEEKLY` | `2` | Weekly periods to keep. |
 | `ARCHIVE_KEEP_YEARLY` | `2` | Yearly periods to keep. |
-| `ARCHIVE_DAILY_HOURS` | `24` | The daily coverage period, for the overdue query (below). |
 
 
 Coverage (cross-tier)
 ----------------------------------------------------------------
 
-The recipe reports *overdue* to the planner, and coverage is **cross-tier**: a
-service is covered for the day if *any* tier was archived within the daily period
-(`ARCHIVE_DAILY_HOURS`, default 24) — a yearly or weekly backup also covers the
-daily. So a covered service is skipped that window (no dump, no downtime), and the
+Coverage is **cross-tier**: a service is covered if *any* tier was archived within
+its `targetIntervalHours` (default 24, set on the service) — a yearly or weekly
+backup also covers the daily. So a covered service is skipped that window (no dump, no downtime), and the
 day's single backup is routed to whichever tier is due. See
 [the scheduling model](../docs/scheduling.md).
 
