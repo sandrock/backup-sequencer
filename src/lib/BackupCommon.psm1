@@ -648,7 +648,8 @@ function Invoke-BackupRun {
         Clear-Trash -TrashRoot $stg.Trash   # reap leftovers at run start, off the publish path
 
         Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'run.start' `
-            -Props @{ runId = $runId; window = "$($Config.window.open)-$($Config.window.close)" }
+            -Props @{ runId = $runId; window = "$($Config.window.open)-$($Config.window.close)"
+                forced = $(if ($ForceAllJobs) { 'all' } elseif ($ForceWindow) { 'window' } else { 'none' }) }
         $startDetail = "$runId  window $($Config.window.open)-$($Config.window.close)"
         if ($ForceAllJobs) { $startDetail += '  forced: window + all jobs' } elseif ($ForceWindow) { $startDetail += '  forced: window' }
         Write-RunLine -RunId $runId -Event 'begin' -Detail $startDetail
@@ -727,6 +728,9 @@ function Invoke-BackupRun {
             $estText = if (-not $plannedJob.LastSuccess -and $plannedJob.EstimatedSeconds -le 0) { '?' } else { Format-DurationUnit $plannedJob.EstimatedSeconds }
             $beginDetail = "est $estText"
             if ($plannedJob.Mandatory) { $beginDetail += '  mandatory' }
+            Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.begin' `
+                -Props @{ runId = $runId; svc = $serviceName; mandatory = [bool]$plannedJob.Mandatory
+                    estSec = $(if ($estText -eq '?') { -1 } else { [int]$plannedJob.EstimatedSeconds }) }
             Write-RunLine -RunId $runId -Service $serviceName -Event 'begin' -Detail $beginDetail
             try {
             # isolate per-service failures: an unhandled error here fails only this service
@@ -826,7 +830,7 @@ function Invoke-BackupRun {
                     $reason = "recipe not found: $($sa.script)"
                     Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.syncfail' `
                         -Props @{ runId = $runId; svc = $serviceName; reason = $reason }
-                    Write-RunLine -RunId $runId -Service $serviceName -Step 'sync-archive' -Event 'end' -Status 'FAIL' -Detail "! $reason"
+                    Write-RunLine -RunId $runId -Service $serviceName -Event 'msg' -Status 'FAIL' -Detail "! archive not run: $reason"
                 }
                 else {
                     $arc = [RecipeContext]::new()
@@ -845,7 +849,7 @@ function Invoke-BackupRun {
                         $reason = "recipe did not register an 'archive' step"
                         Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.syncfail' `
                             -Props @{ runId = $runId; svc = $serviceName; reason = $reason }
-                        Write-RunLine -RunId $runId -Service $serviceName -Step 'sync-archive' -Event 'end' -Status 'FAIL' -Detail "! $reason"
+                        Write-RunLine -RunId $runId -Service $serviceName -Event 'msg' -Status 'FAIL' -Detail "! archive not run: $reason"
                     }
                     else {
                         $archiveBlock = $arc.Steps['archive']
@@ -923,14 +927,14 @@ function Invoke-BackupRun {
             if ($syncFailed -and -not $publishToReady) {
                 $failCount++
                 Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
-                    -Props @{ runId = $runId; svc = $serviceName; status = 'fail'; bytes = $bytes; error = 'sync-archive failed; nothing retained' }
+                    -Props @{ runId = $runId; svc = $serviceName; status = 'fail'; bytes = $bytes; kept = 'dropped'; error = 'sync-archive failed; nothing retained' }
                 Write-RunLine -RunId $runId -Service $serviceName -Event 'end' -Status 'FAIL' -Seconds $svcClock.Elapsed.TotalSeconds `
                     -Detail "$sizeText  ! archive failed, nothing retained (retried next window)"
             }
             else {
                 $okCount++
                 Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.end' `
-                    -Props @{ runId = $runId; svc = $serviceName; status = 'ok'; bytes = $bytes }
+                    -Props @{ runId = $runId; svc = $serviceName; status = 'ok'; bytes = $bytes; kept = $(if ($publishToReady) { 'ready' } else { 'dropped' }) }
                 $notes = @()
                 if ($archNote) { $notes += $archNote }
                 if ($syncFailed) { $notes += 'archive failed' }
@@ -1220,7 +1224,7 @@ function Get-RunDetail {
             $services[$name] = [pscustomobject]@{
                 Service = $name; Steps = [System.Collections.Generic.List[object]]::new(); Open = $null
                 Status = $null; Reason = $null; Problems = @(); Error = $null; Bytes = $null
-                Snapshot = $null; Tier = $null; SyncFail = $null
+                Snapshot = $null; Tier = $null; SyncFail = $null; Started = $false
                 Warnings = [System.Collections.Generic.List[string]]::new()
             }
         }
@@ -1232,6 +1236,7 @@ function Get-RunDetail {
         if (-not (Test-HasProp $e 'svc')) { continue }
         $svc = & $get ([string]$e.svc)
         switch ($e.type) {
+            'service.begin' { $svc.Started = $true }
             'step.start' { $svc.Open = [pscustomobject]@{ Step = [string]$e.step; Start = $e.ts } }
             'step.end' {
                 $svc.Steps.Add([pscustomobject]@{ Step = [string]$e.step; Status = [string]$e.status; DurationSec = [double]$e.durationSec })
@@ -1304,6 +1309,14 @@ function Format-RunDetail {
                 $note = 'check this service: a backup stopped mid-step may have left it down'
             }
         }
+        elseif ($s.Started -and -not $s.Status) {
+            # begun, but no step open: between two steps, or in the engine's own work
+            if ($run.State -eq 'running') { $status = '> between steps' }
+            else {
+                $status = '! died between steps'
+                $note = 'check this service: a backup stopped mid-way may have left it down'
+            }
+        }
         elseif ($s.Status -eq 'skipped') { $status = "skipped ($($s.Reason))" }
         elseif ($s.Status -eq 'fail' -and $s.Reason -eq 'invalid') { $status = 'INVALID' }
         elseif ($s.Status -eq 'fail') { $status = 'FAIL' }
@@ -1331,6 +1344,7 @@ function Format-RunHistoryLine {
     $run = $Detail.Run
     $svcs = @($Detail.Services | ForEach-Object {
             if ($_.Open) { "{0}:{1}..." -f $_.Service, $_.Open.Step }
+            elseif ($_.Started -and -not $_.Status) { "{0}:..." -f $_.Service }
             elseif ($_.Status) { "{0}:{1}" -f $_.Service, $(if ($_.Status -eq 'skipped') { $_.Reason } else { $_.Status }) }
         } | Where-Object { $_ })
     $svcStr = if ($svcs.Count) { $svcs -join ' ' } else { '(nothing run)' }

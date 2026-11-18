@@ -116,6 +116,29 @@ Describe 'run status and detail (status / show / history)' {
         (Format-RunHistoryLine -Detail $detail) | Should -Match 'r1  INTERRUPTED  \[a:dump\.\.\.\]'
     }
 
+    It 'tells a service between two steps from one never reached' {
+        & $addEv $ev (& $iso 0) 'run.start' @{ runId = 'r1' }
+        & $addEv $ev (& $iso 0) 'run.plan' @{ runId = 'r1'; plan = @('a', 'b') }
+        & $addEv $ev (& $iso 1) 'service.begin' @{ runId = 'r1'; svc = 'a'; estSec = 60; mandatory = $false }
+        & $addEv $ev (& $iso 1) 'step.start' @{ runId = 'r1'; svc = 'a'; step = 'dump' }
+        & $addEv $ev (& $iso 4) 'step.end' @{ runId = 'r1'; svc = 'a'; step = 'dump'; status = 'ok'; durationSec = 3 }
+        $events = @(Get-BackupEvents -EventsPath $ev)
+
+        Set-Content -LiteralPath $lock -Value $PID   # still running
+        $detail = Get-RunDetail -Events $events -Run (Get-RunStates -Events $events -LockPath $lock)[-1]
+        $text = (Format-RunDetail -Detail $detail -Now $t0.AddSeconds(10)) -join "`n"
+        $text | Should -Match 'a\s+> between steps'
+        $text | Should -Match 'b\s+pending'
+        (Format-RunHistoryLine -Detail $detail -Now $t0.AddSeconds(10)) | Should -Match '\[a:\.\.\.\]'
+
+        Remove-Item -LiteralPath $lock                # died there
+        $detail = Get-RunDetail -Events $events -Run (Get-RunStates -Events $events -LockPath $lock)[-1]
+        $text = (Format-RunDetail -Detail $detail) -join "`n"
+        $text | Should -Match 'a\s+! died between steps'
+        $text | Should -Match 'may have left it down'
+        $text | Should -Match 'b\s+not reached'
+    }
+
     It 'shows skipped and invalid services of a finished run, with problems and archive failures' {
         & $addEv $ev (& $iso 0) 'run.start' @{ runId = 'r1' }
         & $addEv $ev (& $iso 0) 'service.skip' @{ runId = 'r1'; svc = 'a'; reason = 'covered' }

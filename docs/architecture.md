@@ -85,11 +85,17 @@ Two files, single-writer each:
   `resources` it holds and a `timeoutSec` — the latter two are declared but not yet
   enforced (see Resource model).
 - `events.jsonl` — engine-owned, append-only. One typed line per event
-  (`run.start`, `run.plan`, `step.start`, `step.end`, `service.end`,
-  `service.skip`, `service.replaced`, `service.syncfail`, `service.archived`,
-  `service.archive-pruned`, `run.windowclosed`, `run.end`). Crash-safe and the
-  single source of truth — e.g. archivers route and prune by `service.archived` /
-  `service.archive-pruned` rather than by directory names.
+  (`run.start`, `run.plan`, `service.begin`, `step.start`, `step.end`,
+  `service.end`, `service.skip`, `service.replaced`, `service.syncfail`,
+  `service.archived`, `service.archive-pruned`, `run.windowclosed`, `run.end`).
+  Crash-safe and the single source of truth — e.g. archivers route and prune by
+  `service.archived` / `service.archive-pruned` rather than by directory names.
+  Anything the run output tells that a reader may need later is in an event:
+  `run.start` has `forced` (`none` / `window` / `all`), `service.begin` the
+  estimate (`estSec`, -1 when unknown) and `mandatory`, `service.end` where the
+  copy is (`kept`: `ready` / `dropped`). Events that close an action carry
+  `status` and, when it failed, `error` (see [run-output.md](run-output.md)).
+  Fields and types are only ever added; the log is never rewritten.
 
 "Current state" is a projection folded from the event log
 (`Get-ServiceProjection`): per service, last success, typical step durations,
@@ -105,7 +111,7 @@ Run lifecycle
    compute the plan; emit `run.plan`.
 3. For each planned service, while inside the window (unless `-ForceWindow`) and it
    fits the time left (unless mandatory or `-ForceAllJobs`; see [scheduling.md](scheduling.md)):
-   - pre-flight free-space check against the last recorded size;
+   - emit `service.begin`; pre-flight free-space check against the last recorded size;
    - build the service's env (the scope chain), load the recipe (registering its
      steps), then run each listed step via `Invoke-BackupStep` (timing, retries,
      events), producing the artifact set into `wip/<service>/`;

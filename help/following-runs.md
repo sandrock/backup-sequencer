@@ -175,6 +175,7 @@ Outcome:
 | `skipped (insufficient-space)` | not enough free space in the spool for the expected size |
 | `> step (time)` | running now |
 | `! died in step` | the run was interrupted during that step (see above) |
+| `> between steps` / `! died between steps` | the service has begun but no step is running: the engine is between two steps or archiving / publishing; or the run died there |
 | `pending` / `not reached` | not started yet / never started (the run ended or died first) |
 
 The archive column is the restic snapshot id (`snap …`), or the tier for tiered

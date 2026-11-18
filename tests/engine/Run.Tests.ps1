@@ -112,6 +112,26 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
         (Test-Path (Join-Path $root 'ready/app')) | Should -BeFalse
         @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'step.end' -and $_.step -eq 'sync-archive' -and $_.status -eq 'ok' }).Count | Should -BeGreaterThan 0
+        @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.end' })[-1].kept | Should -Be 'dropped'
+    }
+
+    It 'records what the run output tells: forced flags, service start with its estimate, where the copy is kept' {
+        $cfg = @'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1", "publishToReady": true,
+    "steps": [ { "name": "dump", "resources": [] } ] } } }
+'@ | ConvertFrom-Json
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -ForceAllJobs -WarningAction SilentlyContinue | Out-Null
+        Invoke-BackupRun -Config $cfg -Paths $paths -WarningAction SilentlyContinue | Out-Null   # regular (covered: no backup)
+        $evs = @(Get-BackupEvents -EventsPath $ev)
+        @($evs | Where-Object { $_.type -eq 'run.start' } | ForEach-Object { $_.forced }) -join ',' | Should -Be 'window,all,none'
+        $starts = @($evs | Where-Object { $_.type -eq 'service.begin' })
+        $starts[0].svc | Should -Be 'app'
+        $starts[0].mandatory | Should -BeTrue
+        $starts[0].estSec | Should -Be -1            # never backed up: unknown estimate
+        $starts[1].estSec | Should -BeGreaterOrEqual 0
+        @($evs | Where-Object { $_.type -eq 'service.end' })[0].kept | Should -Be 'ready'
     }
 
     It 'sync-only (publishToReady=false): a sync failure retains nothing and fails the service' {
@@ -130,6 +150,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         # and nothing was archived -> the service is a failure, not a silent ok
         $endE = @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'app' })
         $endE[-1].status | Should -Be 'fail'
+        $endE[-1].kept | Should -Be 'dropped'
     }
 
     It 'publishToReady=true: a sync failure still publishes to ready/ and stays ok (archiver has it)' {
