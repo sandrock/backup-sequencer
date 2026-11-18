@@ -88,7 +88,7 @@ Two files, single-writer each:
   (`run.begin`, `run.plan`, `service.begin`, `step.begin`, `step.end`,
   `service.end`, `service.skip`, `service.replaced`, `service.syncfail`,
   `service.archived`, `service.archive-pruned`, `service.archive-prunefail`,
-  `trash.move`, `trash.delete`, `run.windowclosed`, `run.end`).
+  `trash.move`, `trash.delete`, `run.windowclosed`, `run.end`, `notify.send`).
   Crash-safe and the single source of truth — e.g. archivers route and prune by
   `service.archived` / `service.archive-pruned` rather than by directory names.
   Anything the run output tells that a reader may need later is in an event:
@@ -98,7 +98,8 @@ Two files, single-writer each:
   {svc, reason, trashName}, `trash.delete` {trashName, bytes, files, durationSec,
   and svc/reason/fromRun from its move}, `service.archive-pruned` {path, bytes,
   files}, `service.archive-prunefail` {path, error}; a stale lock removed is
-  `staleLockPid` on `run.begin`. Events that close an action carry
+  `staleLockPid` on `run.begin`. The report mail is `notify.send` {status, error,
+  to = recipient count}, after `run.end`. Events that close an action carry
   `status` and, when it failed, `error` (see [run-output.md](run-output.md)).
   Fields and types are only ever added; the log is never rewritten.
 

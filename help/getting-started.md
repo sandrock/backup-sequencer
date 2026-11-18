@@ -99,7 +99,9 @@ Copy `config.sample.json` to the config dir as `config.json` and edit it:
   the [docker-compose-cold recipe](recipe-docker-compose-cold.md). To ship each
   backup somewhere durable and prune it over time, see [Archiving](archiving.md).
 - `notify` — set `enabled: true` and your SMTP details; put the password in the
-  file named by `passwordFile` (relative to the config dir), mode `0600`.
+  file named by `passwordFile` (relative to the config dir), mode `0600`. Check
+  it with `sudo bseq test-notify` (see Reports below). Optional `swaks`: the
+  swaks executable, when not on the PATH.
 
 Each step may set `retries`, `timeoutSec`, and `alwaysRun` (run even after an
 earlier step in the same service failed — use it for recovery/cleanup).
@@ -151,3 +153,15 @@ Reports
 With `notify.enabled`, each run emails a terse digest (services, status,
 durations, sizes) via `swaks`. Sending every run acts as a dead-man's-switch: no
 email means the run did not happen. Keep the body free of secrets.
+
+To check the settings without waiting for a run:
+
+```sh
+sudo bseq test-notify
+```
+
+It mails the last run's report with `[test]` in the subject (or a short text when
+no run is recorded yet), even when `notify.enabled` is false, and prints swaks'
+reason when the send fails (exit 1). A run whose report could not be sent says so
+too: a `[notify] done FAIL` line, `report mail  FAIL` in `bseq show`, and
+`mail:FAIL` in `bseq history`.

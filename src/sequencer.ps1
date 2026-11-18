@@ -10,7 +10,7 @@
   JSON config and implemented by step scripts (recipes or bespoke). See docs/ for
   internals and help/ for usage.
 .PARAMETER Command
-  plan | validate | run | status | show | history | trash | help
+  plan | validate | run | status | show | history | trash | test-notify | help
 .PARAMETER RunRef
   show: which run(s) - 'latest' (default), run ids, or any unique ending of one.
   trash: which trash item(s), by name (default: all).
@@ -96,6 +96,8 @@ Commands:
   history   Show recent run summaries (newest first, incl. running/interrupted)
   trash     What the spool's trash/ holds and where it came from; -Delete [<name>...]
             deletes it now (all, or the names given; refused during a run)
+  test-notify  Mail the last run's report now, marked [test], to check the notify
+            settings (sent even when notify is disabled)
   help      This message
 
 Config resolution (unless -ConfigPath is given):
@@ -117,6 +119,8 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
     return
 }
 $Config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+# files named in the config (notify.passwordFile) are relative to the config's dir
+$ConfigDir = Split-Path -Parent (Resolve-Path -LiteralPath $ConfigPath).Path
 
 $VarDir = Get-VarDir
 $SpoolRoot = Get-SpoolDefault
@@ -163,12 +167,9 @@ switch ($Command) {
     }
     'run' {
         # the engine narrates the run live; here we only send the email report
-        $runId = Invoke-BackupRun -Config $Config -Paths $Paths -ForceWindow:$ForceWindow -ForceAllJobs:$ForceAllJobs -InformationAction Continue
-        if ($runId -and (Test-HasProp $Config 'notify') -and $Config.notify.enabled) {
-            $report = Format-RunReport -EventsPath $Paths.EventsPath -RunId $runId
-            Send-BackupReport -Notify $Config.notify -Subject "backup report $runId" `
-                -Body $report -BaseDir (Get-ConfigDir) | Out-Null
-        }
+        $InformationPreference = 'Continue'   # the run's narration lines
+        $runId = Invoke-BackupRun -Config $Config -Paths $Paths -ForceWindow:$ForceWindow -ForceAllJobs:$ForceAllJobs
+        if ($runId) { Send-RunReport -Config $Config -Paths $Paths -RunId $runId -BaseDir $ConfigDir }
     }
     'validate' {
         # dry preflight: check every enabled service's config + prerequisites, run nothing.
@@ -274,6 +275,28 @@ switch ($Command) {
             }
         }
         if ($unknown.Count) { exit 1 }
+    }
+    'test-notify' {
+        if (-not (Test-HasProp $Config 'notify') -or -not $Config.notify) { Write-Host 'no notify section in the config'; exit 1 }
+        if (-not ((Test-HasProp $Config.notify 'enabled') -and $Config.notify.enabled)) {
+            Write-Host 'warning: notify.enabled is false: runs send no mail (sending this test anyway)'
+        }
+        $events = @(Get-BackupEvents -EventsPath $Paths.EventsPath)
+        $runs = @(Get-RunStates -Events $events -LockPath $Paths.LockPath)
+        $hostName = [System.Net.Dns]::GetHostName()
+        $intro = "This is a test, sent by 'bseq test-notify' on $hostName at $(Format-EventTime ([datetime]::UtcNow))."
+        if ($runs.Count) {
+            $last = $runs[-1].RunId
+            $subject = "[test] backup report $last"
+            $body = $intro + " Below: the report of the last run.`n`n" + (Format-RunReport -EventsPath $Paths.EventsPath -RunId $last)
+        }
+        else {
+            $subject = '[test] backup report'
+            $body = $intro + ' No run recorded yet.'
+        }
+        $r = Send-BackupReport -Notify $Config.notify -Subject $subject -Body $body -BaseDir $ConfigDir -Force
+        if ($r.Sent) { Write-Host ("sent '{0}' to {1}" -f $subject, (@($Config.notify.to) -join ', ')) }
+        else { Write-Host "FAIL: $($r.Error)"; exit 1 }
     }
     default {
         Write-Host "Unknown command: $Command"

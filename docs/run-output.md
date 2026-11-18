@@ -118,8 +118,9 @@ only ever added, and if a shape has to change, readers accept both forms.
 ### Engine actions in brackets
 
 What the engine does itself, as opposed to a recipe step, carries the action in
-brackets in the step column: `[trash]` (a dir moved into the spool's `trash/`) and
-`[delete]` (an item of `trash/` deleted). Two names, because they are two actions
+brackets in the step column: `[trash]` (a dir moved into the spool's `trash/`),
+`[delete]` (an item of `trash/` deleted) and `[notify]` (the report mail, sent
+after the run's `end`, so a mail that never left is in the log too). Two names, because they are two actions
 with different consequences when they fail: after a failed move the data is still
 in place; after a failed delete it sits in `trash/` and takes space until the next
 run. No step name is reserved: a recipe may call a step `delete`, and its lines

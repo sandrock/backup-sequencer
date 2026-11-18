@@ -1202,6 +1202,25 @@ function Invoke-BackupRun {
 
 # --- reporting --------------------------------------------------------------
 
+function Send-RunReport {
+    # After a run: mail its report when notify is enabled, and record the outcome
+    # (notify.send + a [notify] line), so a mail that never left shows in show/history.
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)][hashtable]$Paths,
+        [Parameter(Mandatory)][string]$RunId,
+        [string]$BaseDir = '.'
+    )
+    if (-not ((Test-HasProp $Config 'notify') -and (Test-HasProp $Config.notify 'enabled') -and $Config.notify.enabled)) { return }
+    $report = Format-RunReport -EventsPath $Paths.EventsPath -RunId $RunId
+    $r = Send-BackupReport -Notify $Config.notify -Subject "backup report $RunId" -Body $report -BaseDir $BaseDir
+    $props = @{ runId = $RunId; status = $(if ($r.Sent) { 'ok' } else { 'fail' }); to = @($Config.notify.to).Count }
+    if ($r.Error) { $props.error = $r.Error }
+    Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'notify.send' -Props $props
+    if ($r.Sent) { Write-RunLine -RunId $RunId -Step '[notify]' -Event 'done' -Status 'ok' -Detail ("report mailed to {0} recipient(s)" -f $props.to) }
+    else { Write-RunLine -RunId $RunId -Step '[notify]' -Event 'done' -Status 'FAIL' -Detail "! $($r.Error)" }
+}
+
 function Format-RunReport {
     # Render a terse text report for one run (reused by history + notifications).
     param(
@@ -1241,39 +1260,43 @@ function Format-RunReport {
 }
 
 function Send-BackupReport {
-    # Send a run report via swaks over SMTP. Keep the body terse (no secrets).
+    # Send a report via swaks over SMTP. Keep the body terse (no secrets). Never
+    # throws: returns @{ Sent; Error }, Sent = $false with Error = $null when notify is
+    # disabled (and -Force not given). swaks' own output is kept for the error.
     param(
         [Parameter(Mandatory)]$Notify,     # config.notify object
         [Parameter(Mandatory)][string]$Subject,
         [Parameter(Mandatory)][string]$Body,
-        [string]$BaseDir = '.'
+        [string]$BaseDir = '.',            # passwordFile is relative to it (the config dir)
+        [switch]$Force                     # send even when notify.enabled is false (test-notify)
     )
-    if (-not $Notify.enabled) {
-        return $false
-    }
-    if (-not (Get-Command swaks -ErrorAction SilentlyContinue)) {
-        Write-Warning 'swaks not found; skipping email report.'
-        return $false
-    }
+    $r = @{ Sent = $false; Error = $null }
+    if (-not $Force -and -not ((Test-HasProp $Notify 'enabled') -and $Notify.enabled)) { return $r }
+    $swaks = if ((Test-HasProp $Notify 'swaks') -and $Notify.swaks) { [string]$Notify.swaks } else { 'swaks' }
+    if (-not (Get-Command $swaks -ErrorAction SilentlyContinue)) { $r.Error = "swaks not found ($swaks)"; return $r }
     $passFile = Join-Path $BaseDir $Notify.passwordFile
-    if (-not (Test-Path -LiteralPath $passFile)) {
-        Write-Warning "SMTP password file not found: $passFile; skipping email."
-        return $false
-    }
+    if (-not (Test-Path -LiteralPath $passFile)) { $r.Error = "SMTP password file not found: $passFile"; return $r }
     $pass = (Get-Content -LiteralPath $passFile -Raw).Trim()
     $tmp = New-TemporaryFile
     Set-Content -LiteralPath $tmp -Value $Body
+    $errors = @()
     try {
-        foreach ($to in $Notify.to) {
-            & swaks --to $to --from $Notify.from `
+        foreach ($to in @($Notify.to)) {
+            $out = & $swaks --to $to --from $Notify.from `
                 --server $Notify.server --auth-user $Notify.authUser --auth-password $pass `
-                --header "Subject: $Subject" --body $tmp | Out-Null
+                --header "Subject: $Subject" --body $tmp 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                # swaks' last lines say why (e.g. "<** 535 Authentication failed"); never the password
+                $why = @($out | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() } | Select-Object -Last 2) -join ' / '
+                $errors += "to $to`: swaks exit $LASTEXITCODE$(if ($why) { ": $why" })"
+            }
         }
     }
     finally {
         Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
     }
-    return $true
+    if ($errors.Count) { $r.Error = $errors -join '; ' } else { $r.Sent = $true }
+    return $r
 }
 
 # --- run status / detail (status, show, history) ----------------------------
@@ -1479,9 +1502,14 @@ function Get-RunDetail {
     }
     foreach ($name in $order) { $null = & $get $name }
     $deletions = [System.Collections.Generic.List[object]]::new()
+    $notify = $null
     $short = { param($id) $x = [string]$id; $x.Substring([math]::Max(0, $x.Length - 4)) }
 
     foreach ($e in $runEvents) {
+        if ($e.type -eq 'notify.send') {
+            $notify = [pscustomobject]@{ Ok = ($e.status -eq 'ok'); Error = $(if (Test-HasProp $e 'error') { [string]$e.error } else { $null }) }
+            continue
+        }
         # trash deletions go to the run's deletions block, not to a service row: an
         # item deleted now may belong to a service this run never touches
         if ($e.type -eq 'trash.delete') {
@@ -1537,7 +1565,7 @@ function Get-RunDetail {
             }
         }
     }
-    return [pscustomobject]@{ Run = $Run; Services = @($services.Values); Deletions = @($deletions) }
+    return [pscustomobject]@{ Run = $Run; Services = @($services.Values); Deletions = @($deletions); Notify = $notify }
 }
 
 function Format-DeletionTotals {
@@ -1621,6 +1649,10 @@ function Format-RunDetail {
         if ($note) { $lines += "      ! $note" }
     }
     if ($Detail.Services.Count -eq 0) { $lines += '  (no services)' }
+    if ((Test-HasProp $Detail 'Notify') -and $Detail.Notify) {
+        $lines += ("  {0,-22} {1}" -f 'report mail', $(if ($Detail.Notify.Ok) { 'sent' } else { 'FAIL' }))
+        if (-not $Detail.Notify.Ok) { $lines += "      ! $($Detail.Notify.Error)" }
+    }
     if (@($Detail.Deletions).Count) {
         $lines += ("  {0,-22} {1}" -f 'deletions', (Format-DeletionTotals $Detail.Deletions))
         foreach ($d in $Detail.Deletions) {
@@ -1649,6 +1681,7 @@ function Format-RunHistoryLine {
             elseif ($_.Status) { "{0}:{1}" -f $_.Service, $(if ($_.Status -eq 'skipped') { $_.Reason } else { $_.Status }) }
         } | Where-Object { $_ })
     $svcStr = if ($svcs.Count) { $svcs -join ' ' } else { '(nothing run)' }
+    $mail = if ((Test-HasProp $Detail 'Notify') -and $Detail.Notify -and -not $Detail.Notify.Ok) { '  mail:FAIL' } else { '' }
     switch ($run.State) {
         'running' {
             return ("{0}  {1}  RUNNING ({2})  [{3}]" -f (Format-EventTime $run.Start), $run.RunId, (Format-Duration (($Now.ToUniversalTime() - ([datetime]$run.Start).ToUniversalTime()).TotalSeconds)), $svcStr)
@@ -1656,7 +1689,7 @@ function Format-RunHistoryLine {
         'interrupted' { return ("{0}  {1}  INTERRUPTED  [{2}]" -f (Format-EventTime $run.Start), $run.RunId, $svcStr) }
         default {
             $sum = $run.Summary
-            return ("{0}  {1}  ok={2} failed={3} planned={4}  [{5}]" -f (Format-EventTime $run.End), $run.RunId, $sum.ok, $sum.failed, $sum.planned, $svcStr)
+            return ("{0}  {1}  ok={2} failed={3} planned={4}  [{5}]{6}" -f (Format-EventTime $run.End), $run.RunId, $sum.ok, $sum.failed, $sum.planned, $svcStr, $mail)
         }
     }
 }
@@ -1670,4 +1703,4 @@ Export-ModuleMember -Function `
     Get-FreeSpaceBytes, Get-PathSizeBytes, Limit-StepWarnings, Invoke-BackupStep, `
     Get-SpoolPaths, Move-ToTrash, Move-Phase, Get-TrashMoves, Get-TrashItems, Clear-Trash, Reset-RunOutput, `
     Get-ScopedEnv, Get-ServiceOverdue, Get-ServiceValidationProblems, `
-    Get-CoverageThreshold, Get-BackupPlan, Invoke-BackupRun, Format-RunReport, Send-BackupReport
+    Get-CoverageThreshold, Get-BackupPlan, Invoke-BackupRun, Format-RunReport, Send-BackupReport, Send-RunReport

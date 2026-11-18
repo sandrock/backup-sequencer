@@ -56,7 +56,7 @@ the step's start time.
 | `retry` | a failed step is tried again |
 | `msg` | a message from the recipe during that step, or from the engine about the service |
 | `closed` | the window closed: remaining services wait for the next run |
-| `done` | an engine action with no begin line: `[trash]` or `[delete]` |
+| `done` | an engine action with no begin line: `[trash]`, `[delete]`, or `[notify]` (the report mail, after the run's `end`) |
 
 | Status | Meaning |
 |---|---|

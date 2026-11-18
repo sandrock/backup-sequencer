@@ -274,3 +274,54 @@ Describe 'CLI trash' {
         finally { & chmod 755 $stuck }
     }
 }
+
+Describe 'CLI test-notify' -Skip:($IsWindows) {
+    BeforeEach {
+        $script:tn = New-CliEnv -Name ("notify-" + [guid]::NewGuid().ToString('n').Substring(0, 6)) -Services @{ app = $mockSvc }
+        Set-Content -LiteralPath (Join-Path $tn.Config 'smtp.pass') -Value 'not-a-real-password'
+        $script:cfgFile = Join-Path $tn.Config 'config.json'
+        $c = Get-Content -LiteralPath $cfgFile -Raw | ConvertFrom-Json
+        $c | Add-Member -NotePropertyName notify -NotePropertyValue ([pscustomobject]@{ enabled = $true; from = 'backups@example.com'; to = @('ops@example.com')
+                server = 'smtp.example.com:587'; authUser = 'smtp-user'; passwordFile = 'smtp.pass'; swaks = $swaksStub })
+        Set-Content -LiteralPath $cfgFile -Value ($c | ConvertTo-Json -Depth 10)
+        $env:SWAKS_STUB_LOG = Join-Path $tn.Config 'swaks.log'; $env:SWAKS_STUB_FAIL = $null
+    }
+    AfterEach { $env:SWAKS_STUB_LOG = $null; $env:SWAKS_STUB_FAIL = $null }
+
+    It 'mails a test with no run yet' {
+        $r = Invoke-Cli $tn @('test-notify')
+        $r.Exit | Should -Be 0
+        $r.Out | Should -Match "sent '\[test\] backup report' to ops@example\.com"
+        Get-Content -LiteralPath $env:SWAKS_STUB_LOG -Raw | Should -Match 'No run recorded yet\.'
+    }
+
+    It 'mails the last run''s report, marked as a test, and records nothing' {
+        $null = Invoke-Cli $tn @('run', '-ForceWindow')
+        Remove-Item -LiteralPath $env:SWAKS_STUB_LOG   # the run's own report
+        $r = Invoke-Cli $tn @('test-notify')
+        $r.Exit | Should -Be 0
+        $text = Get-Content -LiteralPath $env:SWAKS_STUB_LOG -Raw
+        $text | Should -Match '(?m)^Subject: \[test\] backup report \d{8}-\d{6}-[0-9a-f]{4}$'
+        $text | Should -Match "This is a test, sent by 'bseq test-notify'"
+        $text | Should -Match '(?m)^Backup run '
+        $sends = @(Get-BackupEvents -EventsPath (Join-Path $tn.Var 'events.jsonl') | Where-Object { $_.type -eq 'notify.send' })
+        $sends.Count | Should -Be 1   # the run's report only
+    }
+
+    It 'sends when notify is disabled, with a warning' {
+        $c = Get-Content -LiteralPath $cfgFile -Raw | ConvertFrom-Json
+        $c.notify.enabled = $false
+        Set-Content -LiteralPath $cfgFile -Value ($c | ConvertTo-Json -Depth 10)
+        $r = Invoke-Cli $tn @('test-notify')
+        $r.Exit | Should -Be 0
+        $r.Out | Should -Match 'warning: notify.enabled is false'
+        (Test-Path $env:SWAKS_STUB_LOG) | Should -BeTrue
+    }
+
+    It 'says why a send failed and exits 1' {
+        $env:SWAKS_STUB_FAIL = '1'
+        $r = Invoke-Cli $tn @('test-notify')
+        $r.Exit | Should -Be 1
+        $r.Out | Should -Match 'FAIL: to ops@example\.com: swaks exit 28: <\*\* 535'
+    }
+}

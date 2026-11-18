@@ -23,6 +23,24 @@ exit 0
 Set-Content -LiteralPath $script:resticStub -NoNewline -Value ($stubBody -replace "`r", '')
 if (-not $IsWindows) { & chmod '+x' $script:resticStub }
 
+# a fake `swaks` for notify tests: writes its args (one per line) and the body file's
+# content to SWAKS_STUB_LOG (appending), or fails like swaks on a refused login when
+# SWAKS_STUB_FAIL is set. POSIX shell only.
+$script:swaksStub = Join-Path $script:Work 'swaks-stub.sh'
+$swaksBody = @'
+#!/bin/sh
+if [ -n "$SWAKS_STUB_LOG" ]; then
+  printf '%s\n' "$@" >> "$SWAKS_STUB_LOG"
+  body=''; prev=''
+  for a in "$@"; do [ "$prev" = "--body" ] && body="$a"; prev="$a"; done
+  [ -n "$body" ] && cat "$body" >> "$SWAKS_STUB_LOG"
+fi
+if [ -n "$SWAKS_STUB_FAIL" ]; then echo '<** 535 5.7.8 Authentication failed'; echo '-> QUIT'; exit 28; fi
+exit 0
+'@
+Set-Content -LiteralPath $script:swaksStub -NoNewline -Value ($swaksBody -replace "`r", '')
+if (-not $IsWindows) { & chmod '+x' $script:swaksStub }
+
 function New-SpoolTestEnv {
     # Fresh event log + spool root + engine paths for one whole-run test.
     param([string]$Prefix = 'lc')
