@@ -10,9 +10,10 @@
   JSON config and implemented by step scripts (recipes or bespoke). See docs/ for
   internals and help/ for usage.
 .PARAMETER Command
-  plan | validate | run | status | show | history | help
+  plan | validate | run | status | show | history | trash | help
 .PARAMETER RunRef
   show: which run(s) - 'latest' (default), run ids, or any unique ending of one.
+  trash: which trash item(s), by name (default: all).
 .PARAMETER ConfigPath
   Path to config.json. Defaults to the OS config dir (see help/).
 .PARAMETER ForceWindow
@@ -21,12 +22,16 @@
   Skip the fit check: attempt every planned job, no deferral (accepts overruns).
 .PARAMETER Limit
   history: number of recent runs to show.
+.PARAMETER Delete
+  trash: delete the items now (all, or the names given) instead of listing them.
 .EXAMPLE
   pwsh sequencer.ps1 plan
 .EXAMPLE
   pwsh sequencer.ps1 run -ConfigPath ./config.json -ForceWindow -ForceAllJobs
 .EXAMPLE
   pwsh sequencer.ps1 show 332d
+.EXAMPLE
+  pwsh sequencer.ps1 trash -Delete host-config-5468a97d02ac
 #>
 
 [CmdletBinding()]
@@ -37,6 +42,7 @@ param(
     [switch]$ForceWindow,
     [switch]$ForceAllJobs,
     [int]$Limit = 20,
+    [switch]$Delete,
     [switch]$Help
 )
 
@@ -79,7 +85,7 @@ function Show-Usage {
 backup sequencer
 
 Usage:
-  pwsh sequencer.ps1 <command> [<run>...] [-ConfigPath <path>] [-ForceWindow] [-ForceAllJobs] [-Limit <n>]
+  pwsh sequencer.ps1 <command> [<run>...] [-ConfigPath <path>] [-ForceWindow] [-ForceAllJobs] [-Limit <n>] [-Delete]
 
 Commands:
   plan      Show the ordered plan for the current window (no side effects)
@@ -88,6 +94,8 @@ Commands:
   status    The run in progress (step, elapsed), or the last run if idle
   show      Detail of runs: show [latest | <run id> | <unique end of id>]...
   history   Show recent run summaries (newest first, incl. running/interrupted)
+  trash     What the spool's trash/ holds and where it came from; -Delete [<name>...]
+            deletes it now (all, or the names given; refused during a run)
   help      This message
 
 Config resolution (unless -ConfigPath is given):
@@ -122,9 +130,9 @@ $Paths = @{
     SpoolRoot  = $SpoolRoot
 }
 
-# only 'show' takes positional arguments; anywhere else they're a typo (e.g. a
-# misspelled switch), so refuse rather than silently ignore them
-if ($RunRef -and $Command -ne 'show') {
+# only 'show' and 'trash' take positional arguments; anywhere else they're a typo
+# (e.g. a misspelled switch), so refuse rather than silently ignore them
+if ($RunRef -and $Command -notin @('show', 'trash')) {
     Write-Host "Unexpected argument(s) for '$Command': $($RunRef -join ' ')"
     exit 2
 }
@@ -215,6 +223,57 @@ switch ($Command) {
         foreach ($r in $runs) {
             Write-Host (Format-RunHistoryLine -Detail (Get-RunDetail -Events $events -Run $r))
         }
+    }
+    'trash' {
+        $trashRoot = (Get-SpoolPaths -SpoolRoot $Paths.SpoolRoot).Trash
+        $events = @(Get-BackupEvents -EventsPath $Paths.EventsPath)
+        $items = @(Get-TrashItems -TrashRoot $trashRoot -Events $events)
+        $names = @($RunRef | Where-Object { $_ })
+        $present = @($items | ForEach-Object { $_.Name })
+        $unknown = @($names | Where-Object { $_ -notin $present })
+        foreach ($u in $unknown) { Write-Host "not in trash: $u" }
+        if ($names.Count) { $items = @($items | Where-Object { $_.Name -in $names }) }
+
+        if ($Delete) {
+            if ($items.Count -eq 0) { Write-Host 'nothing to delete'; if ($unknown.Count) { exit 1 }; return }
+            $lockInfo = @{}
+            if (-not (Enter-SequencerLock -LockPath $Paths.LockPath -Info $lockInfo)) {
+                Write-Host ("a run is in progress (pid {0}); nothing deleted" -f (Get-LockHolder -LockPath $Paths.LockPath))
+                exit 1
+            }
+            try {
+                Reset-RunOutput
+                $InformationPreference = 'Continue'   # the [delete] lines, as in a run
+                $sum = Clear-Trash -TrashRoot $trashRoot -EventsPath $Paths.EventsPath -Names @($items | ForEach-Object { $_.Name }) -By 'command'
+                Write-Host ("freed {0} ({1} item{2}){3}" -f (Format-Size $sum.Bytes), $sum.Items, $(if ($sum.Items -ne 1) { 's' } else { '' }),
+                    $(if ($sum.Kept) { ", $($sum.Kept) kept" } else { '' }))
+            }
+            finally { Exit-SequencerLock -LockPath $Paths.LockPath }
+            if ($sum.Kept -or $unknown.Count) { exit 1 }
+            return
+        }
+
+        $total = [double]0; foreach ($i in $items) { $total += $i.Bytes }
+        Write-Host ("trash  {0}   {1} item{2}, {3}" -f $trashRoot, $items.Count, $(if ($items.Count -ne 1) { 's' } else { '' }), (Format-Size $total))
+        foreach ($i in $items) {
+            $origin = if ($i.Reason) {
+                "{0,-12} {1,-20} run {2}  moved {3}" -f $i.Service, $i.Reason, $i.FromRun.Substring([math]::Max(0, $i.FromRun.Length - 4)), (Format-EventTime $i.MovedAt)
+            }
+            else { 'no record' }
+            Write-Host ("  {0,-28} {1,9} {2,7} files  {3}" -f $i.Name, (Format-Size $i.Bytes), $i.Files, $origin)
+        }
+        # the last deletions, by runs or by hand
+        $dels = @($events | Where-Object { $_.type -eq 'trash.delete' } | Select-Object -Last 5)
+        if ($dels.Count) {
+            Write-Host 'last deletions:'
+            [array]::Reverse($dels)
+            foreach ($d in $dels) {
+                $byWhom = if ((Test-HasProp $d 'by') -and $d.by) { "by $($d.by)" } elseif (Test-HasProp $d 'runId') { 'run ' + ([string]$d.runId).Substring([math]::Max(0, ([string]$d.runId).Length - 4)) } else { '?' }
+                $st = if ($d.status -eq 'ok') { (Format-Size ([double]$d.bytes)) } else { 'FAIL' }
+                Write-Host ("  {0}  {1,-11} {2,9}  {3}" -f (Format-EventTime $d.ts), $byWhom, $st, $d.trashName)
+            }
+        }
+        if ($unknown.Count) { exit 1 }
     }
     default {
         Write-Host "Unknown command: $Command"

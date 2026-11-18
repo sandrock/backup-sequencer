@@ -73,7 +73,7 @@ What it does
 
 - One nightly window, no overlapping runs (a single-instance lock) — in place of a
   pile of independent cron jobs.
-- Log-driven `plan` / `validate` / `run` / `status` / `show` / `history`, plus an email report per run
+- Log-driven `plan` / `validate` / `run` / `status` / `show` / `history` / `trash`, plus an email report per run
   that doubles as a dead-man's-switch (no mail means the run did not happen).
 - Preflight validation: a misconfigured service (missing password file, unreachable
   destination, unknown step) is caught before any backup runs, never mid-downtime.
@@ -149,7 +149,7 @@ Layout
 
 ```
 src/
-  sequencer.ps1         entry point: plan | validate | run | status | show | history | help
+  sequencer.ps1         entry point: plan | validate | run | status | show | history | trash | help
   lib/BackupCommon.psm1 engine (events, projection, locking, planning, run)
   recipes/              reusable step scripts (e.g. docker-compose-cold, host-config-linux)
   services/             bespoke per-service step scripts (same contract)

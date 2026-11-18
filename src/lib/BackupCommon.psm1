@@ -738,26 +738,58 @@ function Move-Phase {
     [System.IO.Directory]::Move($Src, $Dst)
 }
 
+function Get-TrashMoves {
+    # trashName -> the trash.move event that put it there
+    param([object[]]$Events = @())
+    $moves = @{}
+    foreach ($e in $Events) {
+        if ($e.type -eq 'trash.move' -and (Test-HasProp $e 'trashName') -and $e.status -eq 'ok') { $moves[[string]$e.trashName] = $e }
+    }
+    return $moves
+}
+
+function Get-TrashItems {
+    # What sits in trash/, measured, with where it came from (its trash.move, if any).
+    param(
+        [Parameter(Mandatory)][string]$TrashRoot,
+        [object[]]$Events = @()
+    )
+    if (-not (Test-Path -LiteralPath $TrashRoot)) { return @() }
+    $moves = Get-TrashMoves -Events $Events
+    return @(Get-ChildItem -LiteralPath $TrashRoot -Force -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object {
+            $size = [DiskUsage]::Measure($_.FullName)
+            $m = if ($moves.ContainsKey($_.Name)) { $moves[$_.Name] } else { $null }
+            [pscustomobject]@{
+                Name    = $_.Name
+                Bytes   = $size.Bytes
+                Files   = $size.Files
+                Service = if ($m) { [string]$m.svc } else { $null }
+                Reason  = if ($m) { [string]$m.reason } else { $null }
+                FromRun = if ($m) { [string]$m.runId } else { $null }
+                MovedAt = if ($m) { $m.ts } else { $null }
+            }
+        })
+}
+
 function Clear-Trash {
-    # Reaper: delete everything in trash/, off the publish hot path. Each item is
-    # measured, deleted, and logged (trash.delete + a [delete] line), tied back to the
-    # trash.move that put it there. A failed delete leaves the item for the next run.
+    # Reaper: delete everything in trash/ (or the -Names given), off the publish hot
+    # path. Each item is measured, deleted, and logged (trash.delete + a [delete]
+    # line), tied back to the trash.move that put it there. A failed delete leaves
+    # the item for the next run. -By 'command' marks a deletion asked by hand (no run).
     # Returns @{ Bytes; Items; Kept } for the run's end line.
     param(
         [Parameter(Mandatory)][string]$TrashRoot,
         [string]$EventsPath = '',
-        [string]$RunId = ''
+        [string]$RunId = '',
+        [string[]]$Names = @(),
+        [string]$By = ''
     )
     $sum = @{ Bytes = [long]0; Items = 0; Kept = 0 }
     if (-not (Test-Path -LiteralPath $TrashRoot)) { return $sum }
-    $items = @(Get-ChildItem -LiteralPath $TrashRoot -Force -ErrorAction SilentlyContinue)
+    $items = @(Get-ChildItem -LiteralPath $TrashRoot -Force -ErrorAction SilentlyContinue | Sort-Object Name)
+    if ($Names.Count) { $items = @($items | Where-Object { $Names -contains $_.Name }) }
     if ($items.Count -eq 0) { return $sum }
-    $moves = @{}
-    if ($EventsPath) {
-        foreach ($e in (Get-BackupEvents -EventsPath $EventsPath)) {
-            if ($e.type -eq 'trash.move' -and (Test-HasProp $e 'trashName') -and $e.status -eq 'ok') { $moves[[string]$e.trashName] = $e }
-        }
-    }
+    $moves = if ($EventsPath) { Get-TrashMoves -Events @(Get-BackupEvents -EventsPath $EventsPath) } else { @{} }
     $ProgressPreference = 'SilentlyContinue'   # Remove-Item's progress bar has no place in logs
     foreach ($item in $items) {
         $size = [DiskUsage]::Measure($item.FullName)
@@ -767,8 +799,10 @@ function Clear-Trash {
         catch { $err = $_.Exception.Message }
         $sw.Stop()
         if (-not $EventsPath) { continue }
-        $props = @{ runId = $RunId; trashName = $item.Name; bytes = $size.Bytes; files = $size.Files
+        $props = @{ trashName = $item.Name; bytes = $size.Bytes; files = $size.Files
             durationSec = [math]::Round($sw.Elapsed.TotalSeconds, 2); status = $(if ($err) { 'fail' } else { 'ok' }) }
+        if ($RunId) { $props.runId = $RunId }
+        if ($By) { $props.by = $By }
         $svc = 'run'
         $origin = "no record: $($item.Name)"
         if ($moves.ContainsKey($item.Name)) {
@@ -783,7 +817,7 @@ function Clear-Trash {
         if ($err) {
             $sum.Kept++
             Write-RunLine -RunId $RunId -Service $svc -Step '[delete]' -Event 'done' -Status 'FAIL' -Seconds $sw.Elapsed.TotalSeconds `
-                -Detail "! $($item.Name): $err; kept, retried next run"
+                -Detail "! $($item.Name): $err; kept$(if ($RunId) { ', retried next run' })"
         }
         else {
             $sum.Bytes += $size.Bytes; $sum.Items++
@@ -1634,6 +1668,6 @@ Export-ModuleMember -Function `
     Get-ServiceProjection, Get-EstimatedServiceSeconds, Enter-SequencerLock, Exit-SequencerLock, `
     Test-WithinWindow, Get-WindowLengthSeconds, Get-SecondsUntilClose, `
     Get-FreeSpaceBytes, Get-PathSizeBytes, Limit-StepWarnings, Invoke-BackupStep, `
-    Get-SpoolPaths, Move-ToTrash, Move-Phase, Clear-Trash, `
+    Get-SpoolPaths, Move-ToTrash, Move-Phase, Get-TrashMoves, Get-TrashItems, Clear-Trash, Reset-RunOutput, `
     Get-ScopedEnv, Get-ServiceOverdue, Get-ServiceValidationProblems, `
     Get-CoverageThreshold, Get-BackupPlan, Invoke-BackupRun, Format-RunReport, Send-BackupReport

@@ -201,3 +201,76 @@ Describe 'CLI after runs' {
         $r.Out | Should -Match ("run " + [regex]::Escape($runIds[1]))
     }
 }
+
+Describe 'CLI trash' {
+    BeforeEach {
+        $script:tr = New-CliEnv -Name ("trash-" + [guid]::NewGuid().ToString('n').Substring(0, 6)) -Services @{}
+        $script:trashDir = Join-Path $tr.Spool 'trash'
+        New-Item -ItemType Directory -Force -Path (Join-Path $trashDir 'forgejo-0123456789ab'), (Join-Path $trashDir 'junk'), $tr.Var | Out-Null
+        Set-Content -LiteralPath (Join-Path $trashDir 'forgejo-0123456789ab/a.bin') -Value ('a' * 5000)
+        $script:evPath = Join-Path $tr.Var 'events.jsonl'
+        Set-Content -LiteralPath $evPath -Value '{"ts":"2026-11-18T13:00:00Z","type":"trash.move","runId":"20261118-130000-a558","svc":"forgejo","reason":"local-copy-dropped","trashName":"forgejo-0123456789ab","status":"ok"}'
+    }
+
+    It 'lists what the trash holds, with where it came from' {
+        $r = Invoke-Cli $tr @('trash')
+        $r.Exit | Should -Be 0
+        $r.Out | Should -Match '2 items, 5 KB'
+        $r.Out | Should -Match '(?m)^  forgejo-0123456789ab\s+5 KB\s+1 files  forgejo\s+local-copy-dropped\s+run a558  moved 2026-11-18T'
+        $r.Out | Should -Match '(?m)^  junk\s+0 KB\s+0 files  no record'
+        (Test-Path (Join-Path $trashDir 'junk')) | Should -BeTrue   # listing deletes nothing
+    }
+
+    It 'deletes only the items named, logged as by command' {
+        $r = Invoke-Cli $tr @('trash', '-Delete', 'junk')
+        $r.Exit | Should -Be 0
+        $r.Out | Should -Match '(?m)^----  \d\d:\d\d:\d\d  run\s+\[delete\]\s+done\s+ok .*no record: junk'
+        $r.Out | Should -Match 'freed 0 KB \(1 item\)'
+        (Test-Path (Join-Path $trashDir 'junk')) | Should -BeFalse
+        (Test-Path (Join-Path $trashDir 'forgejo-0123456789ab')) | Should -BeTrue
+        $del = @(Get-BackupEvents -EventsPath $evPath | Where-Object { $_.type -eq 'trash.delete' })
+        $del.Count | Should -Be 1
+        $del[0].by | Should -Be 'command'
+        Test-HasProp $del[0] 'runId' | Should -BeFalse
+    }
+
+    It 'deletes everything when no name is given, and lists the deletions after' {
+        (Invoke-Cli $tr @('trash', '-Delete')).Exit | Should -Be 0
+        @(Get-ChildItem -LiteralPath $trashDir).Count | Should -Be 0
+        $r = Invoke-Cli $tr @('trash')
+        $r.Out | Should -Match '0 items'
+        $r.Out | Should -Match '(?m)^  \S+  by command\s+5 KB  forgejo-0123456789ab$'
+    }
+
+    It 'names an unknown item and exits 1' {
+        $r = Invoke-Cli $tr @('trash', '-Delete', 'nope')
+        $r.Exit | Should -Be 1
+        $r.Out | Should -Match 'not in trash: nope'
+        @(Get-ChildItem -LiteralPath $trashDir).Count | Should -Be 2
+    }
+
+    It 'refuses to delete while a run holds the lock' {
+        Set-Content -LiteralPath (Join-Path $tr.Var 'sequencer.lock') -Value $PID   # a live process
+        $r = Invoke-Cli $tr @('trash', '-Delete')
+        $r.Exit | Should -Be 1
+        $r.Out | Should -Match 'a run is in progress'
+        @(Get-ChildItem -LiteralPath $trashDir).Count | Should -Be 2
+        (Test-Path (Join-Path $tr.Var 'sequencer.lock')) | Should -BeTrue   # not taken from the run
+    }
+
+    It 'keeps an item it cannot delete and exits 1' -Skip:($IsWindows) {
+        $stuck = Join-Path $trashDir 'stuck'
+        New-Item -ItemType Directory -Force -Path $stuck | Out-Null
+        Set-Content -LiteralPath (Join-Path $stuck 'f.bin') -Value 'z'
+        & chmod 555 $stuck
+        try {
+            $r = Invoke-Cli $tr @('trash', '-Delete', 'stuck')
+            $r.Exit | Should -Be 1
+            $r.Out | Should -Match '(?m)\[delete\]\s+done\s+FAIL .*! stuck: .*; kept\s*$'
+            (Test-Path $stuck) | Should -BeTrue
+            (Get-BackupEvents -EventsPath $evPath | Where-Object { $_.type -eq 'trash.delete' }).status | Should -Be 'fail'
+            (Test-Path (Join-Path $tr.Var 'sequencer.lock')) | Should -BeFalse   # released
+        }
+        finally { & chmod 755 $stuck }
+    }
+}

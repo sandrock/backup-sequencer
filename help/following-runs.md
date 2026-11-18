@@ -98,6 +98,27 @@ c583  run                 -             end     ok    39m58s  5 ok, 0 failed, 5 
   stays recorded as live, and the next run prunes it again.
 - A lock left by a run that died is removed with a `WARN` line naming its pid.
 
+To see what the trash holds, and empty it without waiting for a run:
+
+```sh
+bseq trash                              # list: size, service, why, which run, when
+bseq trash -Delete                      # delete everything now (as root)
+bseq trash -Delete forgejo-0123456789ab # only the items named
+```
+
+```
+trash  /var/spool/backup-sequencer/trash   2 items, 32.9 MB
+  host-config-5468a97d02ac        30.7 MB      24 files  host-config  wip-leftover         run caa1  moved 2026-11-18T15:14:14+01:00
+  junk                               0 KB       0 files  no record
+last deletions:
+  2026-11-18T15:14:12+01:00  run caa1      2.2 MB  vaultwarden-b4056de97dcb
+```
+
+`-Delete` takes the run lock: it is refused while a run is in progress, and a run
+starting meanwhile is refused like a second run would be. Its deletions are
+logged like a run's, marked `by command`. Listing is read-only and usually works
+without `sudo`, like `show`.
+
 Under systemd the output goes to the journal, which stamps each line itself, so
 bseq drops its own time column and date lines there:
 
