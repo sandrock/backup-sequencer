@@ -4,6 +4,23 @@
 
 Set-StrictMode -Version Latest
 
+# --- event log lines --------------------------------------------------------
+
+class EventLog {
+    # One event line -> object, with `ts` as an exact UTC [datetime]. ConvertFrom-Json
+    # turns ISO strings into local-kind dates and drops the offset, so differences
+    # across a DST change come out an hour wrong; the raw string is parsed instead.
+    # Accepts both old local-with-offset stamps and UTC `Z` ones.
+    static [object] ParseLine([string]$Line) {
+        $e = $Line | ConvertFrom-Json
+        $m = [regex]::Match($Line, '"ts"\s*:\s*"([^"]+)"')
+        if ($m.Success -and $e.PSObject.Properties['ts']) {
+            $e.ts = [System.DateTimeOffset]::Parse($m.Groups[1].Value, [System.Globalization.CultureInfo]::InvariantCulture).UtcDateTime
+        }
+        return $e
+    }
+}
+
 # --- recipe context (IoC: the engine owns it; a recipe registers its steps) -
 
 class RecipeContext {
@@ -58,7 +75,7 @@ class RecipeContext {
         # read-only access to the sequencer event log (for archivers that route/prune by it)
         if (-not $this.EventsPath -or -not (Test-Path -LiteralPath $this.EventsPath)) { return @() }
         $out = foreach ($line in (Get-Content -LiteralPath $this.EventsPath)) {
-            if ($line.Trim()) { $line | ConvertFrom-Json }
+            if ($line.Trim()) { [EventLog]::ParseLine($line) }
         }
         return @($out)
     }
@@ -67,12 +84,14 @@ class RecipeContext {
 # --- time / ids -------------------------------------------------------------
 
 function New-RunId {
-    # Unpredictable-time-friendly id: sortable timestamp + random suffix.
-    return (Get-Date -Format 'yyyyMMdd-HHmmss') + '-' + ('{0:x4}' -f (Get-Random -Maximum 65536))
+    # Unpredictable-time-friendly id: sortable UTC timestamp + random suffix (UTC so
+    # ids keep sorting through the repeated hour of a DST change).
+    return [datetime]::UtcNow.ToString('yyyyMMdd-HHmmss', [System.Globalization.CultureInfo]::InvariantCulture) + '-' + ('{0:x4}' -f (Get-Random -Maximum 65536))
 }
 
 function Get-NowIso {
-    return (Get-Date).ToString('o')
+    # event timestamps are UTC (`...Z`); displays convert to the viewer's zone
+    return [datetime]::UtcNow.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
 # --- event log (append-only JSONL) -----------------------------------------
@@ -94,6 +113,12 @@ function Add-BackupEvent {
     Add-Content -LiteralPath $EventsPath -Value ($evt | ConvertTo-Json -Compress -Depth 20)
 }
 
+function ConvertFrom-EventLine {
+    # exported wrapper of [EventLog]::ParseLine (Import-Module does not export classes)
+    param([Parameter(Mandatory)][string]$Line)
+    return [EventLog]::ParseLine($Line)
+}
+
 function Get-BackupEvents {
     param([Parameter(Mandatory)][string]$EventsPath)
     if (-not (Test-Path -LiteralPath $EventsPath)) {
@@ -101,7 +126,7 @@ function Get-BackupEvents {
     }
     $events = foreach ($line in (Get-Content -LiteralPath $EventsPath)) {
         if ($line.Trim()) {
-            $line | ConvertFrom-Json
+            [EventLog]::ParseLine($line)
         }
     }
     return @($events)
@@ -380,7 +405,8 @@ function Get-ServiceOverdue {
         [Parameter(Mandatory)][string]$Service,
         [Parameter(Mandatory)][string]$BaseDir,
         [Parameter(Mandatory)][string]$EventsPath,
-        [datetime]$At = (Get-Date)
+        [datetime]$At = (Get-Date),
+        [hashtable]$Info = $null     # filled with PeriodSec when the archiver states its period
     )
     $serviceConfig = $Config.services.$Service
     if (-not (Test-HasProp $serviceConfig 'syncArchive')) { return $null }
@@ -398,7 +424,9 @@ function Get-ServiceOverdue {
         (Get-PropOrNull $syncArchive 'env'))
     & $scriptPath -Recipe $arc | Out-Null     # registration only
     if ($null -eq $arc.OverdueBlock) { return $null }
-    try { return [double](& $arc.OverdueBlock $arc) } catch { return $null }
+    try { $od = [double](& $arc.OverdueBlock $arc) } catch { return $null }
+    if ($null -ne $Info -and $arc.State.ContainsKey('PeriodSec')) { $Info['PeriodSec'] = [double]$arc.State['PeriodSec'] }
+    return $od
 }
 
 function Get-ConfiguredStepNames {
@@ -503,6 +531,18 @@ function Get-ServiceValidationProblems {
     return @($problems)
 }
 
+function Get-CoverageThreshold {
+    # Overdue below which a service counts as covered. The margin absorbs timer jitter
+    # and run length; for periods of a day or more, one hour is added on top: a timer
+    # fires at a local time, so across a spring DST change only 23 real hours separate
+    # two nightly runs, and the daily backup must not be skipped that night (on top,
+    # not max: 23h/24h sits exactly on 1 - 1h/24h, so jitter would still skip it).
+    param([double]$Margin = 0.02, $PeriodSeconds = $null)
+    $slack = $Margin
+    if ($null -ne $PeriodSeconds -and [double]$PeriodSeconds -ge 86400) { $slack = $Margin + 3600.0 / [double]$PeriodSeconds }
+    return 1.0 - $slack
+}
+
 function Get-BackupPlan {
     # Pure: (config, projection, now) -> ALL enabled services, score-sorted.
     # Fluid scheduling — score = overdue + sizeNudge:
@@ -519,7 +559,8 @@ function Get-BackupPlan {
         [Parameter(Mandatory)]$Config,
         $Projection = @{},
         [datetime]$At = (Get-Date),
-        [hashtable]$OverdueByService = @{}
+        [hashtable]$OverdueByService = @{},
+        [hashtable]$PeriodByService = @{}      # archiver-stated period (seconds) per service
     )
     $windowSeconds = Get-WindowLengthSeconds -Open $Config.window.open -Close $Config.window.close
     $defaultTargetHours = 24.0
@@ -540,7 +581,7 @@ function Get-BackupPlan {
         $targetSeconds = [math]::Max(1.0, $targetHours * 3600.0)
 
         if ($lastSuccess) {
-            $ageSeconds = ($At - [datetime]$lastSuccess).TotalSeconds
+            $ageSeconds = ($At.ToUniversalTime() - ([datetime]$lastSuccess).ToUniversalTime()).TotalSeconds
             if ($ageSeconds -lt 0) { $ageSeconds = 0 }
         }
         else {
@@ -557,6 +598,10 @@ function Get-BackupPlan {
         else {
             $overdue = 1e6
         }
+        # the period the overdue is measured against (sizes the coverage tolerance)
+        $periodSeconds = if ($PeriodByService.ContainsKey($serviceName)) { [double]$PeriodByService[$serviceName] }
+        elseif (-not $OverdueByService.ContainsKey($serviceName)) { $targetSeconds }
+        else { $null }
         $sizeNudge = if ($windowSeconds -gt 0) { $estimatedSeconds / $windowSeconds } else { 0 }
 
         $entries += [pscustomobject]@{
@@ -566,6 +611,7 @@ function Get-BackupPlan {
             LastSuccess      = $lastSuccess
             AgeSeconds       = $ageSeconds
             Overdue          = $overdue
+            PeriodSeconds    = $periodSeconds
             Score            = $overdue + $sizeNudge
         }
     }
@@ -658,12 +704,15 @@ function Invoke-BackupRun {
         # ask each service's archiver how overdue it is (it knows its own coverage)
         $planNow = Get-Date
         $overdueByService = @{}
+        $periodByService = @{}
         foreach ($name in $Config.services.PSObject.Properties.Name) {
             if (-not ((Test-HasProp $Config.services.$name 'enabled') -and [bool]$Config.services.$name.enabled)) { continue }
-            $od = Get-ServiceOverdue -Config $Config -Service $name -BaseDir $Paths.BaseDir -EventsPath $Paths.EventsPath -At $planNow
+            $info = @{}
+            $od = Get-ServiceOverdue -Config $Config -Service $name -BaseDir $Paths.BaseDir -EventsPath $Paths.EventsPath -At $planNow -Info $info
             if ($null -ne $od) { $overdueByService[$name] = $od }
+            if ($info.ContainsKey('PeriodSec')) { $periodByService[$name] = $info['PeriodSec'] }
         }
-        $plan = Get-BackupPlan -Config $Config -Projection $projection -At $planNow -OverdueByService $overdueByService
+        $plan = Get-BackupPlan -Config $Config -Projection $projection -At $planNow -OverdueByService $overdueByService -PeriodByService $periodByService
         Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'run.plan' `
             -Props @{ runId = $runId; plan = @($plan.Service) }
 
@@ -677,7 +726,6 @@ function Invoke-BackupRun {
         # min for a daily) absorbs timer jitter + backup duration. Override via config.
         $coverageMargin = 0.02
         if (Test-HasProp $Config 'coverageMargin') { $coverageMargin = [double]$Config.coverageMargin }
-        $coverageThreshold = 1.0 - $coverageMargin
         foreach ($plannedJob in $plan) {
             # hard window gate: never START work past close (a running job may overrun)
             if (-not $ForceWindow -and -not (Test-WithinWindow -Open $Config.window.open -Close $Config.window.close)) {
@@ -696,7 +744,7 @@ function Invoke-BackupRun {
             # archiver judged overdue below the grace threshold — e.g. a yearly/weekly
             # also covers the daily). No backup produced, so no wasted downtime.
             # -ForceAllJobs overrides.
-            if (-not $ForceAllJobs -and $plannedJob.Overdue -lt $coverageThreshold) {
+            if (-not $ForceAllJobs -and $plannedJob.Overdue -lt (Get-CoverageThreshold -Margin $coverageMargin -PeriodSeconds $plannedJob.PeriodSeconds)) {
                 Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.skip' `
                     -Props @{ runId = $runId; svc = $serviceName; reason = 'covered'; overdue = [math]::Round([double]$plannedJob.Overdue, 3) }
                 Write-RunLine -RunId $runId -Service $serviceName -Event 'skip' -Detail ([string]::Format([System.Globalization.CultureInfo]::InvariantCulture, 'covered (x{0:0.00})', $plannedJob.Overdue))
@@ -1143,7 +1191,7 @@ function Format-EventTime {
     # ISO 8601 with offset, independent of the pwsh culture (events parse to [datetime])
     param($Ts)
     if ($null -eq $Ts -or "$Ts" -eq '') { return '?' }
-    try { return ([datetime]$Ts).ToString('yyyy-MM-ddTHH:mm:sszzz') } catch { return [string]$Ts }
+    try { return ([datetime]$Ts).ToLocalTime().ToString('yyyy-MM-ddTHH:mm:sszzz', [System.Globalization.CultureInfo]::InvariantCulture) } catch { return [string]$Ts }
 }
 
 function Get-LockHolder {
@@ -1275,7 +1323,7 @@ function Format-RunDetail {
         [string]$Prefix = ''
     )
     $run = $Detail.Run
-    $since = { param($ts) Format-Duration (($Now - [datetime]$ts).TotalSeconds) }
+    $since = { param($ts) Format-Duration (($Now.ToUniversalTime() - ([datetime]$ts).ToUniversalTime()).TotalSeconds) }
     $lines = @()
     switch ($run.State) {
         'running' {
@@ -1285,7 +1333,7 @@ function Format-RunDetail {
             $lines += ("{0}INTERRUPTED  run {1}  started {2}; no end recorded and no process holds the lock" -f $Prefix, $run.RunId, (Format-EventTime $run.Start))
         }
         default {
-            $dur = Format-Duration (([datetime]$run.End - [datetime]$run.Start).TotalSeconds)
+            $dur = Format-Duration ((([datetime]$run.End).ToUniversalTime() - ([datetime]$run.Start).ToUniversalTime()).TotalSeconds)
             $sum = if ($run.Summary) { "  ok={0} failed={1} planned={2}" -f $run.Summary.ok, $run.Summary.failed, $run.Summary.planned } else { '' }
             $lines += ("{0}run {1}  {2} -> {3} ({4}){5}" -f $Prefix, $run.RunId, (Format-EventTime $run.Start), (Format-EventTime $run.End), $dur, $sum)
         }
@@ -1350,7 +1398,7 @@ function Format-RunHistoryLine {
     $svcStr = if ($svcs.Count) { $svcs -join ' ' } else { '(nothing run)' }
     switch ($run.State) {
         'running' {
-            return ("{0}  {1}  RUNNING ({2})  [{3}]" -f (Format-EventTime $run.Start), $run.RunId, (Format-Duration (($Now - [datetime]$run.Start).TotalSeconds)), $svcStr)
+            return ("{0}  {1}  RUNNING ({2})  [{3}]" -f (Format-EventTime $run.Start), $run.RunId, (Format-Duration (($Now.ToUniversalTime() - ([datetime]$run.Start).ToUniversalTime()).TotalSeconds)), $svcStr)
         }
         'interrupted' { return ("{0}  {1}  INTERRUPTED  [{2}]" -f (Format-EventTime $run.Start), $run.RunId, $svcStr) }
         default {
@@ -1363,10 +1411,10 @@ function Format-RunHistoryLine {
 Export-ModuleMember -Function `
     Format-Duration, Format-DurationUnit, Format-Size, Format-EventTime, Format-RunLine, Format-StartRef, Get-LockHolder, Get-RunStates, Resolve-RunRef, `
     Get-RunDetail, Format-RunDetail, Format-RunHistoryLine, `
-    New-RunId, Get-NowIso, Add-BackupEvent, Get-BackupEvents, Test-HasProp, `
+    New-RunId, Get-NowIso, Add-BackupEvent, ConvertFrom-EventLine, Get-BackupEvents, Test-HasProp, `
     Get-ServiceProjection, Get-EstimatedServiceSeconds, Enter-SequencerLock, Exit-SequencerLock, `
     Test-WithinWindow, Get-WindowLengthSeconds, Get-SecondsUntilClose, `
     Get-FreeSpaceBytes, Get-PathSizeBytes, Limit-StepWarnings, Invoke-BackupStep, `
     Get-SpoolPaths, Move-ToTrash, Move-Phase, Clear-Trash, `
     Get-ScopedEnv, Get-ServiceOverdue, Get-ServiceValidationProblems, `
-    Get-BackupPlan, Invoke-BackupRun, Format-RunReport, Send-BackupReport
+    Get-CoverageThreshold, Get-BackupPlan, Invoke-BackupRun, Format-RunReport, Send-BackupReport

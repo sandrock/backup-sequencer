@@ -70,7 +70,7 @@ function Format-DisplayTime {
     # 8601 explicitly so output doesn't follow the pwsh culture (e.g. US 12h).
     param($Ts)
     if ($null -eq $Ts -or "$Ts" -eq '') { return 'never' }
-    try { return ([datetime]$Ts).ToString('yyyy-MM-ddTHH:mm:sszzz') }
+    try { return ([datetime]$Ts).ToLocalTime().ToString('yyyy-MM-ddTHH:mm:sszzz', [System.Globalization.CultureInfo]::InvariantCulture) }
     catch { return [string]$Ts }
 }
 

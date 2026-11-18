@@ -97,6 +97,18 @@ Two files, single-writer each:
   `status` and, when it failed, `error` (see [run-output.md](run-output.md)).
   Fields and types are only ever added; the log is never rewritten.
 
+### Time
+
+- Event `ts` and run ids are written in UTC (`...Z`, `20261118-131904-...`).
+  Logs written before this have local time with its offset; both read the same.
+- Events are read with `ConvertFrom-EventLine` (`[EventLog]::ParseLine`), which parses `ts` from the raw
+  string to an exact UTC date. Plain `ConvertFrom-Json` turns it into a local
+  date and drops the offset, and differences then come out an hour wrong across
+  a DST change.
+- Durations and ages are computed in UTC. Calendar decisions stay local on
+  purpose: the window, the gfsy periods (day, ISO week, year). Displays (run output,
+  `show`, `history`, `status`, `plan`) convert to the viewer's zone (`TZ` or the system's).
+
 "Current state" is a projection folded from the event log
 (`Get-ServiceProjection`): per service, last success, typical step durations,
 last size in bytes, consecutive failures. Planning, the pre-flight space check,

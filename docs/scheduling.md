@@ -73,6 +73,14 @@ and the backup is wrongly skipped. The margin (≈29 min for a daily) absorbs ti
 jitter and the backup's own duration, so a roughly-due backup reliably runs; a genuine
 same-day re-trigger (well inside the period) still skips.
 
+For a period of a day or more, one hour is added to the margin (`Get-CoverageThreshold`):
+the timer fires at a local time, so across a spring DST change only 23 real hours
+separate two nightly runs (ages are measured in UTC, see
+[architecture.md](architecture.md#time)), and 2% of a day would skip that night's
+backup (added, not the larger of the two: 23h/24h sits exactly on `1 − 1h/24h`,
+and jitter would tip it). The archiver states its period (`PeriodSec`) for this; without an archiver,
+the target interval is used.
+
 
 Window packing (execution)
 ----------------------------------------------------------------
@@ -82,7 +90,7 @@ The run loop walks the scored plan. Before starting each service, with
 
 1. Past close → stop (`-ForceWindow` bypasses this; a job already running is never
    killed and may overrun).
-2. `overdue < 1 − margin` → **covered**, skip (`service.skip reason=covered`);
+2. `overdue < 1 − margin` (plus 1h for daily or longer periods) → **covered**, skip (`service.skip reason=covered`);
    `-ForceAllJobs` overrides.
 3. Mandatory, or `-ForceAllJobs` → run (no fit check).
 4. Estimate unknown (never run) → run optimistically — first backup, learns its

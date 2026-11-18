@@ -62,9 +62,9 @@ $Recipe.AddStep('archive', {
         })
 
     # --- route to a tier: first-of-period wins the coarsest empty slot ---
-    $now = Get-Date
+    $now = Get-Date   # local: periods (day, ISO week, year) follow the host's calendar
     $hasYearlyThisYear = @($archived | Where-Object {
-            $_.tier -eq 'yearly' -and ([datetime]$_.ts).Year -eq $now.Year
+            $_.tier -eq 'yearly' -and ([datetime]$_.ts).ToLocalTime().Year -eq $now.Year
         }).Count -gt 0
     if (-not $hasYearlyThisYear) {
         $tier = 'yearly'
@@ -74,8 +74,8 @@ $Recipe.AddStep('archive', {
         $isoWeek = [System.Globalization.ISOWeek]::GetWeekOfYear($now)
         $hasWeeklyThisWeek = @($archived | Where-Object {
                 $_.tier -eq 'weekly' -and
-                [System.Globalization.ISOWeek]::GetYear([datetime]$_.ts) -eq $isoYear -and
-                [System.Globalization.ISOWeek]::GetWeekOfYear([datetime]$_.ts) -eq $isoWeek
+                [System.Globalization.ISOWeek]::GetYear(([datetime]$_.ts).ToLocalTime()) -eq $isoYear -and
+                [System.Globalization.ISOWeek]::GetWeekOfYear(([datetime]$_.ts).ToLocalTime()) -eq $isoWeek
             }).Count -gt 0
         $tier = if ($hasWeeklyThisWeek) { 'daily' } else { 'weekly' }
     }
@@ -101,7 +101,7 @@ $Recipe.AddStep('archive', {
                 $_.PSObject.Properties['tier'] -and $_.tier -eq $tier -and
                 $_.PSObject.Properties['path'] -and ($prunedPaths -notcontains $_.path)
             } |
-            ForEach-Object { [pscustomobject]@{ ts = [datetime]$_.ts; path = $_.path; isNew = $false } })
+            ForEach-Object { [pscustomobject]@{ ts = ([datetime]$_.ts).ToLocalTime(); path = $_.path; isNew = $false } })
     $tierArchives += [pscustomobject]@{ ts = $now; path = $target; isNew = $true }
     foreach ($a in $tierArchives) {
         $a | Add-Member -NotePropertyName periodKey -NotePropertyValue (& $periodKeyOf $tier $a.ts)
@@ -157,9 +157,10 @@ $Recipe.SetOverdue({
     $mine = @($ctx.ReadEvents() | Where-Object {
             $_.type -eq 'service.archived' -and $_.svc -eq $ctx.Service -and $_.PSObject.Properties['ts']
         })
+    $ctx.State['PeriodSec'] = $dailyHours * 3600.0   # lets the engine size its coverage tolerance
     if (-not $mine) { return 1e6 }   # never archived -> very overdue
     $newest = ($mine | Sort-Object { [datetime]$_.ts } | Select-Object -Last 1)
-    $ageSeconds = ($ctx.Now - [datetime]$newest.ts).TotalSeconds
+    $ageSeconds = ($ctx.Now.ToUniversalTime() - ([datetime]$newest.ts).ToUniversalTime()).TotalSeconds
     if ($ageSeconds -lt 0) { $ageSeconds = 0 }
     return $ageSeconds / ($dailyHours * 3600.0)
 })

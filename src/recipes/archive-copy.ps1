@@ -95,9 +95,10 @@ $Recipe.SetOverdue({
     $mine = @($ctx.ReadEvents() | Where-Object {
             $_.type -eq 'service.archived' -and $_.svc -eq $ctx.Service -and $_.PSObject.Properties['ts']
         })
+    $ctx.State['PeriodSec'] = $minHours * 3600.0   # lets the engine size its coverage tolerance
     if (-not $mine) { return 1e6 }   # never archived -> very overdue
     $newest = ($mine | Sort-Object { [datetime]$_.ts } | Select-Object -Last 1)
-    $ageSeconds = ($ctx.Now - [datetime]$newest.ts).TotalSeconds
+    $ageSeconds = ($ctx.Now.ToUniversalTime() - ([datetime]$newest.ts).ToUniversalTime()).TotalSeconds
     if ($ageSeconds -lt 0) { $ageSeconds = 0 }
     return $ageSeconds / ($minHours * 3600.0)
 })
