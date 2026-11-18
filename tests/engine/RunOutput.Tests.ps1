@@ -98,6 +98,22 @@ Describe 'run narration' {
         ($lines -join "`n") | Should -Not -Match 'chatty output object'   # step output objects stay dropped
     }
 
+    It 'records step warnings in the event log and the email report, not info lines' {
+        $cfg = @'
+{ "window": { "open": "00:00", "close": "00:01" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1", "publishToReady": true,
+      "steps": [ {"name":"dump"}, {"name":"chatty"} ] } } }
+'@ | ConvertFrom-Json
+        $null = Get-RunLines $cfg $paths -Journal
+        $ends = @(Get-BackupEvents -EventsPath $paths.EventsPath | Where-Object { $_.type -eq 'step.end' })
+        @($ends | Where-Object { $_.step -eq 'chatty' })[0].warnings | Should -Be @('chatty warning')
+        Test-HasProp @($ends | Where-Object { $_.step -eq 'dump' })[0] 'warnings' | Should -BeFalse   # absent when none
+        $runId = @(Get-BackupEvents -EventsPath $paths.EventsPath | Where-Object { $_.type -eq 'run.start' })[0].runId
+        $report = Format-RunReport -EventsPath $paths.EventsPath -RunId $runId
+        $report | Should -Match '(?m)^  ! app\s+chatty: chatty warning$'
+        $report | Should -Not -Match 'chatty info'
+    }
+
     It 'shows a failed step, the recovery step, and the service failure' {
         $cfg = @'
 { "window": { "open": "00:00", "close": "00:01" },

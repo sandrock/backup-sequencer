@@ -137,4 +137,33 @@ Describe 'run status and detail (status / show / history)' {
         $text | Should -Match '! archive failed: repo locked'
         (Format-RunHistoryLine -Detail $detail) | Should -Match 'r1  ok=0 failed=2 planned=3  \[a:covered b:fail c:fail\]'
     }
+
+    It 'bounds the warnings a step stores: count, length, then (+N more)' {
+        $w = @(1..25 | ForEach-Object { "w$_" })
+        $out = @(Limit-StepWarnings -Warnings $w)
+        $out.Count | Should -Be 21
+        $out[19] | Should -Be 'w20'
+        $out[20] | Should -Be '(+5 more)'
+        $long = @(Limit-StepWarnings -Warnings @('x' * 600))
+        $long[0].Length | Should -Be 500
+        $long[0] | Should -Match '\.\.\.$'
+        @(Limit-StepWarnings -Warnings @('a', 'b')) -join ',' | Should -Be 'a,b'
+    }
+
+    It 'lists step warnings and engine warnings under their service' {
+        & $addEv $ev (& $iso 0) 'run.start' @{ runId = 'r1' }
+        & $addEv $ev (& $iso 1) 'step.end' @{ runId = 'r1'; svc = 'gitea'; step = 'dump'; status = 'ok'; durationSec = 2; warnings = @('file changed as we read it: /x') }
+        & $addEv $ev (& $iso 2) 'service.replaced' @{ runId = 'r1'; svc = 'gitea'; reason = 'previous-unarchived' }
+        & $addEv $ev (& $iso 2) 'service.end' @{ runId = 'r1'; svc = 'gitea'; status = 'ok'; bytes = 1MB }
+        & $addEv $ev (& $iso 3) 'service.skip' @{ runId = 'r1'; svc = 'minio'; reason = 'insufficient-space'; needBytes = 2GB; freeBytes = 1GB }
+        & $addEv $ev (& $iso 4) 'run.end' @{ runId = 'r1'; summary = @{ ok = 1; failed = 0; planned = 2 } }
+        $events = @(Get-BackupEvents -EventsPath $ev)
+        $detail = Get-RunDetail -Events $events -Run (Get-RunStates -Events $events -LockPath $lock)[-1]
+        $lines = @(Format-RunDetail -Detail $detail)
+
+        $i = [array]::FindIndex($lines, [Predicate[string]] { param($l) $l -match '^\s+gitea\s+ok' })
+        $lines[$i + 1] | Should -Be '      ! dump: file changed as we read it: /x'
+        $lines[$i + 2] | Should -Match '^      ! replaced the previous backup in ready/'
+        ($lines -join "`n") | Should -Match 'minio\s+skipped \(insufficient-space\)\n      ! insufficient space in the spool \(need 2(\.0)? GB, free 1(\.0)? GB\)'
+    }
 }

@@ -125,7 +125,10 @@ Describe 'CLI validate' {
 
 Describe 'CLI after runs' {
     BeforeAll {
-        $script:ran = New-CliEnv -Name 'ran' -Services @{ app = $mockSvc }
+        # the chatty step leaves a warning for show to report after the fact
+        $chattySvc = @{ enabled = $true; script = '../tests/fixtures/mock-service.ps1'; publishToReady = $true
+            steps = @(@{ name = 'dump'; resources = @() }, @{ name = 'chatty'; resources = @() }) }
+        $script:ran = New-CliEnv -Name 'ran' -Services @{ app = $chattySvc }
         # two runs: the second forces past coverage so both have a service line
         $script:run1 = Invoke-Cli $ran @('run', '-ForceWindow')
         $script:run2 = Invoke-Cli $ran @('run', '-ForceWindow', '-ForceAllJobs')
@@ -162,6 +165,13 @@ Describe 'CLI after runs' {
         $r.Exit | Should -Be 0
         $r.Out | Should -Match ("run " + [regex]::Escape($runIds[1]))
         $r.Out | Should -Not -Match ([regex]::Escape($runIds[0]))
+    }
+
+    It 'show lists the warnings of the run under the service' {
+        $r = Invoke-Cli $ran @('show')
+        $r.Out | Should -Match '(?m)^      ! chatty: chatty warning\s*$'
+        # the second run found the first one's backup still in ready/ (no archiver here)
+        $r.Out | Should -Match '(?m)^      ! replaced the previous backup in ready/'
     }
 
     It 'show with one reference (regression: a single ref used to throw)' {

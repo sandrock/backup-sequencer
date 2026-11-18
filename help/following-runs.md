@@ -165,7 +165,17 @@ Outcome:
 
 The archive column is the restic snapshot id (`snap …`), or the tier for tiered
 on-disk archives. A failed step shows as `FAIL` next to its duration
-(`sync-archive FAIL 1s`). Lines starting with `!` under a service give the error.
+(`sync-archive FAIL 1s`). Lines starting with `!` under a service give the error,
+and the warnings of that service in the run: the recipe's own, prefixed with their
+step, and the engine's (a backup replaced in `ready/`, a spool out of space):
+
+```
+  forgejo                ok                    1.2 GB    snap 41c09e7a  stop 3.0s, dump 2m10s, start 5.1s
+      ! dump: tar: ./data/queues/000123.log: file changed as we read it
+```
+
+The email report lists the same warnings, one line each. A step keeps at most 20
+of them in the event log, each cut to 500 characters.
 
 
 Permissions

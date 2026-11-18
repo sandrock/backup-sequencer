@@ -101,6 +101,10 @@ service and step columns. The capture forces those preferences on inside the
 step's own scope, so a caller silencing its streams never makes a step's warnings
 vanish. Other output objects of a step are dropped, as before.
 
+Warnings are also stored on the step's `step.end` event (`warnings`, at most 20,
+500 characters each), so `show` and the email report can list them after the
+fact; `info` lines are narration only and are not stored.
+
 Native tool output (docker compose, tar) is NOT captured: it goes straight to
 stdout/stderr, untagged, between its step's `start` and `ok` lines. Capturing it
 (to a per-step file, shown on failure) was considered and deferred — keep it

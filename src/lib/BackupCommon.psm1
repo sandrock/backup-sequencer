@@ -266,6 +266,21 @@ function Get-PathSizeBytes {
 
 # --- step execution ---------------------------------------------------------
 
+function Limit-StepWarnings {
+    # Bound what a step's warnings put in the event log: a chatty tool must not bloat
+    # events.jsonl. At most $Max messages of $MaxChars each, then a "(+N more)" entry.
+    param(
+        [string[]]$Warnings = @(),
+        [int]$Max = 20,
+        [int]$MaxChars = 500
+    )
+    $out = @($Warnings | Select-Object -First $Max | ForEach-Object {
+            if ($_.Length -gt $MaxChars) { $_.Substring(0, $MaxChars - 3) + '...' } else { $_ }
+        })
+    if ($Warnings.Count -gt $Max) { $out += "(+$($Warnings.Count - $Max) more)" }
+    return $out
+}
+
 function Invoke-BackupStep {
     # Run one step inline with timing + retries, emitting step.start / step.end.
     # (Hard timeout enforcement is a later iteration; timeoutSec is recorded only.)
@@ -288,6 +303,7 @@ function Invoke-BackupStep {
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $status = 'ok'
         $errMsg = $null
+        $warnings = [System.Collections.Generic.List[string]]::new()
         try {
             # the step's warnings and info messages come out as tagged lines (service +
             # step); its other output is dropped; native tool output passes through as is.
@@ -295,6 +311,7 @@ function Invoke-BackupStep {
             # streams must not make the step's warnings vanish.
             & { $WarningPreference = 'Continue'; $InformationPreference = 'Continue'; & $Action } 3>&1 6>&1 | ForEach-Object {
                 if ($_ -is [System.Management.Automation.WarningRecord]) {
+                    $warnings.Add($_.Message)
                     Write-RunLine -RunId $RunId -Service $Service -Step $Step -Event 'WARN' -Detail $_.Message
                 }
                 elseif ($_ -is [System.Management.Automation.InformationRecord]) {
@@ -316,6 +333,7 @@ function Invoke-BackupStep {
             durationSec = [math]::Round($sw.Elapsed.TotalSeconds, 2); attempt = $attempt
         }
         if ($errMsg) { $props.error = $errMsg }
+        if ($warnings.Count -gt 0) { $props.warnings = @(Limit-StepWarnings -Warnings $warnings) }
         Add-BackupEvent -EventsPath $EventsPath -Type 'step.end' -Props $props
         if ($status -eq 'ok') {
             return 'ok'
@@ -965,7 +983,12 @@ function Format-RunReport {
         $reason = if (Test-HasProp $e 'reason') { $e.reason } else { 'see events.jsonl' }
         $lines += ("  ! {0,-22} archive failed: {1}" -f $e.svc, $reason)
     }
-    $end = $events | Where-Object { $_.type -eq 'run.end' } | Select-Object -First 1
+    # step warnings and engine warnings (replaced backup, spool out of space), worded as in `show`
+    $detail = Get-RunDetail -Events @($events) -Run ([pscustomobject]@{ RunId = $RunId })
+    foreach ($s in $detail.Services) {
+        foreach ($w in $s.Warnings) { $lines += ("  ! {0,-22} {1}" -f $s.Service, $w) }
+    }
+    $end =$events | Where-Object { $_.type -eq 'run.end' } | Select-Object -First 1
     if ($end) {
         $lines += ("  -- ok={0} failed={1} planned={2}" -f $end.summary.ok, $end.summary.failed, $end.summary.planned)
     }
@@ -1193,6 +1216,7 @@ function Get-RunDetail {
                 Service = $name; Steps = [System.Collections.Generic.List[object]]::new(); Open = $null
                 Status = $null; Reason = $null; Problems = @(); Error = $null; Bytes = $null
                 Snapshot = $null; Tier = $null; SyncFail = $null
+                Warnings = [System.Collections.Generic.List[string]]::new()
             }
         }
         $services[$name]
@@ -1207,8 +1231,15 @@ function Get-RunDetail {
             'step.end' {
                 $svc.Steps.Add([pscustomobject]@{ Step = [string]$e.step; Status = [string]$e.status; DurationSec = [double]$e.durationSec })
                 $svc.Open = $null
+                if (Test-HasProp $e 'warnings') { foreach ($w in @($e.warnings)) { $svc.Warnings.Add("$($e.step): $w") } }
             }
-            'service.skip' { $svc.Status = 'skipped'; $svc.Reason = [string]$e.reason }
+            'service.skip' {
+                $svc.Status = 'skipped'; $svc.Reason = [string]$e.reason
+                if ($svc.Reason -eq 'insufficient-space' -and (Test-HasProp $e 'needBytes') -and (Test-HasProp $e 'freeBytes')) {
+                    $svc.Warnings.Add(("insufficient space in the spool (need {0}, free {1})" -f (Format-Size ([double]$e.needBytes)), (Format-Size ([double]$e.freeBytes))))
+                }
+            }
+            'service.replaced' { $svc.Warnings.Add('replaced the previous backup in ready/, never taken by the archiver') }
             'service.archived' {
                 if (Test-HasProp $e 'snapshot') { $svc.Snapshot = [string]$e.snapshot }
                 if (Test-HasProp $e 'tier') { $svc.Tier = [string]$e.tier }
@@ -1279,6 +1310,7 @@ function Format-RunDetail {
         foreach ($p in $s.Problems) { $lines += "      - $p" }
         if ($s.Error) { $lines += "      ! $($s.Error)" }
         if ($s.SyncFail) { $lines += "      ! archive failed: $($s.SyncFail)" }
+        foreach ($w in $s.Warnings) { $lines += "      ! $w" }
         if ($note) { $lines += "      ! $note" }
     }
     if ($Detail.Services.Count -eq 0) { $lines += '  (no services)' }
@@ -1315,7 +1347,7 @@ Export-ModuleMember -Function `
     New-RunId, Get-NowIso, Add-BackupEvent, Get-BackupEvents, Test-HasProp, `
     Get-ServiceProjection, Get-EstimatedServiceSeconds, Enter-SequencerLock, Exit-SequencerLock, `
     Test-WithinWindow, Get-WindowLengthSeconds, Get-SecondsUntilClose, `
-    Get-FreeSpaceBytes, Get-PathSizeBytes, Invoke-BackupStep, `
+    Get-FreeSpaceBytes, Get-PathSizeBytes, Limit-StepWarnings, Invoke-BackupStep, `
     Get-SpoolPaths, Move-ToTrash, Move-Phase, Clear-Trash, `
     Get-ScopedEnv, Get-ServiceOverdue, Get-ServiceValidationProblems, `
     Get-BackupPlan, Invoke-BackupRun, Format-RunReport, Send-BackupReport

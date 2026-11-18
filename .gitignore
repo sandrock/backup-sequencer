@@ -2,6 +2,3 @@
 var/
 secrets/
 tmp/
-
-# Airudit confidentiality marker — kept local, not for the public repo
-+++*Airudit+Confidentiality+++
