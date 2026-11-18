@@ -20,6 +20,6 @@ Describe 'step execution' {
     It 'retries on failure then reports fail' {
         $ev = Join-Path $Work 'step-retry.jsonl'
         (Invoke-BackupStep -EventsPath $ev -RunId 'r' -Service 's' -Step 'x' -Action { throw 'nope' } -Retries 2 -BackoffSec 0) | Should -Be 'fail'
-        @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'step.start' }).Count | Should -Be 3
+        @(Get-BackupEvents -EventsPath $ev | Where-Object { $_.type -eq 'step.begin' }).Count | Should -Be 3
     }
 }

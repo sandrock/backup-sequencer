@@ -133,7 +133,7 @@ Describe 'CLI after runs' {
         $script:run1 = Invoke-Cli $ran @('run', '-ForceWindow')
         $script:run2 = Invoke-Cli $ran @('run', '-ForceWindow', '-ForceAllJobs')
         $events = @(Get-BackupEvents -EventsPath (Join-Path $ran.Var 'events.jsonl'))
-        $script:runIds = @($events | Where-Object { $_.type -eq 'run.start' } | ForEach-Object { [string]$_.runId })
+        $script:runIds = @($events | Where-Object { $_.type -eq 'run.begin' } | ForEach-Object { [string]$_.runId })
     }
 
     It 'run -ForceWindow backs the service up' {

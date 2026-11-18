@@ -49,10 +49,10 @@ Describe 'run status and detail (status / show / history)' {
     }
 
     It 'tells finished, running and interrupted runs apart' {
-        & $addEv $ev (& $iso 0) 'run.start' @{ runId = 'r-0001' }
+        & $addEv $ev (& $iso 0) 'run.begin' @{ runId = 'r-0001' }
         & $addEv $ev (& $iso 5) 'run.end' @{ runId = 'r-0001'; summary = @{ ok = 1; failed = 0; planned = 1 } }
-        & $addEv $ev (& $iso 10) 'run.start' @{ runId = 'r-0002' }
-        & $addEv $ev (& $iso 20) 'run.start' @{ runId = 'r-0003' }
+        & $addEv $ev (& $iso 10) 'run.begin' @{ runId = 'r-0002' }
+        & $addEv $ev (& $iso 20) 'run.begin' @{ runId = 'r-0003' }
         $events = @(Get-BackupEvents -EventsPath $ev)
 
         Set-Content -LiteralPath $lock -Value $PID   # a live process holds the lock
@@ -78,15 +78,15 @@ Describe 'run status and detail (status / show / history)' {
     }
 
     It 'shows the step in progress, finished services and pending ones for a running run' {
-        & $addEv $ev (& $iso 0) 'run.start' @{ runId = 'r1' }
+        & $addEv $ev (& $iso 0) 'run.begin' @{ runId = 'r1' }
         & $addEv $ev (& $iso 0) 'run.plan' @{ runId = 'r1'; plan = @('a', 'b', 'c') }
-        & $addEv $ev (& $iso 1) 'step.start' @{ runId = 'r1'; svc = 'a'; step = 'dump' }
+        & $addEv $ev (& $iso 1) 'step.begin' @{ runId = 'r1'; svc = 'a'; step = 'dump' }
         & $addEv $ev (& $iso 4) 'step.end' @{ runId = 'r1'; svc = 'a'; step = 'dump'; status = 'ok'; durationSec = 3.1 }
         & $addEv $ev (& $iso 5) 'service.archived' @{ runId = 'r1'; svc = 'a'; snapshot = 'deadbeefcafe0123' }
         & $addEv $ev (& $iso 5) 'service.end' @{ runId = 'r1'; svc = 'a'; status = 'ok'; bytes = 7.2MB }
-        & $addEv $ev (& $iso 6) 'step.start' @{ runId = 'r1'; svc = 'b'; step = 'stop' }
+        & $addEv $ev (& $iso 6) 'step.begin' @{ runId = 'r1'; svc = 'b'; step = 'stop' }
         & $addEv $ev (& $iso 55) 'step.end' @{ runId = 'r1'; svc = 'b'; step = 'stop'; status = 'ok'; durationSec = 49 }
-        & $addEv $ev (& $iso 60) 'step.start' @{ runId = 'r1'; svc = 'b'; step = 'hot-dump' }
+        & $addEv $ev (& $iso 60) 'step.begin' @{ runId = 'r1'; svc = 'b'; step = 'hot-dump' }
         Set-Content -LiteralPath $lock -Value $PID
         $events = @(Get-BackupEvents -EventsPath $ev)
         $run = (Get-RunStates -Events $events -LockPath $lock)[-1]
@@ -101,9 +101,9 @@ Describe 'run status and detail (status / show / history)' {
     }
 
     It 'flags the step a dead run stopped in, and services it never reached' {
-        & $addEv $ev (& $iso 0) 'run.start' @{ runId = 'r1' }
+        & $addEv $ev (& $iso 0) 'run.begin' @{ runId = 'r1' }
         & $addEv $ev (& $iso 0) 'run.plan' @{ runId = 'r1'; plan = @('a', 'b') }
-        & $addEv $ev (& $iso 1) 'step.start' @{ runId = 'r1'; svc = 'a'; step = 'dump' }
+        & $addEv $ev (& $iso 1) 'step.begin' @{ runId = 'r1'; svc = 'a'; step = 'dump' }
         $events = @(Get-BackupEvents -EventsPath $ev)
         $run = (Get-RunStates -Events $events -LockPath $lock)[-1]
         $detail = Get-RunDetail -Events $events -Run $run
@@ -117,10 +117,10 @@ Describe 'run status and detail (status / show / history)' {
     }
 
     It 'tells a service between two steps from one never reached' {
-        & $addEv $ev (& $iso 0) 'run.start' @{ runId = 'r1' }
+        & $addEv $ev (& $iso 0) 'run.begin' @{ runId = 'r1' }
         & $addEv $ev (& $iso 0) 'run.plan' @{ runId = 'r1'; plan = @('a', 'b') }
         & $addEv $ev (& $iso 1) 'service.begin' @{ runId = 'r1'; svc = 'a'; estSec = 60; mandatory = $false }
-        & $addEv $ev (& $iso 1) 'step.start' @{ runId = 'r1'; svc = 'a'; step = 'dump' }
+        & $addEv $ev (& $iso 1) 'step.begin' @{ runId = 'r1'; svc = 'a'; step = 'dump' }
         & $addEv $ev (& $iso 4) 'step.end' @{ runId = 'r1'; svc = 'a'; step = 'dump'; status = 'ok'; durationSec = 3 }
         $events = @(Get-BackupEvents -EventsPath $ev)
 
@@ -140,10 +140,10 @@ Describe 'run status and detail (status / show / history)' {
     }
 
     It 'shows skipped and invalid services of a finished run, with problems and archive failures' {
-        & $addEv $ev (& $iso 0) 'run.start' @{ runId = 'r1' }
+        & $addEv $ev (& $iso 0) 'run.begin' @{ runId = 'r1' }
         & $addEv $ev (& $iso 0) 'service.skip' @{ runId = 'r1'; svc = 'a'; reason = 'covered' }
         & $addEv $ev (& $iso 1) 'service.end' @{ runId = 'r1'; svc = 'b'; status = 'fail'; reason = 'invalid'; problems = @('hot dir missing: /x'); bytes = 0 }
-        & $addEv $ev (& $iso 2) 'step.start' @{ runId = 'r1'; svc = 'c'; step = 'sync-archive' }
+        & $addEv $ev (& $iso 2) 'step.begin' @{ runId = 'r1'; svc = 'c'; step = 'sync-archive' }
         & $addEv $ev (& $iso 3) 'step.end' @{ runId = 'r1'; svc = 'c'; step = 'sync-archive'; status = 'fail'; durationSec = 1 }
         & $addEv $ev (& $iso 3) 'service.syncfail' @{ runId = 'r1'; svc = 'c'; reason = 'repo locked' }
         & $addEv $ev (& $iso 3) 'service.end' @{ runId = 'r1'; svc = 'c'; status = 'fail'; bytes = 0; error = 'sync-archive failed; nothing retained' }
@@ -174,7 +174,7 @@ Describe 'run status and detail (status / show / history)' {
     }
 
     It 'lists step warnings and engine warnings under their service' {
-        & $addEv $ev (& $iso 0) 'run.start' @{ runId = 'r1' }
+        & $addEv $ev (& $iso 0) 'run.begin' @{ runId = 'r1' }
         & $addEv $ev (& $iso 1) 'step.end' @{ runId = 'r1'; svc = 'gitea'; step = 'dump'; status = 'ok'; durationSec = 2; warnings = @('file changed as we read it: /x') }
         & $addEv $ev (& $iso 2) 'service.replaced' @{ runId = 'r1'; svc = 'gitea'; reason = 'previous-unarchived' }
         & $addEv $ev (& $iso 2) 'service.end' @{ runId = 'r1'; svc = 'gitea'; status = 'ok'; bytes = 1MB }

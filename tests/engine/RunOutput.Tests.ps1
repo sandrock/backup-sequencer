@@ -117,7 +117,7 @@ Describe 'run narration' {
         $ends = @(Get-BackupEvents -EventsPath $paths.EventsPath | Where-Object { $_.type -eq 'step.end' })
         @($ends | Where-Object { $_.step -eq 'chatty' })[0].warnings | Should -Be @('chatty warning')
         Test-HasProp @($ends | Where-Object { $_.step -eq 'dump' })[0] 'warnings' | Should -BeFalse   # absent when none
-        $runId = @(Get-BackupEvents -EventsPath $paths.EventsPath | Where-Object { $_.type -eq 'run.start' })[0].runId
+        $runId = @(Get-BackupEvents -EventsPath $paths.EventsPath | Where-Object { $_.type -eq 'run.begin' })[0].runId
         $report = Format-RunReport -EventsPath $paths.EventsPath -RunId $runId
         $report | Should -Match '(?m)^  ! app\s+chatty: chatty warning$'
         $report | Should -Not -Match 'chatty info'

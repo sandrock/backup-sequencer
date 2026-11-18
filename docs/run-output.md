@@ -111,7 +111,7 @@ The event log follows the same rule: an event that closes an action carries
 (`service.syncfail` with `reason`) are still read as they are.
 
 The words above are display only: the event log keeps its own types
-(`step.start`, `step.end`, ...), so renaming a run-output word never touches it.
+(`step.begin`, `step.end`, ...), so renaming a run-output word never touches it.
 The log itself is append-only and never rewritten: a field or an event type is
 only ever added, and if a shape has to change, readers accept both forms.
 

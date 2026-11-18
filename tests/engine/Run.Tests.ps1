@@ -69,7 +69,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         (Test-Path (Join-Path $root 'ready/app')) | Should -BeFalse
         $events = Get-BackupEvents -EventsPath $ev
         ($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'app' } | Select-Object -First 1).status | Should -Be 'fail'
-        @($events | Where-Object { $_.type -eq 'step.start' -and $_.step -eq 'start' }).Count | Should -BeGreaterThan 0
+        @($events | Where-Object { $_.type -eq 'step.begin' -and $_.step -eq 'start' }).Count | Should -BeGreaterThan 0
     }
 
     It 'replaces an unconsumed previous backup and notifies' {
@@ -125,13 +125,15 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         Invoke-BackupRun -Config $cfg -Paths $paths -ForceWindow -ForceAllJobs -WarningAction SilentlyContinue | Out-Null
         Invoke-BackupRun -Config $cfg -Paths $paths -WarningAction SilentlyContinue | Out-Null   # regular (covered: no backup)
         $evs = @(Get-BackupEvents -EventsPath $ev)
-        @($evs | Where-Object { $_.type -eq 'run.start' } | ForEach-Object { $_.forced }) -join ',' | Should -Be 'window,all,none'
+        @($evs | Where-Object { $_.type -eq 'run.begin' } | ForEach-Object { $_.forced }) -join ',' | Should -Be 'window,all,none'
         $starts = @($evs | Where-Object { $_.type -eq 'service.begin' })
         $starts[0].svc | Should -Be 'app'
         $starts[0].mandatory | Should -BeTrue
         $starts[0].estSec | Should -Be -1            # never backed up: unknown estimate
         $starts[1].estSec | Should -BeGreaterOrEqual 0
         @($evs | Where-Object { $_.type -eq 'service.end' })[0].kept | Should -Be 'ready'
+        # lifecycle events say begin/end; start/stop are for starting a real service
+        @($evs | Where-Object { $_.type -match '\.(start|stop)$' }).Count | Should -Be 0
     }
 
     It 'sync-only (publishToReady=false): a sync failure retains nothing and fails the service' {
@@ -305,7 +307,7 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         $badEnd = @($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'bad' })[-1]
         $badEnd.status | Should -Be 'fail'
         $badEnd.reason | Should -Be 'invalid'
-        @($events | Where-Object { ($_.type -eq 'step.start' -or $_.type -eq 'step.end') -and $_.svc -eq 'bad' }).Count | Should -Be 0
+        @($events | Where-Object { ($_.type -eq 'step.begin' -or $_.type -eq 'step.end') -and $_.svc -eq 'bad' }).Count | Should -Be 0
         # good: ran and archived despite the other service being invalid
         (@($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'good' })[-1]).status | Should -Be 'ok'
         @($events | Where-Object { $_.type -eq 'service.archived' -and $_.svc -eq 'good' }).Count | Should -BeGreaterThan 0

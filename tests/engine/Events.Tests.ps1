@@ -12,11 +12,11 @@ AfterAll {
 Describe 'event log and projection' {
     It 'appends and reads events' {
         $ev = Join-Path $Work 'events-1.jsonl'
-        Add-BackupEvent -EventsPath $ev -Type 'run.start' -Props @{ runId = 'r1' }
+        Add-BackupEvent -EventsPath $ev -Type 'run.begin' -Props @{ runId = 'r1' }
         Add-BackupEvent -EventsPath $ev -Type 'step.end' -Props @{ svc = 'a'; step = 'dump'; status = 'ok'; durationSec = 3; runId = 'r1' }
         $events = Get-BackupEvents -EventsPath $ev
         $events.Count | Should -Be 2
-        $events[0].type | Should -Be 'run.start'
+        $events[0].type | Should -Be 'run.begin'
     }
 
     It 'folds a per-service projection' {

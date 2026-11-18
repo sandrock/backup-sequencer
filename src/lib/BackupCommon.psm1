@@ -307,7 +307,7 @@ function Limit-StepWarnings {
 }
 
 function Invoke-BackupStep {
-    # Run one step inline with timing + retries, emitting step.start / step.end.
+    # Run one step inline with timing + retries, emitting step.begin / step.end.
     # (Hard timeout enforcement is a later iteration; timeoutSec is recorded only.)
     param(
         [Parameter(Mandatory)][string]$EventsPath,
@@ -320,7 +320,7 @@ function Invoke-BackupStep {
     )
     $attempt = 0
     while ($true) {
-        Add-BackupEvent -EventsPath $EventsPath -Type 'step.start' `
+        Add-BackupEvent -EventsPath $EventsPath -Type 'step.begin' `
             -Props @{ runId = $RunId; svc = $Service; step = $Step; attempt = $attempt }
         $startedAt = Get-Date
         $startDetail = if ($attempt -gt 0) { "attempt $($attempt + 1)/$($Retries + 1)" } else { '' }
@@ -693,7 +693,7 @@ function Invoke-BackupRun {
         }
         Clear-Trash -TrashRoot $stg.Trash   # reap leftovers at run start, off the publish path
 
-        Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'run.start' `
+        Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'run.begin' `
             -Props @{ runId = $runId; window = "$($Config.window.open)-$($Config.window.close)"
                 forced = $(if ($ForceAllJobs) { 'all' } elseif ($ForceWindow) { 'window' } else { 'none' }) }
         $startDetail = "$runId  window $($Config.window.open)-$($Config.window.close)"
@@ -1214,7 +1214,7 @@ function Get-RunStates {
         [object[]]$Events = @(),
         [string]$LockPath
     )
-    $starts = @($Events | Where-Object { $_.type -eq 'run.start' })
+    $starts = @($Events | Where-Object { $_.type -eq 'run.begin' })
     $ends = @{}
     foreach ($e in @($Events | Where-Object { $_.type -eq 'run.end' })) { $ends[[string]$e.runId] = $e }
     $holder = Get-LockHolder -LockPath $LockPath
@@ -1285,7 +1285,7 @@ function Get-RunDetail {
         $svc = & $get ([string]$e.svc)
         switch ($e.type) {
             'service.begin' { $svc.Started = $true }
-            'step.start' { $svc.Open = [pscustomobject]@{ Step = [string]$e.step; Start = $e.ts } }
+            'step.begin' { $svc.Open = [pscustomobject]@{ Step = [string]$e.step; Start = $e.ts } }
             'step.end' {
                 $svc.Steps.Add([pscustomobject]@{ Step = [string]$e.step; Status = [string]$e.status; DurationSec = [double]$e.durationSec })
                 $svc.Open = $null
