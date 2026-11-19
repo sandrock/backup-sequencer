@@ -65,11 +65,11 @@ function Remove-TestWork {
 
 function Get-RunLines {
     # run the engine, return its narration lines (Information stream) as strings
-    param($Config, $Paths, [switch]$Journal)
+    param($Config, $Paths, [switch]$Journal, [switch]$ForceAllJobs)
     $saved = $env:JOURNAL_STREAM
     $env:JOURNAL_STREAM = if ($Journal) { '8:1234' } else { $null }
     try {
-        $out = Invoke-BackupRun -Config $Config -Paths $Paths -ForceWindow -InformationAction Continue -WarningAction SilentlyContinue 6>&1
+        $out = Invoke-BackupRun -Config $Config -Paths $Paths -ForceWindow -ForceAllJobs:$ForceAllJobs -InformationAction Continue -WarningAction SilentlyContinue 6>&1
         return @($out | Where-Object { $_ -is [System.Management.Automation.InformationRecord] } | ForEach-Object { [string]$_.MessageData })
     }
     finally { $env:JOURNAL_STREAM = $saved }

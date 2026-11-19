@@ -54,6 +54,7 @@ Fields
 | `publishToReady` | Keep a local copy in `ready/` after the run. See [Archiving](archiving.md). |
 | `syncArchive` | The archiver to run in-window (below). |
 | `targetIntervalHours` | Desired backup interval for scheduling (below). |
+| `emptyTrash` | When the archived local copy is deleted from the spool (below). |
 
 
 Steps
@@ -108,6 +109,35 @@ plus `publishToReady`. The bundled archivers and their parameters:
 
 How synchronous and asynchronous archiving differ, and when to set
 `publishToReady` to `false` vs `true`, is covered in [Archiving](archiving.md).
+
+### Freeing the spool: `emptyTrash`
+
+With `publishToReady: false`, the local copy is moved into the spool's `trash/`
+once archived. `emptyTrash` says when it is deleted, at the top level (all
+services) or per service (overrides):
+
+| Value | The archived copy is deleted |
+|---|---|
+| `service-end` | right after the service ends: the space is back before the next service |
+| `run-end` | at the end of the run, before the report mail |
+| `next-run` | at the start of the next run (default) |
+| `manual` | never by a run: `bseq trash -Delete` frees it |
+
+```json
+{
+  "emptyTrash": "service-end",
+  "services": {
+    "mattermost": { "emptyTrash": "manual", ... }
+  }
+}
+```
+
+Only the archived copy is deleted early. Anything else in the trash (the partial
+dump of a failed backup, a leftover of an interrupted run, a copy whose archive
+failed) waits for the next run, so it can still be looked at. `manual` prints what
+it holds instead of deleting it; see [Following runs](following-runs.md#deletions).
+Large services want `service-end`: a 300 GB copy otherwise stays on the spool
+disk until the next run.
 
 
 Scheduling

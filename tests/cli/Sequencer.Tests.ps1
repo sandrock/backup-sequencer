@@ -216,9 +216,19 @@ Describe 'CLI trash' {
         $r = Invoke-Cli $tr @('trash')
         $r.Exit | Should -Be 0
         $r.Out | Should -Match '2 items, 5 KB'
-        $r.Out | Should -Match '(?m)^  forgejo-0123456789ab\s+5 KB\s+1 files  forgejo\s+local-copy-dropped\s+run a558  moved 2026-11-18T'
-        $r.Out | Should -Match '(?m)^  junk\s+0 KB\s+0 files  no record'
+        $r.Out | Should -Match '(?m)^  forgejo-0123456789ab\s+5 KB\s+1 files  next run  forgejo\s+local-copy-dropped\s+run a558  moved 2026-11-18T'
+        $r.Out | Should -Match '(?m)^  junk\s+0 KB\s+0 files  next run  no record'
         (Test-Path (Join-Path $trashDir 'junk')) | Should -BeTrue   # listing deletes nothing
+    }
+
+    It 'says when a run deletes each item: never for an emptyTrash manual service' {
+        $m = New-CliEnv -Name ("trash-m-" + [guid]::NewGuid().ToString('n').Substring(0, 6)) -Services @{ forgejo = @{ emptyTrash = 'manual' } }
+        $mTrash = Join-Path $m.Spool 'trash'
+        New-Item -ItemType Directory -Force -Path (Join-Path $mTrash 'forgejo-0123456789ab'), (Join-Path $mTrash 'junk'), $m.Var | Out-Null
+        Copy-Item -LiteralPath $evPath -Destination (Join-Path $m.Var 'events.jsonl')
+        $r = Invoke-Cli $m @('trash')
+        $r.Out | Should -Match '(?m)^  forgejo-0123456789ab\s+0 KB\s+0 files  manual    forgejo'
+        $r.Out | Should -Match '(?m)^  junk\s+0 KB\s+0 files  next run  no record'
     }
 
     It 'deletes only the items named, logged as by command' {

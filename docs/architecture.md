@@ -87,7 +87,8 @@ Two files, single-writer each:
   (`run.begin`, `run.plan`, `service.begin`, `step.begin`, `step.end`,
   `service.end`, `service.skip`, `service.replaced`, `service.syncfail`,
   `service.archived`, `service.archive-pruned`, `service.archive-prunefail`,
-  `trash.move`, `trash.delete`, `run.windowclosed`, `run.end`, `notify.send`).
+  `trash.move`, `trash.delete`, `trash.hold`, `run.windowclosed`, `run.end`,
+  `notify.send`).
   Crash-safe and the single source of truth — e.g. archivers route and prune by
   `service.archived` / `service.archive-pruned` rather than by directory names.
   Anything the run output tells that a reader may need later is in an event:
@@ -97,7 +98,14 @@ Two files, single-writer each:
   {svc, reason, trashName}, `trash.delete` {trashName, bytes, files, durationSec,
   and svc/reason/fromRun from its move}, `service.archive-pruned` {path, bytes,
   files}, `service.archive-prunefail` {path, error}; a stale lock removed is
-  `staleLockPid` on `run.begin`. The report mail is `notify.send` {status, error,
+  `staleLockPid` on `run.begin`. When the archived copy is deleted follows
+  `emptyTrash` (config root, per-service override): `service-end` and `run-end`
+  delete it in the same run (a `trash.delete` whose `runId` equals its `fromRun`),
+  `next-run` at the next run's start sweep, `manual` never: `trash.hold` {svc,
+  trashName, reason, bytes, files} at the service's end, and the sweep skips the
+  item, counted in `run.end` as `trashHeld` {items, bytes}. Only the
+  `local-copy-dropped` item of a successful archive is deleted early; a copy whose
+  archive failed is moved as `archive-failed` and waits for the sweep. The report mail is `notify.send` {status, error,
   to = recipient count}, after `run.end`. Events that close an action carry
   `status` and, when it failed, `error` (see [run-output.md](run-output.md)).
   Fields and types are only ever added; the log is never rewritten.

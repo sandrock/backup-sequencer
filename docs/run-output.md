@@ -126,6 +126,10 @@ in place; after a failed delete it sits in `trash/` and takes space until the ne
 run. No step name is reserved: a recipe may call a step `delete`, and its lines
 stay distinct. Routine moves (the local copy dropped once archived) are not
 printed; every move and delete is an event (`trash.move`, `trash.delete`).
+A deletion that `emptyTrash: manual` leaves to the admin is a `[delete]` line with
+event `skip` and the word `held` in the detail (event `trash.hold`): the line
+shows where a deletion would have happened, which is how trust in the automatic
+modes is built before switching to one.
 
 ### Recipe messages are tagged, tool output is not
 

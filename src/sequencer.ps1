@@ -257,7 +257,9 @@ switch ($Command) {
                 "{0,-12} {1,-20} run {2}  moved {3}" -f $i.Service, $i.Reason, $i.FromRun.Substring([math]::Max(0, $i.FromRun.Length - 4)), (Format-EventTime $i.MovedAt)
             }
             else { 'no record' }
-            Write-Host ("  {0,-28} {1,9} {2,7} files  {3}" -f $i.Name, (Format-Size $i.Bytes), $i.Files, $origin)
+            # when a run deletes it: never for an emptyTrash manual service
+            $when = if ((Get-EmptyTrashMode -Config $Config -Service ([string]$i.Service)) -eq 'manual') { 'manual' } else { 'next run' }
+            Write-Host ("  {0,-28} {1,9} {2,7} files  {3,-8}  {4}" -f $i.Name, (Format-Size $i.Bytes), $i.Files, $when, $origin)
         }
         # the last deletions, by runs or by hand
         $dels = @($events | Where-Object { $_.type -eq 'trash.delete' } | Select-Object -Last 5)

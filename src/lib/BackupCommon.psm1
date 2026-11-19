@@ -179,7 +179,8 @@ function Get-BackupEvents {
 
 function Test-HasProp {
     param($Object, [string]$Name)
-    return ($null -ne $Object) -and ($Object.PSObject.Properties.Name -contains $Name)
+    # indexer, not .Properties.Name: StrictMode throws on .Name of an empty property list
+    return ($null -ne $Object) -and ($null -ne $Object.PSObject.Properties[$Name])
 }
 
 function Get-ServiceProjection {
@@ -545,6 +546,11 @@ function Get-ServiceValidationProblems {
         }
     }
 
+    $mode = Get-EmptyTrashMode -Config $Config -Service $Service
+    if ($script:EmptyTrashModes -notcontains $mode) {
+        $problems += "emptyTrash: unknown value '$mode' (use $($script:EmptyTrashModes -join ', '))"
+    }
+
     return @($problems)
 }
 
@@ -650,7 +656,23 @@ $script:TrashReasons = @{
     'failed-dump'         = 'partial dump of a failed backup'
     'replaced-unarchived' = 'previous backup in ready/, never archived'
     'local-copy-dropped'  = 'local copy, archived'
+    'archive-failed'      = 'backup whose archive failed (only copy)'
     'error-cleanup'       = 'work dir after an error'
+}
+
+# when the archived local copy is deleted (config `emptyTrash`, root and per service)
+$script:EmptyTrashModes = @('service-end', 'run-end', 'next-run', 'manual')
+
+function Get-EmptyTrashMode {
+    # <service>.emptyTrash, else <config>.emptyTrash, else next-run. A service no
+    # longer in the config (or none given) gets the global value.
+    param([Parameter(Mandatory)]$Config, [string]$Service = '')
+    $svc = $null
+    if ($Service -and (Test-HasProp $Config 'services') -and (Test-HasProp $Config.services $Service)) { $svc = $Config.services.$Service }
+    $v = Get-PropOrNull $svc 'emptyTrash'
+    if (-not $v) { $v = Get-PropOrNull $Config 'emptyTrash' }
+    if (-not $v) { return 'next-run' }
+    return [string]$v
 }
 
 function Move-ToTrash {
@@ -663,7 +685,8 @@ function Move-ToTrash {
         [string]$EventsPath = '',
         [string]$RunId = '',
         [string]$Service = 'run',
-        [string]$Reason = ''
+        [string]$Reason = '',
+        [switch]$PassThru   # return the item's name in trash/
     )
     if (-not (Test-Path -LiteralPath $Path)) { return }
     $name = (Split-Path -Leaf $Path) + '-' + ([guid]::NewGuid().ToString('n').Substring(0, 12))
@@ -690,6 +713,7 @@ function Move-ToTrash {
             Write-RunLine -RunId $RunId -Service $Service -Step '[trash]' -Event 'done' -Status 'ok' -Detail "$label -> trash/$name"
         }
     }
+    if ($PassThru) { return $name }
 }
 
 function Move-Phase {
@@ -740,15 +764,19 @@ function Clear-Trash {
     # path. Each item is measured, deleted, and logged (trash.delete + a [delete]
     # line), tied back to the trash.move that put it there. A failed delete leaves
     # the item for the next run. -By 'command' marks a deletion asked by hand (no run).
-    # Returns @{ Bytes; Items; Kept } for the run's end line.
+    # Items of -HoldServices (emptyTrash manual), and items with no record when
+    # -HoldUnrecorded, are left alone and counted as held.
+    # Returns @{ Bytes; Items; Kept; Held; HeldBytes } for the run's end line.
     param(
         [Parameter(Mandatory)][string]$TrashRoot,
         [string]$EventsPath = '',
         [string]$RunId = '',
         [string[]]$Names = @(),
-        [string]$By = ''
+        [string]$By = '',
+        [string[]]$HoldServices = @(),
+        [switch]$HoldUnrecorded
     )
-    $sum = @{ Bytes = [long]0; Items = 0; Kept = 0 }
+    $sum = @{ Bytes = [long]0; Items = 0; Kept = 0; Held = 0; HeldBytes = [long]0 }
     if (-not (Test-Path -LiteralPath $TrashRoot)) { return $sum }
     $items = @(Get-ChildItem -LiteralPath $TrashRoot -Force -ErrorAction SilentlyContinue | Sort-Object Name)
     if ($Names.Count) { $items = @($items | Where-Object { $Names -contains $_.Name }) }
@@ -757,6 +785,8 @@ function Clear-Trash {
     $ProgressPreference = 'SilentlyContinue'   # Remove-Item's progress bar has no place in logs
     foreach ($item in $items) {
         $size = [DiskUsage]::Measure($item.FullName)
+        $hold = if ($moves.ContainsKey($item.Name)) { $HoldServices -contains [string]$moves[$item.Name].svc } else { [bool]$HoldUnrecorded }
+        if ($hold) { $sum.Held++; $sum.HeldBytes += $size.Bytes; continue }
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $err = $null
         try { Remove-Item -LiteralPath $item.FullName -Recurse -Force -ErrorAction Stop }
@@ -833,8 +863,15 @@ function Invoke-BackupRun {
         if ($lockInfo.ContainsKey('StaleLockPid')) {
             Write-RunLine -RunId $runId -Event 'msg' -Status 'WARN' -Detail ("stale lock removed: pid {0} no longer running (previous run died?)" -f $lockInfo['StaleLockPid'])
         }
-        # empty trash/ (what earlier runs dropped), logged under this run, off the publish path
-        $trashSum = Clear-Trash -TrashRoot $stg.Trash -EventsPath $Paths.EventsPath -RunId $runId
+        # empty trash/ (what earlier runs dropped), logged under this run, off the publish
+        # path; items of emptyTrash manual services are held for `bseq trash -Delete`
+        $manualServices = @()
+        if (Test-HasProp $Config 'services') {
+            $manualServices = @($Config.services.PSObject.Properties.Name | Where-Object { (Get-EmptyTrashMode -Config $Config -Service $_) -eq 'manual' })
+        }
+        $trashSum = Clear-Trash -TrashRoot $stg.Trash -EventsPath $Paths.EventsPath -RunId $runId `
+            -HoldServices $manualServices -HoldUnrecorded:((Get-EmptyTrashMode -Config $Config) -eq 'manual')
+        $runEndTrash = [System.Collections.Generic.List[string]]::new()   # emptyTrash run-end: deleted before run.end
 
         $projection = Get-ServiceProjection -EventsPath $Paths.EventsPath
         $planNow = Get-Date
@@ -995,6 +1032,7 @@ function Invoke-BackupRun {
 
             # --- optional synchronous archive step, on stage/<service> ---
             $syncFailed = $false
+            $droppedName = $null   # the stage dir's name in trash/, when dropped
             $archNote = ''   # archive result, shown on the service's final line
             if (Test-HasProp $svc 'syncArchive') {
                 $sa = $svc.syncArchive
@@ -1104,7 +1142,10 @@ function Invoke-BackupRun {
                 Move-Phase -Src $stageDir -Dst $readyDir
             }
             else {
-                Move-ToTrash -Path $stageDir -TrashRoot $stg.Trash -EventsPath $Paths.EventsPath -RunId $runId -Service $serviceName -Reason 'local-copy-dropped'   # archived synchronously, or nothing to keep
+                # archived synchronously (or nothing to keep); a copy whose archive failed
+                # is the only one left: its own reason, never deleted early
+                $dropReason = if ($syncFailed) { 'archive-failed' } else { 'local-copy-dropped' }
+                $droppedName = Move-ToTrash -Path $stageDir -TrashRoot $stg.Trash -EventsPath $Paths.EventsPath -RunId $runId -Service $serviceName -Reason $dropReason -PassThru
             }
 
             # A sync-archive failure with no local copy kept means nothing was archived
@@ -1129,6 +1170,21 @@ function Invoke-BackupRun {
                 Write-RunLine -RunId $runId -Service $serviceName -Event 'end' -Status 'ok' -Seconds $svcClock.Elapsed.TotalSeconds `
                     -Detail ("{0}  {1}" -f $sizeText, ($notes -join ', '))
             }
+
+            # emptyTrash: the archived local copy (only that) may go now, at run end, or never
+            if ($droppedName -and (Test-HasProp $svc 'syncArchive') -and -not $syncFailed) {
+                switch (Get-EmptyTrashMode -Config $Config -Service $serviceName) {
+                    'service-end' { Add-TrashSum -Total $trashSum -Sum (Clear-Trash -TrashRoot $stg.Trash -EventsPath $Paths.EventsPath -RunId $runId -Names @($droppedName)) }
+                    'run-end' { $runEndTrash.Add($droppedName) }
+                    'manual' {
+                        $size = [DiskUsage]::Measure((Join-Path $stg.Trash $droppedName))
+                        Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'trash.hold' `
+                            -Props @{ runId = $runId; svc = $serviceName; trashName = $droppedName; reason = 'local-copy-dropped'; bytes = $size.Bytes; files = $size.Files }
+                        Write-RunLine -RunId $runId -Service $serviceName -Step '[delete]' -Event 'skip' `
+                            -Detail ("held (emptyTrash manual): {0}, {1} files; bseq trash -Delete {2}" -f [DiskUsage]::Text($size.Bytes), $size.Files, $droppedName)
+                    }
+                }
+            }
             }
             catch {
                 $emsg = $_.Exception.Message
@@ -1142,8 +1198,12 @@ function Invoke-BackupRun {
             }
         }
 
-        Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'run.end' `
-            -Props @{ runId = $runId; status = $(if ($failCount -gt 0) { 'fail' } else { 'ok' }); summary = @{ ok = $okCount; failed = $failCount; planned = $plan.Count } }
+        if ($runEndTrash.Count) {
+            Add-TrashSum -Total $trashSum -Sum (Clear-Trash -TrashRoot $stg.Trash -EventsPath $Paths.EventsPath -RunId $runId -Names @($runEndTrash))
+        }
+        $endProps = @{ runId = $runId; status = $(if ($failCount -gt 0) { 'fail' } else { 'ok' }); summary = @{ ok = $okCount; failed = $failCount; planned = $plan.Count } }
+        if ($trashSum.Held -gt 0) { $endProps.trashHeld = @{ items = $trashSum.Held; bytes = $trashSum.HeldBytes } }
+        Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'run.end' -Props $endProps
         Write-RunLine -RunId $runId -Event 'end' -Status $(if ($failCount -gt 0) { 'FAIL' } else { 'ok' }) -Seconds $runClock.Elapsed.TotalSeconds `
             -Detail (("{0} ok, {1} failed, {2} planned" -f $okCount, $failCount, $plan.Count) + (Format-TrashTotals $trashSum))
         return $runId
@@ -1206,6 +1266,10 @@ function Format-RunReport {
         $lines += ("  ! {0,-22} trash item {1}" -f $d.Service, $d.Detail)
     }
     if (@($detail.Deletions).Count) { $lines += ("  -- {0}" -f (Format-DeletionTotals $detail.Deletions)) }
+    if ($detail.Held) {
+        $lines += ("  -- trash held: {0} item{1}, {2} (emptyTrash manual: bseq trash)" -f $detail.Held.Items,
+            $(if ($detail.Held.Items -gt 1) { 's' } else { '' }), (Format-Size $detail.Held.Bytes))
+    }
     $end =$events | Where-Object { $_.type -eq 'run.end' } | Select-Object -First 1
     if ($end) {
         $lines += ("  -- ok={0} failed={1} planned={2}" -f $end.summary.ok, $end.summary.failed, $end.summary.planned)
@@ -1309,11 +1373,21 @@ function Format-RunLine {
 function Format-TrashTotals {
     # "  freed 47.1 GB (3 items), 1 trash item kept" for the run's end line; '' when nothing happened
     param($Sum)
-    if ($null -eq $Sum -or ($Sum.Items -eq 0 -and $Sum.Kept -eq 0)) { return '' }
+    if ($null -eq $Sum) { return '' }
+    $held = if ($Sum.ContainsKey('Held')) { $Sum.Held } else { 0 }
+    if ($Sum.Items -eq 0 -and $Sum.Kept -eq 0 -and $held -eq 0) { return '' }
     $parts = @()
     if ($Sum.Items -gt 0) { $parts += "freed {0} ({1} item{2})" -f [DiskUsage]::Text($Sum.Bytes), $Sum.Items, $(if ($Sum.Items -gt 1) { 's' } else { '' }) }
     if ($Sum.Kept -gt 0) { $parts += "{0} trash item{1} kept" -f $Sum.Kept, $(if ($Sum.Kept -gt 1) { 's' } else { '' }) }
+    if ($held -gt 0) { $parts += "{0} held in trash ({1})" -f $held, [DiskUsage]::Text($Sum.HeldBytes) }
     return '  ' + ($parts -join ', ')
+}
+
+function Add-TrashSum {
+    # fold one Clear-Trash result into a run total
+    param([Parameter(Mandatory)][hashtable]$Total, $Sum)
+    if ($null -eq $Sum) { return }
+    foreach ($k in @($Sum.Keys)) { if ($Total.ContainsKey($k)) { $Total[$k] += $Sum[$k] } else { $Total[$k] = $Sum[$k] } }
 }
 
 function Format-StartRef {
@@ -1457,6 +1531,7 @@ function Get-RunDetail {
     foreach ($name in $order) { $null = & $get $name }
     $deletions = [System.Collections.Generic.List[object]]::new()
     $notify = $null
+    $held = $null   # trash items left for `bseq trash -Delete` at this run's end (emptyTrash manual)
     $short = { param($id) $x = [string]$id; $x.Substring([math]::Max(0, $x.Length - 4)) }
 
     foreach ($e in $runEvents) {
@@ -1472,6 +1547,15 @@ function Get-RunDetail {
             $deletions.Add([pscustomobject]@{ Kind = 'delete'; Service = $(if (Test-HasProp $e 'svc') { [string]$e.svc } else { '(no record)' })
                     Ok = $ok; Bytes = [double]$e.bytes; Files = [int]$e.files
                     Detail = $(if ($ok) { $origin } else { "kept: $($e.trashName): $($e.error)" }) })
+            continue
+        }
+        if ($e.type -eq 'trash.hold') {
+            $deletions.Add([pscustomobject]@{ Kind = 'held'; Service = [string]$e.svc; Ok = $true
+                    Bytes = [double]$e.bytes; Files = [int]$e.files; Detail = "emptyTrash manual: bseq trash -Delete $($e.trashName)" })
+            continue
+        }
+        if ($e.type -eq 'run.end' -and (Test-HasProp $e 'trashHeld')) {
+            $held = [pscustomobject]@{ Items = [int]$e.trashHeld.items; Bytes = [double]$e.trashHeld.bytes }
             continue
         }
         if (-not (Test-HasProp $e 'svc')) { continue }
@@ -1519,7 +1603,7 @@ function Get-RunDetail {
             }
         }
     }
-    return [pscustomobject]@{ Run = $Run; Services = @($services.Values); Deletions = @($deletions); Notify = $notify }
+    return [pscustomobject]@{ Run = $Run; Services = @($services.Values); Deletions = @($deletions); Notify = $notify; Held = $held }
 }
 
 function Format-DeletionTotals {
@@ -1528,10 +1612,12 @@ function Format-DeletionTotals {
     $parts = @()
     $del = @($Deletions | Where-Object { $_.Kind -eq 'delete' -and $_.Ok })
     $pr = @($Deletions | Where-Object { $_.Kind -eq 'prune' -and $_.Ok })
+    $hd = @($Deletions | Where-Object { $_.Kind -eq 'held' })
     $failed = @($Deletions | Where-Object { -not $_.Ok }).Count
     $sumOf = { param($xs) $t = 0.0; foreach ($x in $xs) { $t += $x.Bytes }; $t }
     if ($del.Count) { $parts += "freed {0} in {1} item{2}" -f (Format-Size (& $sumOf $del)), $del.Count, $(if ($del.Count -gt 1) { 's' } else { '' }) }
     if ($pr.Count) { $parts += "pruned {0} archive{1} ({2})" -f $pr.Count, $(if ($pr.Count -gt 1) { 's' } else { '' }), (Format-Size (& $sumOf $pr)) }
+    if ($hd.Count) { $parts += "held {0} in {1} item{2}" -f (Format-Size (& $sumOf $hd)), $hd.Count, $(if ($hd.Count -gt 1) { 's' } else { '' }) }
     $text = $parts -join ', '
     if ($failed) { $text = ($text + "; $failed failed").TrimStart(';', ' ') }
     return $text
@@ -1619,6 +1705,10 @@ function Format-RunDetail {
             }
         }
     }
+    if ((Test-HasProp $Detail 'Held') -and $Detail.Held) {
+        $lines += ("  {0,-22} {1} item{2}, {3} (emptyTrash manual: bseq trash)" -f 'trash held', $Detail.Held.Items,
+            $(if ($Detail.Held.Items -gt 1) { 's' } else { '' }), (Format-Size $Detail.Held.Bytes))
+    }
     return $lines
 }
 
@@ -1656,5 +1746,6 @@ Export-ModuleMember -Function `
     Test-WithinWindow, Get-WindowLengthSeconds, Get-SecondsUntilClose, `
     Get-FreeSpaceBytes, Get-PathSizeBytes, Limit-StepWarnings, Invoke-BackupStep, `
     Get-SpoolPaths, Move-ToTrash, Move-Phase, Get-TrashMoves, Get-TrashItems, Clear-Trash, Reset-RunOutput, `
+    Get-EmptyTrashMode, Add-TrashSum, `
     Get-ScopedEnv, Get-ServiceValidationProblems, `
     Get-CoverageThreshold, Get-BackupPlan, Invoke-BackupRun, Format-RunReport, Send-BackupReport, Send-RunReport

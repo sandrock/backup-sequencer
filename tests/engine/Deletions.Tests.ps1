@@ -151,6 +151,125 @@ Describe 'emptying the trash' {
     }
 }
 
+Describe 'emptyTrash: when the archived local copy is deleted' {
+    BeforeAll {
+        function New-ArchCfg {
+            # two archived services; $Root and $Svc set emptyTrash globally / on 'app'
+            param([string]$Root = '', [string]$Svc = '', [string]$Fail = '')
+            $c = @'
+{ "window": { "open": "00:00", "close": "23:59" },
+  "services": {
+    "app":   { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1", "publishToReady": false,
+               "syncArchive": { "script": "fixtures/mock-service.ps1" }, "steps": [ { "name": "dump" } ] },
+    "other": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1", "publishToReady": false,
+               "syncArchive": { "script": "fixtures/mock-service.ps1" }, "steps": [ { "name": "dump" } ] } } }
+'@ | ConvertFrom-Json
+            if ($Root) { $c | Add-Member -NotePropertyName emptyTrash -NotePropertyValue $Root }
+            if ($Svc) { $c.services.app | Add-Member -NotePropertyName emptyTrash -NotePropertyValue $Svc }
+            if ($Fail) { $c.services.app.syncArchive | Add-Member -NotePropertyName env -NotePropertyValue ([pscustomobject]@{ MOCK_ARCHIVE_FAIL = '1' }) }
+            return $c
+        }
+        function Get-TrashNames { @(Get-ChildItem -LiteralPath (Join-Path $root 'trash') -ErrorAction SilentlyContinue | ForEach-Object { $_.Name }) }
+    }
+    BeforeEach {
+        $t = New-SpoolTestEnv -Prefix 'de'
+        $script:paths = $t.Paths; $script:root = $t.Root
+    }
+
+    It 'next-run (default): keeps the copy in trash until the next run' {
+        $rows = @(Get-RunLines (New-ArchCfg) $paths -Journal | ForEach-Object { Split-RunLine $_ })
+        @(Get-TrashNames).Count | Should -Be 2
+        @(Get-Ev 'trash.delete').Count | Should -Be 0
+        @($rows | Where-Object { $_.Step -eq '[delete]' }).Count | Should -Be 0
+    }
+
+    It 'service-end: deletes the copy right after the service end line' {
+        $rows = @(Get-RunLines (New-ArchCfg -Root 'service-end') $paths -Journal | ForEach-Object { Split-RunLine $_ })
+        @(Get-TrashNames).Count | Should -Be 0
+        $del = @(Get-Ev 'trash.delete')
+        $del.Count | Should -Be 2
+        $del[0].reason | Should -Be 'local-copy-dropped'
+        $del[0].runId | Should -Be $del[0].fromRun   # deleted by the run that dropped it
+        # app: end line, then its [delete] line, before other begins
+        $appRows = @($rows | Where-Object { $_.Service -eq 'app' })
+        $appRows[-2].Event | Should -Be 'end'
+        $appRows[-1].Step | Should -Be '[delete]'
+        $iDel = [array]::IndexOf($rows, $appRows[-1])
+        $iOther = [array]::IndexOf($rows, @($rows | Where-Object { $_.Service -eq 'other' -and $_.Event -eq 'begin' })[0])
+        $iDel | Should -BeLessThan $iOther
+        $rows[-1].Detail | Should -Match '  freed \d+ KB \(2 items\)$'
+    }
+
+    It 'run-end: deletes the copies before run.end' {
+        $rows = @(Get-RunLines (New-ArchCfg -Root 'run-end') $paths -Journal | ForEach-Object { Split-RunLine $_ })
+        @(Get-TrashNames).Count | Should -Be 0
+        $evs = @(Get-BackupEvents -EventsPath $paths.EventsPath)
+        $types = @($evs | ForEach-Object { $_.type })
+        $iFirstDel = [array]::IndexOf($types, 'trash.delete')
+        $iFirstDel | Should -BeGreaterThan ([array]::LastIndexOf($types, 'service.end'))
+        $iFirstDel | Should -BeLessThan ([array]::IndexOf($types, 'run.end'))
+        @($rows | Where-Object { $_.Step -eq '[delete]' }).Count | Should -Be 2
+        $rows[-1].Detail | Should -Match '  freed \d+ KB \(2 items\)$'
+    }
+
+    It 'a service value overrides the global one' {
+        Get-RunLines (New-ArchCfg -Root 'service-end' -Svc 'next-run') $paths -Journal | Out-Null
+        $left = @(Get-TrashNames)
+        $left.Count | Should -Be 1
+        $left[0] | Should -Match '^app-'
+    }
+
+    It 'never deletes early a copy whose archive failed; moves it as archive-failed, with a line' {
+        $rows = @(Get-RunLines (New-ArchCfg -Root 'service-end' -Fail '1') $paths -Journal | ForEach-Object { Split-RunLine $_ })
+        $mv = @(Get-Ev 'trash.move' | Where-Object { $_.svc -eq 'app' })[0]
+        $mv.reason | Should -Be 'archive-failed'
+        (Test-Path (Join-Path $root "trash/$($mv.trashName)")) | Should -BeTrue
+        @(Get-Ev 'trash.delete' | Where-Object { $_.svc -eq 'app' }).Count | Should -Be 0
+        @($rows | Where-Object { $_.Service -eq 'app' -and $_.Step -eq '[trash]' })[0].Detail | Should -Match '^backup whose archive failed \(only copy\) -> trash/'
+    }
+
+    It 'manual: holds the copy, logs it, and the next runs keep it' {
+        $cfg = New-ArchCfg -Svc 'manual'
+        $rows = @(Get-RunLines $cfg $paths -Journal | ForEach-Object { Split-RunLine $_ })
+        $hold = @(Get-Ev 'trash.hold')
+        $hold.Count | Should -Be 1
+        $hold[0].svc | Should -Be 'app'
+        $hold[0].bytes | Should -BeGreaterThan 0
+        $line = @($rows | Where-Object { $_.Step -eq '[delete]' })
+        $line.Count | Should -Be 1
+        $line[0].Event | Should -Be 'skip'
+        $line[0].Detail | Should -Match ('^held \(emptyTrash manual\): \d+ KB, \d+ files; bseq trash -Delete ' + $hold[0].trashName + '$')
+
+        # next run: other's copy goes, app's stays and is counted as held
+        $rows = @(Get-RunLines $cfg $paths -Journal -ForceAllJobs | ForEach-Object { Split-RunLine $_ })
+        (Test-Path (Join-Path $root "trash/$($hold[0].trashName)")) | Should -BeTrue
+        @(Get-Ev 'trash.delete' | Where-Object { $_.svc -eq 'app' }).Count | Should -Be 0
+        @(Get-Ev 'trash.delete' | Where-Object { $_.svc -eq 'other' }).Count | Should -Be 1
+        (Get-Ev 'run.end')[-1].trashHeld.items | Should -Be 1
+        $rows[-1].Detail | Should -Match '1 held in trash \(\d+ KB\)$'
+
+        $events = @(Get-BackupEvents -EventsPath $paths.EventsPath)
+        $run = (Get-RunStates -Events $events -LockPath $paths.LockPath)[-1]
+        $text = (Format-RunDetail -Detail (Get-RunDetail -Events $events -Run $run)) -join "`n"
+        $text | Should -Match '(?m)^  trash held\s+1 item, \d+ KB \(emptyTrash manual: bseq trash\)$'
+    }
+
+    It 'manual: show and the mail list the held copy' {
+        $runId = Invoke-BackupRun -Config (New-ArchCfg -Svc 'manual') -Paths $paths -ForceWindow -WarningAction SilentlyContinue
+        $events = @(Get-BackupEvents -EventsPath $paths.EventsPath)
+        $run = (Get-RunStates -Events $events -LockPath $paths.LockPath)[-1]
+        $text = (Format-RunDetail -Detail (Get-RunDetail -Events $events -Run $run)) -join "`n"
+        $text | Should -Match '(?m)^  deletions\s+held \d+ KB in 1 item$'
+        $text | Should -Match '(?m)^      held    app\s+\d+ KB\s+\d+ files  emptyTrash manual: bseq trash -Delete app-[0-9a-f]{12}$'
+        Format-RunReport -EventsPath $paths.EventsPath -RunId $runId | Should -Match '(?m)^  -- held \d+ KB in 1 item$'
+    }
+
+    It 'rejects an unknown value in validation' {
+        $p = @(Get-ServiceValidationProblems -Config (New-ArchCfg -Svc 'soon') -Service 'app' -BaseDir $paths.BaseDir -EventsPath $paths.EventsPath)
+        $p | Should -Contain "emptyTrash: unknown value 'soon' (use service-end, run-end, next-run, manual)"
+    }
+}
+
 Describe 'stale lock' {
     It 'records the dead pid on run.begin and warns' {
         $t = New-SpoolTestEnv -Prefix 'dl'

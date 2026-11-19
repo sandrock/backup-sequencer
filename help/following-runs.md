@@ -73,7 +73,10 @@ bseq asks them for plain output (no colours, no redrawn progress).
 ### Deletions
 
 Nothing is deleted silently. A backup dir that is no longer needed is first moved
-into the spool's `trash/` (instant), and deleted at the start of the next run:
+into the spool's `trash/` (instant), and deleted at the start of the next run.
+For the archived local copy, `emptyTrash` can bring that forward to the end of the
+service or of the run, or leave it to you (see
+[Configuring a service](configuring-services.md#freeing-the-spool-emptytrash)):
 
 ```
 c583  run                 -             begin                 20261118-230108-c583  window 19:00-06:00
@@ -91,8 +94,19 @@ c583  run                 -             end     ok    39m58s  5 ok, 0 failed, 5 
   A failed delete leaves the item in `trash/`; the next run tries again.
 - `[trash]`: a dir moved into `trash/`, shown only when unusual: a leftover from
   an interrupted run, the partial dump of a failed backup, a backup in `ready/`
-  replaced before the archiver took it, cleanup after an error. The routine drop
-  of the local copy once archived is recorded in the event log, not printed.
+  replaced before the archiver took it, a backup whose archive failed (the only
+  copy left), cleanup after an error. The routine drop of the local copy once
+  archived is recorded in the event log, not printed.
+- With `emptyTrash` set to `service-end` or `run-end`, the `[delete]` line of the
+  archived copy comes in the same run, right after the service's `end` line or
+  just before the run's.
+- With `emptyTrash: manual`, nothing is deleted; the archived copy gets a line
+  instead, and the run's end line counts what the trash holds for you:
+
+  ```
+  c583  mattermost          [delete]      skip                  held (emptyTrash manual): 31.2 GB, 2 files; bseq trash -Delete mattermost-5d1e0c9a2b47
+  c583  run                 -             end     ok    1h02m   4 ok, 0 failed, 4 planned  freed 1.1 GB (1 item), 2 held in trash (62.4 GB)
+  ```
 - Archive prunes (`archive-copy`, `archive-gfsy`) print what they delete, with its
   size. A prune that fails is a warning: the service stays `ok`, the old archive
   stays recorded as live, and the next run prunes it again.
@@ -108,11 +122,14 @@ bseq trash -Delete forgejo-0123456789ab # only the items named
 
 ```
 trash  /var/spool/backup-sequencer/trash   2 items, 32.9 MB
-  host-config-5468a97d02ac        30.7 MB      24 files  host-config  wip-leftover         run caa1  moved 2026-11-18T15:14:14+01:00
-  junk                               0 KB       0 files  no record
+  host-config-5468a97d02ac        30.7 MB      24 files  next run  host-config  wip-leftover         run caa1  moved 2026-11-18T15:14:14+01:00
+  junk                               0 KB       0 files  next run  no record
 last deletions:
   2026-11-18T15:14:12+01:00  run caa1      2.2 MB  vaultwarden-b4056de97dcb
 ```
+
+The column after the file count says when a run deletes the item: `next run`, or
+`manual` for a service set to `emptyTrash: manual` (only `-Delete` frees it).
 
 `-Delete` takes the run lock: it is refused while a run is in progress, and a run
 starting meanwhile is refused like a second run would be. Its deletions are
