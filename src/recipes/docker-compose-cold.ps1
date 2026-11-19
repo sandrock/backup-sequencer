@@ -25,7 +25,8 @@
   (the compose dir, automatically excluding any DCC_DATA_DIRS that live inside it,
   plus DCC_COMPOSE_EXCLUDES) and a data archive (all DCC_DATA_DIRS, each stored
   under its own leaf name). Compression, if any, happens downstream. The sequencer
-  owns everything after.
+  owns everything after. Every tar stores numeric owners only (--numeric-owner):
+  container uids/gids must come back as numbers on any host.
 
   Restart policy: 'start' only brings the service back up if it was running when
   'stop' ran (tracked in $ctx.State.WasRunning). A service already down at backup
@@ -151,7 +152,9 @@ $Recipe.AddStep('dump', {
     foreach ($e in @($ctx.EnvValue('DCC_COMPOSE_EXCLUDES', '').Split(';', [System.StringSplitOptions]::RemoveEmptyEntries))) {
         $excludes += "$composeLeaf/$($e.Trim().Trim('/'))"
     }
-    $composeArgs = @('-C', $composeParent)
+    # numeric owners only: a container's uids/gids must not be remapped by name on
+    # another host (the names there may match other ids)
+    $composeArgs = @('--numeric-owner', '-C', $composeParent)
     foreach ($e in $excludes) { $composeArgs += "--exclude=$e" }
     # hot-dir excludes are anchored (exact member path), unlike the ones above;
     # GNU tar applies --anchored to the --exclude options that follow it
@@ -169,7 +172,7 @@ $Recipe.AddStep('dump', {
     # --- data archive: all data dirs in one tar, each under its leaf (multi-volume via repeated -C) ---
     $dataName = $ctx.EnvValue('DCC_DATA_ARCHIVE_NAME', $ctx.EnvValue('DCC_ARCHIVE_NAME', "$($ctx.Service)_data.tar"))
     $dataOut = Join-Path $ctx.OutDir $dataName
-    $dataArgs = @()
+    $dataArgs = @('--numeric-owner')
     $hotData = @($hotPlan | Where-Object { $_.ExcludeFrom -eq 'data' })
     if ($hotData.Count -gt 0) {
         $dataArgs += '--anchored'
@@ -193,7 +196,7 @@ $Recipe.AddStep('hot-dump', {
     New-Item -ItemType Directory -Force -Path $ctx.OutDir | Out-Null
 
     $hotName = $ctx.EnvValue('DCC_HOT_ARCHIVE_NAME', "$($ctx.Service)_hot.tar")
-    $hotArgs = @('-cf', (Join-Path $ctx.OutDir $hotName))
+    $hotArgs = @('--numeric-owner', '-cf', (Join-Path $ctx.OutDir $hotName))
     foreach ($hp in $plan) { $hotArgs += @('-C', $hp.Root, $hp.Member) }
     & tar @hotArgs
     if ($LASTEXITCODE -eq 1) {

@@ -103,6 +103,11 @@ Describe 'docker-compose-cold recipe' {
         $hl | Should -Match '(?m)^data/system/artifacts/a.bin$'
         $hl | Should -Match '(?m)^app/hotcfg/x.cfg$'
         $hl | Should -Match '(?m)^standalone/s.bin$'
+
+        # every tar stores numeric owners only (no names to remap on another host)
+        foreach ($f in 'app_compose.tar', 'app_data.tar', 'app_hot.tar') {
+            foreach ($line in @(& tar -tvf (Join-Path $set $f))) { $line | Should -Match '^\S+ \d+/\d+ ' }
+        }
     }
 
     It 'docker-compose-cold keeps hot dirs in the cold tar when no hot-dump step is configured' {

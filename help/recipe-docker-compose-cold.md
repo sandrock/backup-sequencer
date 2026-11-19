@@ -133,11 +133,20 @@ Restoring
 There is no restore command yet — restore by extracting each artifact back to
 where it came from, then starting the stack.
 
+Extract as root with `--numeric-owner -p`, always. Files written by a container
+belong to the container's own users (uid 998, gid 996, ...). On the host those
+numbers may happen to carry a host user's or group's name (`systemd-coredump`,
+`docker`), and by default tar restores owners by *name*: on another machine the same
+name usually has another number, the files get the wrong owner, and the service
+fails to start (a database refusing its data dir, for example). The recipe's tars
+store numbers only, so a plain `tar -x` is already right; tars made by older
+versions also carry names, and only `--numeric-owner` restores them correctly.
+
 The compose tar holds the compose dir by its leaf name, so extract it into the
 compose dir's parent:
 
 ```sh
-tar -C /srv -xf vaultwarden_compose.tar          # recreates /srv/vaultwarden/…
+tar --numeric-owner -xpf vaultwarden_compose.tar -C /srv          # recreates /srv/vaultwarden/…
 ```
 
 The data tar holds each data dir by its leaf name. If they shared a parent,
@@ -145,7 +154,7 @@ extract there; if they came from different volumes, extract to a scratch dir and
 move each leaf back to its parent:
 
 ```sh
-tar -C /tmp/restore -xf vaultwarden_data.tar
+tar --numeric-owner -xpf vaultwarden_data.tar -C /tmp/restore
 mv /tmp/restore/data           /srv/vaultwarden/data
 mv /tmp/restore/vaultwarden-ssl /mnt/vol2/vaultwarden-ssl
 ```
@@ -154,8 +163,8 @@ A hot tar, if any, uses the same layout as the tar its dirs were left out of —
 extract it into the same place, after that tar:
 
 ```sh
-tar -C /mnt/vol2/ci -xf ci_data.tar
-tar -C /mnt/vol2/ci -xf ci_hot.tar               # fills in data/system/artifacts/…
+tar --numeric-owner -xpf ci_data.tar -C /mnt/vol2/ci
+tar --numeric-owner -xpf ci_hot.tar -C /mnt/vol2/ci    # fills in data/system/artifacts/…
 ```
 
 Then bring it back up:
