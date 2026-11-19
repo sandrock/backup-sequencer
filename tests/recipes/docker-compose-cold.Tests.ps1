@@ -133,4 +133,57 @@ Describe 'docker-compose-cold recipe' {
         & $rc.Steps['dump'] $rc
         ((& tar -tf (Join-Path $rc.OutDir 'app_data.tar')) -join "`n") | Should -Match 'data/artifacts/a.bin'
     }
+
+    It 'docker-compose-cold leaves DCC_DATA_EXCLUDES out of the data tar, by exact path' {
+        $base = Join-Path $Work "xsvc-$n"
+        $composeDir = Join-Path $base 'app'
+        $data = Join-Path $base 'vol/data'
+        $conf = Join-Path $base 'vol/conf'
+        foreach ($d in $composeDir, (Join-Path $data 'backups'), (Join-Path $data 'shared/registry'), (Join-Path $data 'git'), (Join-Path $data 'git/backups'), $conf) {
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+        }
+        Set-Content -LiteralPath (Join-Path $composeDir 'docker-compose.yml') -Value 'services: {}'
+        Set-Content -LiteralPath (Join-Path $data 'backups/old.tar') -Value 'OLD'
+        Set-Content -LiteralPath (Join-Path $data 'shared/registry/blob') -Value 'BLOB'
+        Set-Content -LiteralPath (Join-Path $data 'git/repo.git') -Value 'REPO'
+        Set-Content -LiteralPath (Join-Path $data 'git/backups/keep.bin') -Value 'SAME NAME, ELSEWHERE'
+        Set-Content -LiteralPath (Join-Path $conf 'secrets.json') -Value '{}'
+        $u = { param($p) $p -replace '\\', '/' }
+
+        $rc = & (Get-Module BackupCommon) { [RecipeContext]::new() }
+        $rc.Service = 'app'
+        $rc.OutDir = Join-Path $base 'out'
+        $rc.Env = [pscustomobject]@{ DCC_COMPOSE_DIR = (& $u $composeDir); DCC_COMPOSE_CMD = 'tar'
+            DCC_DATA_DIRS = "$(& $u $data);$(& $u $conf)"
+            DCC_DATA_EXCLUDES = "$(& $u (Join-Path $data 'backups')); $(& $u (Join-Path $data 'shared/registry'))/;$(& $u (Join-Path $data 'missing'))" }
+        $rc.ConfiguredSteps = @('dump')
+        & (Join-Path $TestsDir '../src/recipes/docker-compose-cold.ps1') -Recipe $rc | Out-Null
+        @(& $rc.ValidateBlock $rc) | Should -BeNullOrEmpty   # an absent excluded path is fine
+        & $rc.Steps['dump'] $rc
+
+        $dl = (& tar -tf (Join-Path $rc.OutDir 'app_data.tar')) -join "`n"
+        $dl | Should -Not -Match '(?m)^data/backups'
+        $dl | Should -Not -Match '(?m)^data/shared/registry'
+        $dl | Should -Match '(?m)^data/shared/$'
+        $dl | Should -Match '(?m)^data/git/repo.git$'
+        $dl | Should -Match '(?m)^data/git/backups/keep.bin$'   # exact path: the same name elsewhere stays
+        $dl | Should -Match '(?m)^conf/secrets.json$'
+    }
+
+    It 'docker-compose-cold validate refuses a data exclude outside the data dirs, or a whole data dir' {
+        $base = Join-Path $Work "xsvc2-$n"
+        $composeDir = Join-Path $base 'app'
+        $data = Join-Path $base 'data'
+        foreach ($d in $composeDir, $data) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+        $u = { param($p) $p -replace '\\', '/' }
+        $rc = & (Get-Module BackupCommon) { [RecipeContext]::new() }
+        $rc.Service = 'app'
+        $rc.Env = [pscustomobject]@{ DCC_COMPOSE_DIR = (& $u $composeDir); DCC_COMPOSE_CMD = 'tar'; DCC_DATA_DIRS = (& $u $data)
+            DCC_DATA_EXCLUDES = "/elsewhere/logs;$(& $u $data)" }
+        $rc.ConfiguredSteps = @('dump')
+        & (Join-Path $TestsDir '../src/recipes/docker-compose-cold.ps1') -Recipe $rc | Out-Null
+        $p = @(& $rc.ValidateBlock $rc)
+        $p | Should -Contain 'data exclude not inside any data dir: /elsewhere/logs'
+        $p | Should -Contain "data exclude is a whole data dir (remove it from DCC_DATA_DIRS instead): $(& $u $data)"
+    }
 }

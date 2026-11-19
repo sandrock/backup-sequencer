@@ -21,6 +21,8 @@
     DCC_HOT_DIRS             dir(s) copied by the 'hot-dump' step while the service
                              runs; ';'-separated. Left out of the cold tars.  (optional)
     DCC_HOT_ARCHIVE_NAME     hot tar name       (default: '<service>_hot.tar')
+    DCC_DATA_EXCLUDES        absolute paths inside a data dir to leave out of the
+                             data tar (exact paths, not patterns); ';'-separated  (optional)
   The dump step writes two uncompressed tars into $ctx.OutDir: a compose archive
   (the compose dir, automatically excluding any DCC_DATA_DIRS that live inside it,
   plus DCC_COMPOSE_EXCLUDES) and a data archive (all DCC_DATA_DIRS, each stored
@@ -87,6 +89,34 @@ $Recipe.State['DccHotPlan'] = {
         $plan += $entry
     }
     return $plan   # unrolled; callers wrap in @()
+}
+
+# DCC_DATA_EXCLUDES: absolute paths inside a data dir, left out of the data tar. Each
+# maps to its exact member in the tar ('<data leaf>/<rel>'); an entry outside every
+# data dir, or naming a data dir itself, carries a Problem instead (for validate).
+$Recipe.State['DccDataExcludes'] = {
+    param($ctx)
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    $split = { param($s) @($s.Split(';', [System.StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
+    $full = { param($p) [System.IO.Path]::GetFullPath($p).TrimEnd($sep) }
+    $dataDirs = & $split $ctx.EnvValue('DCC_DATA_DIRS', $ctx.EnvValue('DCC_DATA_DIR', ''))
+    $list = @()
+    foreach ($x in (& $split $ctx.EnvValue('DCC_DATA_EXCLUDES', ''))) {
+        $xFull = & $full $x
+        $entry = @{ Path = $xFull; Member = $null; Problem = "data exclude not inside any data dir: $x" }
+        foreach ($d in $dataDirs) {
+            $dFull = & $full $d
+            if ($xFull -eq $dFull) { $entry.Problem = "data exclude is a whole data dir (remove it from DCC_DATA_DIRS instead): $x"; break }
+            if ($xFull.StartsWith($dFull + $sep, [System.StringComparison]::Ordinal)) {
+                $rel = $xFull.Substring($dFull.Length).TrimStart($sep) -replace '\\', '/'
+                $entry.Member = "$(Split-Path -Leaf $dFull)/$rel"
+                $entry.Problem = $null
+                break
+            }
+        }
+        $list += $entry
+    }
+    return $list   # unrolled; callers wrap in @()
 }
 
 $Recipe.AddStep('stop', {
@@ -173,10 +203,15 @@ $Recipe.AddStep('dump', {
     $dataName = $ctx.EnvValue('DCC_DATA_ARCHIVE_NAME', $ctx.EnvValue('DCC_ARCHIVE_NAME', "$($ctx.Service)_data.tar"))
     $dataOut = Join-Path $ctx.OutDir $dataName
     $dataArgs = @('--numeric-owner')
-    $hotData = @($hotPlan | Where-Object { $_.ExcludeFrom -eq 'data' })
-    if ($hotData.Count -gt 0) {
+    # anchored excludes (exact members): hot dirs inside a data dir + DCC_DATA_EXCLUDES
+    $dataExcl = @(@($hotPlan | Where-Object { $_.ExcludeFrom -eq 'data' }) | ForEach-Object { $_.Member })
+    foreach ($x in @(& $ctx.State['DccDataExcludes'] $ctx)) {
+        if ($x.Problem) { throw $x.Problem }
+        $dataExcl += $x.Member
+    }
+    if ($dataExcl.Count -gt 0) {
         $dataArgs += '--anchored'
-        foreach ($hp in $hotData) { $dataArgs += "--exclude=$($hp.Member)" }
+        foreach ($m in $dataExcl) { $dataArgs += "--exclude=$m" }
     }
     $dataArgs += @('-cf', $dataOut)
     foreach ($d in $dataDirs) { $dataArgs += @('-C', (Split-Path -Parent $d), (Split-Path -Leaf $d)) }
@@ -249,6 +284,8 @@ $Recipe.SetValidate({
     foreach ($hp in $hotPlan) {
         if (-not (Test-Path -LiteralPath $hp.Path -PathType Container)) { $problems += "hot dir missing: $($hp.Path)" }
     }
+    # a data exclude may be absent on disk (nothing to leave out), but must sit inside a data dir
+    $problems += @(@(& $ctx.State['DccDataExcludes'] $ctx) | Where-Object { $_.Problem } | ForEach-Object { $_.Problem })
     return $problems
 })
 

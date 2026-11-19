@@ -53,6 +53,7 @@ Set these in the service's `env`:
 | `DCC_COMPOSE_CMD` | no | `docker compose` | the compose command |
 | `DCC_COMPOSE_ARCHIVE_NAME` | no | `<service>_compose.tar` | compose tar file name |
 | `DCC_DATA_DIRS` | yes | — | data dir(s) to archive; `;`-separated, may span volumes |
+| `DCC_DATA_EXCLUDES` | no | — | absolute paths inside a data dir to leave out of the data tar; `;`-separated (see below) |
 | `DCC_DATA_ARCHIVE_NAME` | no | `<service>_data.tar` | data tar file name |
 | `DCC_HOT_DIRS` | no | — | dir(s) archived live by the `hot-dump` step instead of the cold tars; `;`-separated (see below) |
 | `DCC_HOT_ARCHIVE_NAME` | no | `<service>_hot.tar` | hot tar file name |
@@ -83,6 +84,23 @@ Example:
 Decide deliberately where TLS certs and similar go: list a dir in `DCC_DATA_DIRS`
 and it rides in the data tar; leave it under the compose dir (and out of
 `DCC_DATA_DIRS`) and it rides in the compose tar.
+
+To keep part of a data dir out of the backup (monitoring history, the
+application's own backup output, a big dir backed up by another service), list it
+in `DCC_DATA_EXCLUDES`:
+
+```json
+"DCC_DATA_DIRS": "/srv/forgejo/config;/mnt/vol2/forgejo/data",
+"DCC_DATA_EXCLUDES": "/mnt/vol2/forgejo/data/backups;/mnt/vol2/forgejo/data/prometheus"
+```
+
+- Exact absolute paths, not patterns: only that dir (and everything under it) is
+  left out; a dir with the same name elsewhere in the tree stays in.
+- Each must sit inside one of `DCC_DATA_DIRS`; `validate` refuses one that does not,
+  or one that is a whole data dir (drop it from `DCC_DATA_DIRS` instead).
+- A path that does not exist (yet) is fine: there is just nothing to leave out.
+- An excluded dir is not restored. Make sure the service recreates it on its own,
+  or that it is backed up elsewhere.
 
 
 Hot dirs (shorter downtime)
