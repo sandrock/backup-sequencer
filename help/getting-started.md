@@ -127,6 +127,10 @@ what fits and defers the rest to a later run — see
 
 Without installing (from a checkout), use `pwsh src/sequencer.ps1 <command>` instead.
 
+A run from a terminal is killed by Ctrl-C or a lost connection, leaving a stopped
+service down: run it inside tmux or screen ([Running by hand](manual-runs.md)), or
+start it through systemd ([Running under systemd](systemd.md)).
+
 To follow a run while it works, or to dig into a past one, see
 [Following runs](following-runs.md).
 
@@ -142,7 +146,8 @@ scheduler fires it, it does not sleep until the window.
   [`packages/systemd/`](../packages/systemd/README.md) — copy them to
   `/etc/systemd/system/`, adjust paths and schedule, then
   `systemctl enable --now backup-sequencer.timer`. The single-instance lock makes
-  a double-trigger a no-op.
+  a double-trigger a no-op. Day-to-day control (start a run, follow it, the
+  journal, pausing the timer): [Running under systemd](systemd.md).
 - Windows (Task Scheduler): a daily trigger at the window open running
   `pwsh.exe <install>\src\sequencer.ps1 run`.
 

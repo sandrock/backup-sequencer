@@ -122,6 +122,10 @@ User guides (`help/`):
 - [Getting started](help/getting-started.md) — install, configure, run, notify.
 - [Following runs](help/following-runs.md) — `status`, `show`, `history`: what is
   running, what a run did, and what to do after an interrupted run.
+- [Running under systemd](help/systemd.md) — start a run, follow it in the
+  journal, pause or move the timer, and why not to stop a run.
+- [Running by hand](help/manual-runs.md) — `bseq run` from a terminal, safely
+  inside tmux or screen.
 - [Configuring a service](help/configuring-services.md) — wiring a service to a
   recipe: `script`, `env`, `steps`, archiving, scheduling.
 - [docker-compose-cold recipe](help/recipe-docker-compose-cold.md) — the bundled

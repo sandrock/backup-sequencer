@@ -16,6 +16,7 @@ Install
 
 ```sh
 sudo cp backup-sequencer.service /etc/systemd/system/
+sudo cp backup-sequencer-now.service /etc/systemd/system/
 sudo cp backup-sequencer.timer   /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now backup-sequencer.timer
@@ -25,13 +26,13 @@ Check the schedule and run a one-off now to validate the setup:
 
 ```sh
 systemctl list-timers backup-sequencer.timer      # next firing time
-sudo systemctl start backup-sequencer.service     # run once, now (respects the window)
+sudo systemctl start --no-block backup-sequencer.service   # run once, now (respects the window)
 journalctl -u backup-sequencer.service -e         # output of the last run
 ```
 
-To run a backup now ignoring the window, invoke the sequencer directly with
-`-ForceWindow` (add `-ForceAllJobs` to also bypass the fit check) rather than the
-unit — see the [getting started guide](../../help/getting-started.md).
+To run a backup now ignoring the window:
+`sudo systemctl start --no-block backup-sequencer-now.service` (`-ForceWindow`).
+Day-to-day use: [Running under systemd](../../help/systemd.md).
 
 
 Quiet logging

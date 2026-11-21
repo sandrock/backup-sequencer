@@ -152,16 +152,13 @@ cp "$SRC/config.sample.json" "$CONFIG_DIR/config.sample.json"
 # --- systemd units: on by default, path-adjusted, never clobbering, never enabled ---
 if [ "$INSTALL_SYSTEMD" = 1 ]; then
     ensure_dir "$SYSTEMD_DIR"
-    if [ -f "$SYSTEMD_DIR/backup-sequencer.service" ]; then
-        echo "kept existing $SYSTEMD_DIR/backup-sequencer.service"
-    else
-        sed "s#/opt/backup-sequencer#${CODE_DIR}#g" "$SRC/packages/systemd/backup-sequencer.service" > "$SYSTEMD_DIR/backup-sequencer.service"
-    fi
-    if [ -f "$SYSTEMD_DIR/backup-sequencer.timer" ]; then
-        echo "kept existing $SYSTEMD_DIR/backup-sequencer.timer"
-    else
-        cp "$SRC/packages/systemd/backup-sequencer.timer" "$SYSTEMD_DIR/backup-sequencer.timer"
-    fi
+    for unit in backup-sequencer.service backup-sequencer-now.service backup-sequencer.timer; do
+        if [ -f "$SYSTEMD_DIR/$unit" ]; then
+            echo "kept existing $SYSTEMD_DIR/$unit"
+        else
+            sed "s#/opt/backup-sequencer#${CODE_DIR}#g" "$SRC/packages/systemd/$unit" > "$SYSTEMD_DIR/$unit"
+        fi
+    done
     echo "systemd units in $SYSTEMD_DIR (disabled). Enable the nightly run with:"
     echo "  sudo systemctl daemon-reload"
     echo "  sudo systemctl enable --now backup-sequencer.timer"
