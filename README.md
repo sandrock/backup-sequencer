@@ -128,6 +128,8 @@ User guides (`help/`):
   cold-backup recipe and its `DCC_*` parameters.
 - [host-config-linux recipe](help/recipe-host-config-linux.md) — the host's own
   configuration (`/etc`, crontabs, `/root`) plus rebuild facts; secrets left out.
+- [dir-tar recipe](help/recipe-dir-tar.md) — a live tar of directories, in the
+  order listed (e.g. a container registry).
 - [Archiving](help/archiving.md) — synchronous vs asynchronous archiving,
   `publishToReady`, and the env scope chain. Per-archiver:
   [archive-copy](help/archiving-copy.md) · [archive-gfsy](help/archiving-gfsy.md) ·
