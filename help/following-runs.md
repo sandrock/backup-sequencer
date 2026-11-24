@@ -240,7 +240,7 @@ Outcome:
 | `INVALID` | refused by the preflight check before any step ran — no downtime; the problems are listed below |
 | `skipped (covered)` | already backed up recently enough; nothing to do |
 | `skipped (deferred)` | would not fit in what was left of the window; runs in a later window |
-| `skipped (insufficient-space)` | not enough free space in the spool for the expected size |
+| `skipped (insufficient-space)` | not enough free space in the spool for the expected size; the warning shows the sum (`need 970.0 GB = 800.0 GB x 1.2 + 10.0 GB, free …`, see [the free-space check](configuring-services.md#spool-free-space-check)) |
 | `> step (time)` | running now |
 | `! died in step` | the run was interrupted during that step (see above) |
 | `> between steps` / `! died between steps` | the service has begun but no step is running: the engine is between two steps or archiving / publishing; or the run died there |

@@ -55,6 +55,7 @@ Fields
 | `syncArchive` | The archiver to run in-window (below). |
 | `targetIntervalHours` | Desired backup interval for scheduling (below). |
 | `emptyTrash` | When the archived local copy is deleted from the spool (below). |
+| `spool` | Free-space headroom for this service: `headroomRatio`, `headroomGiB` (below). |
 
 
 Steps
@@ -138,6 +139,37 @@ failed) waits for the next run, so it can still be looked at. `manual` prints wh
 it holds instead of deleting it; see [Following runs](following-runs.md#deletions).
 Large services want `service-end`: a 300 GB copy otherwise stays on the spool
 disk until the next run.
+
+### Spool free-space check
+
+Before a service runs, the sequencer checks the spool's free space against the
+size of the service's last backup:
+
+    need = last backup size x headroomRatio + headroomGiB
+
+If less is free, the service is skipped (`skipped (insufficient-space)`, a warning
+in the report) and stays due for the next run. A service with no backup yet is not
+checked. Defaults: `headroomRatio` 1.2, `headroomGiB` 10. Set them in the
+top-level `spool` (all services) or in a service's `spool` (overrides, key by key):
+
+```json
+{
+  "spool": { "path": "/srv/backup-spool", "headroomRatio": 1.2, "headroomGiB": 10 },
+  "services": {
+    "paperless": { "spool": { "headroomRatio": 1.05 }, ... }
+  }
+}
+```
+
+| Key | Allowed | Meaning |
+|---|---|---|
+| `headroomRatio` | a number above 0 | growth allowed over the last size (1.2 = 20 %); under 1 for a service known to shrink |
+| `headroomGiB` | a number, 0 or more | fixed room on top, in GiB (1024^3 bytes; the sizes the sequencer prints are in the same unit) |
+
+The margin protects small services, the ratio large ones. For a service of
+several hundred GB, lower the ratio rather than freeing space: a 800 GB backup
+needs 970 GB at the defaults, 850 GB at 1.05. A service's `spool` takes no
+`path` (one spool per sequencer); `bseq validate` reports it.
 
 
 Scheduling

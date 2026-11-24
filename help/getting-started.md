@@ -76,13 +76,20 @@ dirs; a backup moves through them by atomic rename:
 
 The spool root is resolved as:
 
-1. `spool` in `config.json`, if set; otherwise
+1. `spool.path` in `config.json`, if set; otherwise
 2. `/var/spool/backup-sequencer` (Linux) or `%ProgramData%\backup-sequencer\spool`
    (Windows) — override with `BACKUP_SEQUENCER_SPOOL_DIR`.
 
-Set `spool` explicitly to a path with room for a service's largest backup —
+```json
+"spool": { "path": "/srv/backup-spool" }
+```
+
+Set `spool.path` explicitly to a path with room for a service's largest backup —
 especially if the state dir is on a small system disk. Put it on the volume that
-has the space. The async archiver takes completed backups from `ready/<service>/`
+has the space. Before each service, the sequencer checks the spool has room for
+it (see [the free-space check](configuring-services.md#spool-free-space-check)).
+`spool` is an object: the older plain-string form (`"spool": "/path"`) is refused,
+every command stops with the line to write instead. The async archiver takes completed backups from `ready/<service>/`
 and deletes them; see [the spool and archiving model](../docs/archiving.md).
 
 

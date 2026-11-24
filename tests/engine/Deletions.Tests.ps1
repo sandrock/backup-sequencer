@@ -5,6 +5,9 @@
 BeforeAll {
     . (Join-Path $PSScriptRoot '../TestHelpers.ps1')
 
+    # repeated runs: keep the spool free-space check (10 GiB margin) off the host's disk
+    Mock -ModuleName BackupCommon Get-FreeSpaceBytes { [long]::MaxValue }
+
     # one service, a copy kept in ready/ (no archiver)
     $script:readyCfg = @'
 { "window": { "open": "00:00", "close": "23:59" },

@@ -148,7 +148,8 @@ Run lifecycle
    compute the plan; emit `run.plan`.
 3. For each planned service, while inside the window (unless `-ForceWindow`) and it
    fits the time left (unless mandatory or `-ForceAllJobs`; see [scheduling.md](scheduling.md)):
-   - emit `service.begin`; pre-flight free-space check against the last recorded size;
+   - emit `service.begin`; pre-flight free-space check: last recorded size x
+     `headroomRatio` + `headroomGiB` (config `spool`, top level and per service);
    - build the service's env (the scope chain), load the recipe (registering its
      steps), then run each listed step via `Invoke-BackupStep` (timing, retries,
      events), producing the artifact set into `wip/<service>/`;

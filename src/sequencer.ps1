@@ -123,10 +123,14 @@ $Config = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
 $ConfigDir = Split-Path -Parent (Resolve-Path -LiteralPath $ConfigPath).Path
 
 $VarDir = Get-VarDir
-$SpoolRoot = Get-SpoolDefault
-if ((Test-HasProp $Config 'spool') -and $Config.spool) {
-    $SpoolRoot = $Config.spool
+# a bad top-level spool stops every command: guessing the path could fill the wrong disk
+$spoolProblems = @(Get-SpoolConfigProblems -Config $Config)
+if ($spoolProblems.Count) {
+    Write-Host "Config problem in ${ConfigPath}:"
+    foreach ($p in $spoolProblems) { Write-Host "  - $p" }
+    exit 2
 }
+$SpoolRoot = Get-SpoolRoot -Config $Config -Default (Get-SpoolDefault)
 $Paths = @{
     BaseDir    = $BaseDir
     EventsPath = Join-Path $VarDir 'events.jsonl'

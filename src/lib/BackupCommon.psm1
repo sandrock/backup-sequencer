@@ -550,6 +550,7 @@ function Get-ServiceValidationProblems {
     if ($script:EmptyTrashModes -notcontains $mode) {
         $problems += "emptyTrash: unknown value '$mode' (use $($script:EmptyTrashModes -join ', '))"
     }
+    $problems += @(Get-SpoolConfigProblems -Config $Config -Service $Service)
 
     return @($problems)
 }
@@ -673,6 +674,89 @@ function Get-EmptyTrashMode {
     if (-not $v) { $v = Get-PropOrNull $Config 'emptyTrash' }
     if (-not $v) { return 'next-run' }
     return [string]$v
+}
+
+# spool config (`spool` object): the root sets the path and the headroom, a service
+# may override the headroom. Before a service runs, the spool must have
+#   last archive size x headroomRatio + headroomGiB
+# free, else the service is skipped (insufficient-space).
+$script:DefaultHeadroomRatio = 1.2
+$script:DefaultHeadroomGiB = 10.0
+
+function Test-IsJsonNumber {
+    param($Value)
+    return ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal])
+}
+
+function Get-SpoolConfigProblems {
+    # Checks the root `spool` object, or with -Service that service's `spool` (headroom
+    # only: one spool per sequencer). Absent is fine (defaults). Returns problem strings.
+    param([Parameter(Mandatory)]$Config, [string]$Service = '')
+    $owner = $Config
+    if ($Service) { $owner = Get-PropOrNull (Get-PropOrNull $Config 'services') $Service }
+    if (-not (Test-HasProp $owner 'spool')) { return @() }
+    $spool = $owner.spool
+    if ($spool -isnot [System.Management.Automation.PSCustomObject]) {
+        if ($Service) { return @('spool: must be an object, e.g. "spool": { "headroomRatio": 1.1 }') }
+        if ($spool -is [string]) {
+            return @(('spool: the plain path form is no longer read; use "spool": {{ "path": "{0}" }}' -f $spool))
+        }
+        return @('spool: must be an object, e.g. "spool": { "path": "/var/spool/backup-sequencer" }')
+    }
+    $problems = @()
+    $known = @('headroomRatio', 'headroomGiB')
+    if (-not $Service) { $known += 'path' }
+    foreach ($name in $spool.PSObject.Properties.Name) {
+        if ($name -eq 'path' -and $Service) {
+            $problems += 'spool.path: one spool per sequencer, set it in the top-level spool'
+        }
+        elseif ($known -notcontains $name) {
+            $problems += "spool: unknown key '$name' (use $($known -join ', '))"
+        }
+    }
+    if (-not $Service -and (Test-HasProp $spool 'path') -and $spool.path -isnot [string]) {
+        $problems += 'spool.path: must be a string'
+    }
+    if (Test-HasProp $spool 'headroomRatio') {
+        $v = $spool.headroomRatio
+        if (-not (Test-IsJsonNumber $v) -or [double]$v -le 0) { $problems += "spool.headroomRatio: must be a number above 0 (got '$v')" }
+    }
+    if (Test-HasProp $spool 'headroomGiB') {
+        $v = $spool.headroomGiB
+        if (-not (Test-IsJsonNumber $v) -or [double]$v -lt 0) { $problems += "spool.headroomGiB: must be a number, 0 or more (got '$v')" }
+    }
+    return @($problems)
+}
+
+function Get-SpoolRoot {
+    # spool.path from the config, else -Default (an empty path counts as unset)
+    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$Default)
+    $p = Get-PropOrNull (Get-PropOrNull $Config 'spool') 'path'
+    if ($p -is [string] -and $p) { return $p }
+    return $Default
+}
+
+function Get-SpoolHeadroom {
+    # per key: <service>.spool.X, else <config>.spool.X, else the built-in default
+    param([Parameter(Mandatory)]$Config, [string]$Service = '')
+    $svc = $null
+    if ($Service) { $svc = Get-PropOrNull (Get-PropOrNull $Config 'services') $Service }
+    $ratio = $script:DefaultHeadroomRatio
+    $gib = $script:DefaultHeadroomGiB
+    foreach ($spool in @((Get-PropOrNull $Config 'spool'), (Get-PropOrNull $svc 'spool'))) {
+        $v = Get-PropOrNull $spool 'headroomRatio'
+        if ($null -ne $v) { $ratio = [double]$v }
+        $v = Get-PropOrNull $spool 'headroomGiB'
+        if ($null -ne $v) { $gib = [double]$v }
+    }
+    return @{ Ratio = $ratio; MarginBytes = [long]($gib * 1GB) }
+}
+
+function Format-SpaceNeed {
+    # "974.0 GB = 802.9 GB x 1.2 + 10.0 GB"
+    param([double]$NeedBytes, [double]$LastBytes, [double]$Ratio, [double]$MarginBytes)
+    return [string]::Format([System.Globalization.CultureInfo]::InvariantCulture, '{0} = {1} x {2:0.###} + {3}',
+        (Format-Size $NeedBytes), (Format-Size $LastBytes), $Ratio, (Format-Size $MarginBytes))
 }
 
 function Move-ToTrash {
@@ -962,15 +1046,18 @@ function Invoke-BackupRun {
                 continue
             }
 
-            # pre-flight free-space check against the last recorded size (1.5x headroom)
+            # pre-flight free-space check: last recorded size x headroomRatio + headroomGiB
             if ($projection.ContainsKey($serviceName) -and $projection[$serviceName].lastBytes -gt 0) {
-                $need = [long]($projection[$serviceName].lastBytes * 1.5)
+                $lastBytes = [long]$projection[$serviceName].lastBytes
+                $headroom = Get-SpoolHeadroom -Config $Config -Service $serviceName
+                $need = [long]($lastBytes * $headroom.Ratio + $headroom.MarginBytes)
                 $free = Get-FreeSpaceBytes -Path $Paths.SpoolRoot
                 if ($free -lt $need) {
                     Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'service.skip' `
-                        -Props @{ runId = $runId; svc = $serviceName; reason = 'insufficient-space'; needBytes = $need; freeBytes = $free }
+                        -Props @{ runId = $runId; svc = $serviceName; reason = 'insufficient-space'; needBytes = $need; freeBytes = $free
+                            lastBytes = $lastBytes; ratio = $headroom.Ratio; marginBytes = $headroom.MarginBytes }
                     Write-RunLine -RunId $runId -Service $serviceName -Event 'skip' -Status 'WARN' `
-                        -Detail ("insufficient space in the spool (need {0}, free {1})" -f (Format-Size $need), (Format-Size $free))
+                        -Detail ("insufficient space in the spool (need {0}, free {1})" -f (Format-SpaceNeed $need $lastBytes $headroom.Ratio $headroom.MarginBytes), (Format-Size $free))
                     continue
                 }
             }
@@ -1585,7 +1672,12 @@ function Get-RunDetail {
             'service.skip' {
                 $svc.Status = 'skipped'; $svc.Reason = [string]$e.reason
                 if ($svc.Reason -eq 'insufficient-space' -and (Test-HasProp $e 'needBytes') -and (Test-HasProp $e 'freeBytes')) {
-                    $svc.Warnings.Add(("insufficient space in the spool (need {0}, free {1})" -f (Format-Size ([double]$e.needBytes)), (Format-Size ([double]$e.freeBytes))))
+                    # events before the headroom settings carry no formula terms
+                    $needText = if ((Test-HasProp $e 'lastBytes') -and (Test-HasProp $e 'ratio') -and (Test-HasProp $e 'marginBytes')) {
+                        Format-SpaceNeed ([double]$e.needBytes) ([double]$e.lastBytes) ([double]$e.ratio) ([double]$e.marginBytes)
+                    }
+                    else { Format-Size ([double]$e.needBytes) }
+                    $svc.Warnings.Add(("insufficient space in the spool (need {0}, free {1})" -f $needText, (Format-Size ([double]$e.freeBytes))))
                 }
             }
             'service.replaced' { $svc.Warnings.Add('replaced the previous backup in ready/, never taken by the archiver') }
@@ -1746,6 +1838,6 @@ Export-ModuleMember -Function `
     Test-WithinWindow, Get-WindowLengthSeconds, Get-SecondsUntilClose, `
     Get-FreeSpaceBytes, Get-PathSizeBytes, Limit-StepWarnings, Invoke-BackupStep, `
     Get-SpoolPaths, Move-ToTrash, Move-Phase, Get-TrashMoves, Get-TrashItems, Clear-Trash, Reset-RunOutput, `
-    Get-EmptyTrashMode, Add-TrashSum, `
+    Get-EmptyTrashMode, Add-TrashSum, Get-SpoolConfigProblems, Get-SpoolRoot, Get-SpoolHeadroom, Format-SpaceNeed, `
     Get-ScopedEnv, Get-ServiceValidationProblems, `
     Get-CoverageThreshold, Get-BackupPlan, Invoke-BackupRun, Format-RunReport, Send-BackupReport, Send-RunReport

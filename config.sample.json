@@ -1,6 +1,10 @@
 {
   "window": { "open": "23:00", "close": "06:00" },
-  "spool": "/var/spool/backup-sequencer",
+  "spool": {
+    "path": "/var/spool/backup-sequencer",
+    "headroomRatio": 1.2,
+    "headroomGiB": 10
+  },
   "resources": { "diskA": 1, "diskB": 1, "net-out": 1, "cpu": 2 },
   "env": { "ARCHIVE_DEST": "/var/backups/cloud" },
   "notify": {

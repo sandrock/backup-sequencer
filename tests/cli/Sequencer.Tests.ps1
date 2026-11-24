@@ -9,7 +9,7 @@ BeforeAll {
 
     function New-CliEnv {
         # a config dir, var dir and spool for one CLI scenario
-        param([string]$Name, [hashtable]$Services)
+        param([string]$Name, [hashtable]$Services, $Spool = $null)
         $root = Join-Path $Work "cli-$Name"
         $cfgDir = Join-Path $root 'etc'
         New-Item -ItemType Directory -Force -Path $cfgDir | Out-Null
@@ -17,6 +17,7 @@ BeforeAll {
             window   = @{ open = '00:00'; close = '00:01' }   # closed nearly all day: run needs -ForceWindow
             services = $Services
         }
+        if ($null -ne $Spool) { $cfg.spool = $Spool }
         Set-Content -LiteralPath (Join-Path $cfgDir 'config.json') -Value ($cfg | ConvertTo-Json -Depth 10)
         return @{ Config = $cfgDir; Var = (Join-Path $root 'var'); Spool = (Join-Path $root 'spool') }
     }
@@ -121,6 +122,38 @@ Describe 'CLI validate' {
         $r.Out | Should -Match '(?m)^\s+broken\s+INVALID'
         $r.Out | Should -Match '(?m)^\s+app\s+OK'
     }
+
+    It 'flags a path in a service spool' {
+        $withPath = $mockSvc.Clone()
+        $withPath.spool = @{ path = '/elsewhere' }
+        $e = New-CliEnv -Name 'svcpath' -Services @{ app = $withPath }
+        $r = Invoke-Cli $e @('validate')
+        $r.Exit | Should -Be 1
+        $r.Out | Should -Match 'spool.path: one spool per sequencer'
+    }
+}
+
+Describe 'CLI spool config' {
+    It 'refuses the plain path form for every command, before doing anything' {
+        $e = New-CliEnv -Name 'plainspool' -Services @{ app = $mockSvc } -Spool '/data/spool'
+        foreach ($cmd in 'plan', 'validate', 'status') {
+            $r = Invoke-Cli $e @($cmd)
+            $r.Exit | Should -Be 2
+            $r.Out | Should -Match 'no longer read'
+            $r.Out | Should -Match ([regex]::Escape('"spool": { "path": "/data/spool" }'))
+        }
+    }
+
+    It 'backs up into spool.path' {
+        $e = New-CliEnv -Name 'objspool' -Services @{ app = $mockSvc } -Spool @{ path = '__PATH__' }
+        $spoolDir = Join-Path $Work 'cli-objspool/custom-spool'
+        $cfgFile = Join-Path $e.Config 'config.json'
+        (Get-Content -LiteralPath $cfgFile -Raw) -replace '__PATH__', ($spoolDir -replace '\\', '/') | Set-Content -LiteralPath $cfgFile
+        $r = Invoke-Cli $e @('run', '-ForceWindow')
+        $r.Exit | Should -Be 0
+        (Test-Path (Join-Path $spoolDir 'ready/app')) | Should -BeTrue
+        (Test-Path (Join-Path $e.Spool 'ready/app')) | Should -BeFalse
+    }
 }
 
 Describe 'CLI after runs' {
@@ -128,7 +161,8 @@ Describe 'CLI after runs' {
         # the chatty step leaves a warning for show to report after the fact
         $chattySvc = @{ enabled = $true; script = '../tests/fixtures/mock-service.ps1'; publishToReady = $true
             steps = @(@{ name = 'dump'; resources = @() }, @{ name = 'chatty'; resources = @() }) }
-        $script:ran = New-CliEnv -Name 'ran' -Services @{ app = $chattySvc }
+        # no margin: the second run must not depend on the host's free space
+        $script:ran = New-CliEnv -Name 'ran' -Services @{ app = $chattySvc } -Spool @{ headroomGiB = 0 }
         # two runs: the second forces past coverage so both have a service line
         $script:run1 = Invoke-Cli $ran @('run', '-ForceWindow')
         $script:run2 = Invoke-Cli $ran @('run', '-ForceWindow', '-ForceAllJobs')
