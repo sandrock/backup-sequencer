@@ -312,6 +312,8 @@ Describe 'spool lifecycle (wip -> stage -> ready)' {
         (@($events | Where-Object { $_.type -eq 'service.end' -and $_.svc -eq 'good' })[-1]).status | Should -Be 'ok'
         @($events | Where-Object { $_.type -eq 'service.archived' -and $_.svc -eq 'good' }).Count | Should -BeGreaterThan 0
         # the report surfaces the invalid reason
-        (Format-RunReport -EventsPath $ev -RunId $runId) | Should -Match 'invalid:'
+        $report = Format-RunReport -EventsPath $ev -RunId $runId
+        $report | Should -Match '(?m)^  bad\s+INVALID'
+        $report | Should -Match '(?m)^      - '
     }
 }

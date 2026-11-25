@@ -1314,7 +1314,8 @@ function Send-RunReport {
     )
     if (-not ((Test-HasProp $Config 'notify') -and (Test-HasProp $Config.notify 'enabled') -and $Config.notify.enabled)) { return }
     $report = Format-RunReport -EventsPath $Paths.EventsPath -RunId $RunId
-    $r = Send-BackupReport -Notify $Config.notify -Subject "backup report $RunId" -Body $report -BaseDir $BaseDir
+    $subject = Format-RunReportSubject -EventsPath $Paths.EventsPath -RunId $RunId
+    $r = Send-BackupReport -Notify $Config.notify -Subject $subject -Body $report -BaseDir $BaseDir
     $props = @{ runId = $RunId; status = $(if ($r.Sent) { 'ok' } else { 'fail' }); to = @($Config.notify.to).Count }
     if ($r.Error) { $props.error = $r.Error }
     Add-BackupEvent -EventsPath $Paths.EventsPath -Type 'notify.send' -Props $props
@@ -1323,45 +1324,31 @@ function Send-RunReport {
 }
 
 function Format-RunReport {
-    # Render a terse text report for one run (reused by history + notifications).
+    # The report mail body of one run: the same lines as `bseq show <run>`, so the
+    # mail, show and status never drift apart.
     param(
         [Parameter(Mandatory)][string]$EventsPath,
         [Parameter(Mandatory)][string]$RunId
     )
-    $events = Get-BackupEvents -EventsPath $EventsPath | Where-Object { (Test-HasProp $_ 'runId') -and $_.runId -eq $RunId }
-    $lines = @("Backup run $RunId")
-    foreach ($e in ($events | Where-Object { $_.type -eq 'service.end' })) {
-        $mb = [math]::Round(($e.bytes / 1MB), 1)
-        $lines += ("  {0,-24} {1,-5} {2} MB" -f $e.svc, $e.status.ToUpper(), $mb)
-    }
-    # surface preflight-invalid services (skipped before any step, so no downtime)
-    foreach ($e in ($events | Where-Object { $_.type -eq 'service.end' -and (Test-HasProp $_ 'reason') -and $_.reason -eq 'invalid' })) {
-        $probs = if (Test-HasProp $e 'problems') { @($e.problems) } else { @('see events.jsonl') }
-        foreach ($p in $probs) { $lines += ("  ! {0,-22} invalid: {1}" -f $e.svc, $p) }
-    }
-    # surface sync-archive failures even when the backup was still published (ok)
-    foreach ($e in ($events | Where-Object { $_.type -eq 'service.syncfail' })) {
-        $reason = if (Test-HasProp $e 'reason') { $e.reason } else { 'see events.jsonl' }
-        $lines += ("  ! {0,-22} archive failed: {1}" -f $e.svc, $reason)
-    }
-    # step warnings and engine warnings (replaced backup, spool out of space), worded as in `show`
-    $detail = Get-RunDetail -Events @($events) -Run ([pscustomobject]@{ RunId = $RunId })
-    foreach ($s in $detail.Services) {
-        foreach ($w in $s.Warnings) { $lines += ("  ! {0,-22} {1}" -f $s.Service, $w) }
-    }
-    foreach ($d in @($detail.Deletions | Where-Object { $_.Kind -eq 'delete' -and -not $_.Ok })) {
-        $lines += ("  ! {0,-22} trash item {1}" -f $d.Service, $d.Detail)
-    }
-    if (@($detail.Deletions).Count) { $lines += ("  -- {0}" -f (Format-DeletionTotals $detail.Deletions)) }
-    if ($detail.Held) {
-        $lines += ("  -- trash held: {0} item{1}, {2} (emptyTrash manual: bseq trash)" -f $detail.Held.Items,
-            $(if ($detail.Held.Items -gt 1) { 's' } else { '' }), (Format-Size $detail.Held.Bytes))
-    }
-    $end =$events | Where-Object { $_.type -eq 'run.end' } | Select-Object -First 1
-    if ($end) {
-        $lines += ("  -- ok={0} failed={1} planned={2}" -f $end.summary.ok, $end.summary.failed, $end.summary.planned)
-    }
-    return ($lines -join "`n")
+    $events = @(Get-BackupEvents -EventsPath $EventsPath)
+    $run = @(Get-RunStates -Events $events | Where-Object { $_.RunId -eq $RunId }) | Select-Object -First 1
+    if (-not $run) { throw "no run $RunId in the event log" }
+    return ((Format-RunDetail -Detail (Get-RunDetail -Events $events -Run $run)) -join "`n")
+}
+
+function Format-RunReportSubject {
+    # Mail subject with the outcome, readable from the inbox list:
+    # "backup OK ok=5 failed=0 <runId>", FAIL when a service failed.
+    param(
+        [Parameter(Mandatory)][string]$EventsPath,
+        [Parameter(Mandatory)][string]$RunId
+    )
+    $end = Get-BackupEvents -EventsPath $EventsPath |
+        Where-Object { $_.type -eq 'run.end' -and (Test-HasProp $_ 'runId') -and $_.runId -eq $RunId } | Select-Object -First 1
+    if (-not $end -or -not (Test-HasProp $end 'summary')) { return "backup report $RunId" }
+    $sum = $end.summary
+    $word = if ([int]$sum.failed -gt 0) { 'FAIL' } else { 'OK' }
+    return ("backup {0} ok={1} failed={2} {3}" -f $word, $sum.ok, $sum.failed, $RunId)
 }
 
 function Send-BackupReport {
@@ -1840,4 +1827,4 @@ Export-ModuleMember -Function `
     Get-SpoolPaths, Move-ToTrash, Move-Phase, Get-TrashMoves, Get-TrashItems, Clear-Trash, Reset-RunOutput, `
     Get-EmptyTrashMode, Add-TrashSum, Get-SpoolConfigProblems, Get-SpoolRoot, Get-SpoolHeadroom, Format-SpaceNeed, `
     Get-ScopedEnv, Get-ServiceValidationProblems, `
-    Get-CoverageThreshold, Get-BackupPlan, Invoke-BackupRun, Format-RunReport, Send-BackupReport, Send-RunReport
+    Get-CoverageThreshold, Get-BackupPlan, Invoke-BackupRun, Format-RunReport, Format-RunReportSubject, Send-BackupReport, Send-RunReport

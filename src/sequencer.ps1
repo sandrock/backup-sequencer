@@ -289,7 +289,7 @@ switch ($Command) {
         $intro = "This is a test, sent by 'bseq test-notify' on $hostName at $(Format-EventTime ([datetime]::UtcNow))."
         if ($runs.Count) {
             $last = $runs[-1].RunId
-            $subject = "[test] backup report $last"
+            $subject = '[test] ' + (Format-RunReportSubject -EventsPath $Paths.EventsPath -RunId $last)
             $body = $intro + " Below: the report of the last run.`n`n" + (Format-RunReport -EventsPath $Paths.EventsPath -RunId $last)
         }
         else {

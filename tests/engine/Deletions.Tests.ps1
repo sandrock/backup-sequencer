@@ -264,7 +264,7 @@ Describe 'emptyTrash: when the archived local copy is deleted' {
         $text = (Format-RunDetail -Detail (Get-RunDetail -Events $events -Run $run)) -join "`n"
         $text | Should -Match '(?m)^  deletions\s+held \d+ KB in 1 item$'
         $text | Should -Match '(?m)^      held    app\s+\d+ KB\s+\d+ files  emptyTrash manual: bseq trash -Delete app-[0-9a-f]{12}$'
-        Format-RunReport -EventsPath $paths.EventsPath -RunId $runId | Should -Match '(?m)^  -- held \d+ KB in 1 item$'
+        Format-RunReport -EventsPath $paths.EventsPath -RunId $runId | Should -Be $text   # the mail is the show output
     }
 
     It 'rejects an unknown value in validation' {
@@ -359,8 +359,8 @@ Describe 'deletions in show and the email' {
         $text | Should -Match '(?m)^    ! delete  \(no record\)\s+kept: stuck: '
 
         $mail = Format-RunReport -EventsPath $paths.EventsPath -RunId $runId
-        $mail | Should -Match '(?m)^  ! \(no record\)\s+trash item kept: stuck: '
-        $mail | Should -Match '(?m)^  -- freed \d+ KB in 1 item; 1 failed$'
+        $mail | Should -Match '(?m)^    ! delete  \(no record\)\s+kept: stuck: '
+        $mail | Should -Match '(?m)^  deletions\s+freed \d+ KB in 1 item; 1 failed$'
         & chmod 755 (Join-Path $root 'trash/stuck')
     }
 }

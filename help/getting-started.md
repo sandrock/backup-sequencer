@@ -162,9 +162,12 @@ scheduler fires it, it does not sleep until the window.
 Reports
 ----------------------------------------------------------------
 
-With `notify.enabled`, each run emails a terse digest (services, status,
-durations, sizes) via `swaks`. Sending every run acts as a dead-man's-switch: no
-email means the run did not happen. Keep the body free of secrets.
+With `notify.enabled`, each run emails its report via `swaks`: the same lines as
+`bseq show <run>` (per service the outcome, size, archive id, step durations,
+skip reasons and warnings, then the deletions). The subject carries the outcome,
+`backup OK ok=5 failed=0 <run>` or `backup FAIL ...`. Sending every run acts as a
+dead-man's-switch: no email means the run did not happen. The report holds no
+secrets, but it names your services and paths: mind where the mail goes.
 
 To check the settings without waiting for a run:
 

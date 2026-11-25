@@ -93,8 +93,32 @@ Describe 'run narration' {
         Test-HasProp @($ends | Where-Object { $_.step -eq 'dump' })[0] 'warnings' | Should -BeFalse   # absent when none
         $runId = @(Get-BackupEvents -EventsPath $paths.EventsPath | Where-Object { $_.type -eq 'run.begin' })[0].runId
         $report = Format-RunReport -EventsPath $paths.EventsPath -RunId $runId
-        $report | Should -Match '(?m)^  ! app\s+chatty: chatty warning$'
+        $report | Should -Match '(?m)^      ! chatty: chatty warning$'
         $report | Should -Not -Match 'chatty info'
+    }
+
+    It 'mails the show output, with the outcome in the subject' {
+        $ok = @'
+{ "window": { "open": "00:00", "close": "00:01" },
+  "services": { "app": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1", "publishToReady": true,
+      "steps": [ {"name":"dump"} ] } } }
+'@ | ConvertFrom-Json
+        $null = Get-RunLines $ok $paths -Journal
+        $events = @(Get-BackupEvents -EventsPath $paths.EventsPath)
+        $run = (Get-RunStates -Events $events)[-1]
+        $show = (Format-RunDetail -Detail (Get-RunDetail -Events $events -Run $run)) -join "`n"
+        Format-RunReport -EventsPath $paths.EventsPath -RunId $run.RunId | Should -Be $show
+        Format-RunReportSubject -EventsPath $paths.EventsPath -RunId $run.RunId | Should -Be "backup OK ok=1 failed=0 $($run.RunId)"
+
+        $bad = @'
+{ "window": { "open": "00:00", "close": "00:01" },
+  "services": { "other": { "enabled": true, "mandatory": true, "script": "fixtures/mock-service.ps1",
+      "steps": [ {"name":"boom"} ] } } }
+'@ | ConvertFrom-Json
+        $null = Get-RunLines $bad $paths -Journal
+        $run = (Get-RunStates -Events @(Get-BackupEvents -EventsPath $paths.EventsPath))[-1]
+        Format-RunReportSubject -EventsPath $paths.EventsPath -RunId $run.RunId | Should -Be "backup FAIL ok=0 failed=1 $($run.RunId)"
+        Format-RunReportSubject -EventsPath $paths.EventsPath -RunId 'no-such-run' | Should -Be 'backup report no-such-run'
     }
 
     It 'shows a failed step, the recovery step, and the service failure' {

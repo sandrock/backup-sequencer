@@ -345,9 +345,9 @@ Describe 'CLI test-notify' -Skip:($IsWindows) {
         $r = Invoke-Cli $tn @('test-notify')
         $r.Exit | Should -Be 0
         $text = Get-Content -LiteralPath $env:SWAKS_STUB_LOG -Raw
-        $text | Should -Match '(?m)^Subject: \[test\] backup report \d{8}-\d{6}-[0-9a-f]{4}$'
+        $text | Should -Match '(?m)^Subject: \[test\] backup OK ok=\d+ failed=0 \d{8}-\d{6}-[0-9a-f]{4}$'
         $text | Should -Match "This is a test, sent by 'bseq test-notify'"
-        $text | Should -Match '(?m)^Backup run '
+        $text | Should -Match '(?m)^run \d{8}-\d{6}-[0-9a-f]{4}  '
         $sends = @(Get-BackupEvents -EventsPath (Join-Path $tn.Var 'events.jsonl') | Where-Object { $_.type -eq 'notify.send' })
         $sends.Count | Should -Be 1   # the run's report only
     }
